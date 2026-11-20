@@ -1,0 +1,27 @@
+name: Build and test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        run: rustup toolchain install 1.89.0 --profile minimal
+
+      - name: Build release binary
+        run: cargo +1.89.0 build --locked --release
+
+      - name: Run tests
+        run: cargo +1.89.0 test --locked
