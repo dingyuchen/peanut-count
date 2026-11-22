@@ -54,6 +54,17 @@ class SerialQueue {
 // withExclusiveTransactionAsync opens a second connection, which would not have
 // the key.) A serial queue keeps statements from interleaving: plain queries each
 // take one turn, and a transaction holds the queue from BEGIN to COMMIT.
+//
+// Why sqlite-proxy: drizzle-orm 0.45's own expo-sqlite driver uses expo-sqlite's
+// synchronous API, which blocks the JS thread (drizzle-orm issue #5240). Drizzle
+// 1.0 adds an async driver, `drizzle-orm/expo-sqlite/async` (from 1.0.0-rc.5).
+// When 1.0 is stable, switch to it and drop the proxy callback, `migrate` here and
+// the DrizzleQueryError unwrapping in storage.ts (1.0 leaves parameters out of
+// error messages unless `paramsInErrors` is set). Keep the queue and transaction
+// handling: that driver runs BEGIN, each statement and COMMIT as separate calls on
+// the shared connection, so other queries can land inside a transaction, and a
+// rejected Promise.all can leave writes to run after ROLLBACK. It also prepares
+// and finalizes a statement for every query instead of reusing one.
 export class LedgerClient {
   readonly db: LedgerDb;
   private readonly queue = new SerialQueue();

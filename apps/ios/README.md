@@ -66,6 +66,11 @@ in `src/db/schema.ts`. After changing the schema, run
 pending migrations when it opens the ledger. The first migration uses
 `CREATE TABLE IF NOT EXISTS` so it adopts ledgers created before Drizzle.
 
+The app uses Drizzle's `sqlite-proxy` driver because the Expo driver in
+drizzle-orm 0.45 is synchronous. Drizzle 1.0 adds an async Expo driver. Switch
+to it once 1.0 is stable; `src/db/client.ts` notes what to replace and what to
+keep.
+
 ## Sync
 
 Sync is optional and off by default. Without an account, the app never
