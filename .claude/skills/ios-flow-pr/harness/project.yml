@@ -1,0 +1,15 @@
+name: FlowUITests
+settings:
+  CODE_SIGNING_ALLOWED: NO
+targets:
+  FlowUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    deploymentTarget: "18.0"
+    sources: Tests
+    settings:
+      PRODUCT_BUNDLE_IDENTIFIER: org.peanutcount.flowuitests
+      GENERATE_INFOPLIST_FILE: YES
+    scheme:
+      testTargets:
+        - FlowUITests

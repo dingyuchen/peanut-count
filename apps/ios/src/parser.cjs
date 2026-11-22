@@ -91,4 +91,26 @@ function parseStatement(text, currency, dateOrder) {
   return { rows, skipped };
 }
 
-module.exports = { validAccount, currencyPattern, parseStatement };
+// Work out the statement's date format from its dated lines. Returns 'ISO' when every
+// date is YYYY-MM-DD, 'DMY' or 'MDY' when a day above 12 settles it, or null when the
+// dates are ambiguous or contradict each other.
+function detectDateOrder(text) {
+  let iso = 0;
+  let slashed = 0;
+  let dmy = false;
+  let mdy = false;
+  for (const original of text.split(/\r?\n/)) {
+    const token = original.trim().match(dateStart)?.[1];
+    if (!token) continue;
+    if (token.includes('-')) { iso++; continue; }
+    slashed++;
+    const [first, second] = token.split(/[/.]/).map(Number);
+    if (first > 12 && second <= 12) dmy = true;
+    if (second > 12 && first <= 12) mdy = true;
+  }
+  if (iso && !slashed) return 'ISO';
+  if (dmy !== mdy) return dmy ? 'DMY' : 'MDY';
+  return null;
+}
+
+module.exports = { validAccount, currencyPattern, parseStatement, detectDateOrder };

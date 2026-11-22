@@ -1,0 +1,6 @@
+Sample Credit Union - Card Statement
+
+Date Description Amount
+03/04/2026 Corner Grocery -40.00
+05/06/2026 Coffee Corner -3.50
+07/08/2026 Taxi ride -12.00

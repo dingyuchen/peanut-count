@@ -1,0 +1,30 @@
+Sample Bank - Everyday Checking
+Statement period 2026-06-01 to 2026-11-30
+
+Date Description Amount
+2026-06-03 Payroll deposit +3,200.00
+2026-06-05 Corner Grocery -84.20
+2026-06-11 Coffee Corner -6.50
+2026-06-19 City Rail pass -96.00
+2026-07-03 Payroll deposit +3,200.00
+2026-07-06 Corner Grocery -112.45
+2026-07-14 Restaurant Luna -58.30
+2026-07-22 Parking garage -18.00
+2026-08-03 Payroll deposit +3,200.00
+2026-08-08 Supermarket Fresh -143.10
+2026-08-16 Coffee Corner -12.75
+2026-08-29 Taxi ride -24.60
+2026-09-03 Payroll deposit +3,200.00
+2026-09-04 Corner Grocery -97.85
+2026-09-12 Restaurant Luna -76.40
+2026-09-21 City Rail pass -96.00
+2026-10-03 Payroll deposit +3,200.00
+2026-10-07 Supermarket Fresh -131.20
+2026-10-15 Cafe Verde -9.40
+2026-10-24 Hardware store -45.99
+2026-11-03 Payroll deposit +3,200.00
+2026-11-06 Corner Grocery -102.30
+2026-11-09 Restaurant Luna -64.10
+2026-11-13 City Rail pass -96.00
+2026-11-18 Streaming service -15.99
+2026-11-20 Coffee Corner -7.25

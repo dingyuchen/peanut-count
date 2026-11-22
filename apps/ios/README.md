@@ -24,9 +24,9 @@ picker if the Share Sheet does not open Peanut Count.
 
 ## Import a statement
 
-1. Sign up or sign in to a self-hosted sync server, or choose **Continue without sync**.
+1. Open the app. It starts with an encrypted ledger on the device. No account is needed.
 2. Share a PDF from Files or another app to **Peanut Count**. You can also choose a PDF from inside the app.
-3. Enter the account shown on the statement, its currency, and the date order.
+3. Enter the account shown on the statement, its currency, and the date format.
 4. Review the imported rows. Edit the proposed counter-accounts or exclude rows, then choose **Add transactions**.
 
 The parser handles single-line text rows with a full date, description, and
@@ -42,12 +42,29 @@ the statement account and the reviewed counter-account. The file fingerprint
 prevents reimporting the same PDF into one ledger. Overlapping date ranges
 across different files still need review.
 
+## Storage
+
+The ledger is stored with SQLCipher (AES-256), which `app.json` enables
+through the `expo-sqlite` plugin. On first launch the app generates a
+random 256-bit key and keeps it in the iOS Keychain. The app refuses to
+open the ledger if the build lacks SQLCipher, so it never writes a
+plaintext database. On first launch, a build with encryption copies any
+plaintext `peanut-count.sqlite3` from an earlier build into the encrypted
+`ledger.sqlite3` and deletes the plaintext file.
+
+The Keychain item is readable after the first unlock and moves to a new
+device only through an encrypted backup. If the key is missing, the app
+cannot read the ledger and offers to erase it. Copies of statement PDFs
+in the app's caches or temporary folder are deleted after their text is read.
+
 ## Sync
 
-See the [server setup guide](../../README.md#mobile-accounts-and-statement-sync).
+Sync is optional and off by default. Without an account, the app never
+contacts a server. To turn on sync, tap **Sync** and sign in or create an
+account. See the [server setup guide](../../README.md#mobile-accounts-and-statement-sync).
 An account-backed import is written locally first and queued for upload if
-the server is unreachable. Use **Sync now** to retry or pull from other
-devices. The device-only ledger stays separate from account-backed ledgers.
+the server is unreachable. Use **Sync now** in **Account**, or pull down on
+the ledger, to retry or pull from other devices. The device-only ledger stays separate from account-backed ledgers.
 Signing up does not upload existing local-only imports.
 
 `npm test` runs the parser fixtures.
