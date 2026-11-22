@@ -1,10 +1,80 @@
+import * as Crypto from 'expo-crypto';
+import * as SecureStore from 'expo-secure-store';
 import * as SQLite from 'expo-sqlite';
+
+// The ledger is always stored with SQLCipher (see the expo-sqlite plugin in app.json).
+// A random 256-bit key lives in the iOS Keychain; the file on disk is never plaintext.
+const DATABASE = 'ledger.sqlite3';
+const LEGACY_DATABASE = 'peanut-count.sqlite3';
+const KEY_ITEM = 'peanut.ledger.key';
+const LEGACY_DONE_ITEM = 'peanut.ledger.legacy-migrated';
+const keychain = { keychainAccessible: SecureStore.AFTER_FIRST_UNLOCK };
+
+export class LockedLedgerError extends Error {}
 
 let database;
 
-async function open() {
-  database ??= (async () => {
-    const db = await SQLite.openDatabaseAsync('peanut-count.sqlite3');
+async function removeDatabaseFiles(name) {
+  for (const file of [name, `${name}-wal`, `${name}-shm`]) {
+    await SQLite.deleteDatabaseAsync(file).catch(() => {});
+  }
+}
+
+async function databaseKey() {
+  const stored = await SecureStore.getItemAsync(KEY_ITEM, keychain);
+  if (stored !== null) {
+    if (!/^[0-9a-f]{64}$/.test(stored)) throw new LockedLedgerError('The ledger key in the Keychain is damaged.');
+    return stored;
+  }
+  const bytes = await Crypto.getRandomBytesAsync(32);
+  const key = Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
+  await SecureStore.setItemAsync(KEY_ITEM, key, keychain);
+  return key;
+}
+
+async function requireCipher(db) {
+  const row = await db.getFirstAsync('PRAGMA cipher_version');
+  if (!row?.cipher_version) {
+    // Refuse to fall back to plaintext if the app was built without SQLCipher.
+    throw new Error('This build cannot encrypt the ledger. Rebuild the app with SQLCipher enabled.');
+  }
+}
+
+// Builds before encryption wrote a plaintext file. Copy it into the encrypted
+// database once, then delete it. A retry after an interruption starts the copy over.
+async function migrateLegacy(key) {
+  if (await SecureStore.getItemAsync(LEGACY_DONE_ITEM, keychain)) return;
+  const legacy = await SQLite.openDatabaseAsync(LEGACY_DATABASE, { useNewConnection: true });
+  try {
+    await requireCipher(legacy);
+    const { tables } = await legacy.getFirstAsync("SELECT count(*) AS tables FROM sqlite_master WHERE type = 'table'");
+    if (tables > 0) {
+      await removeDatabaseFiles(DATABASE);
+      await legacy.execAsync('PRAGMA journal_mode = DELETE');
+      await legacy.runAsync('ATTACH DATABASE ? AS encrypted KEY ?', `${SQLite.defaultDatabaseDirectory}/${DATABASE}`, `x'${key}'`);
+      await legacy.getFirstAsync("SELECT sqlcipher_export('encrypted')");
+      await legacy.execAsync('DETACH DATABASE encrypted');
+    }
+  } finally {
+    await legacy.closeAsync();
+  }
+  await removeDatabaseFiles(LEGACY_DATABASE);
+  await SecureStore.setItemAsync(LEGACY_DONE_ITEM, '1', keychain);
+}
+
+async function openEncrypted() {
+  const key = await databaseKey();
+  await migrateLegacy(key);
+  const db = await SQLite.openDatabaseAsync(DATABASE);
+  try {
+    // PRAGMA key must run before anything else touches the file.
+    await db.execAsync(`PRAGMA key = "x'${key}'"`);
+    await requireCipher(db);
+    try {
+      await db.getFirstAsync('SELECT count(*) FROM sqlite_master');
+    } catch {
+      throw new LockedLedgerError('This ledger cannot be unlocked with the key in this device\'s Keychain.');
+    }
     await db.execAsync(`
       PRAGMA journal_mode = WAL;
       CREATE TABLE IF NOT EXISTS statements (
@@ -24,8 +94,25 @@ async function open() {
       );
     `);
     return db;
-  })().catch((error) => { database = undefined; throw error; });
+  } catch (error) {
+    await db.closeAsync().catch(() => {});
+    throw error;
+  }
+}
+
+async function open() {
+  database ??= openEncrypted().catch((error) => { database = undefined; throw error; });
   return database;
+}
+
+// Erase a ledger that can no longer be decrypted (for example, after its Keychain
+// entry was lost) and start over with a new key.
+export async function eraseLocalLedger() {
+  const db = await database?.catch(() => null);
+  database = undefined;
+  await db?.closeAsync().catch(() => {});
+  await removeDatabaseFiles(DATABASE);
+  await SecureStore.deleteItemAsync(KEY_ITEM, keychain);
 }
 
 function encode({ id, source, currency, rows }) {

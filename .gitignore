@@ -13,3 +13,4 @@ __pycache__/
 /training/statement-parser/data/
 /training/statement-parser/artifacts/
 /mobile-data/
+/.flows/

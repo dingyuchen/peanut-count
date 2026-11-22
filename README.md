@@ -168,8 +168,8 @@ client that supports custom authorization headers.
 
 ## Mobile accounts and statement sync
 
-The iOS client can keep a ledger on the device or sign in to a mobile sync
-server. Start the mobile API with a private data directory:
+The iOS client keeps an encrypted ledger on the device by default. It
+contacts a server only after the user signs in to a mobile sync server. Start the mobile API with a private data directory:
 
 ```sh
 umask 077

@@ -8,7 +8,10 @@ enum StatementPdfReader {
             throw PdfError("Choose a local PDF file.")
         }
         let access = url.startAccessingSecurityScopedResource()
-        defer { if access { url.stopAccessingSecurityScopedResource() } }
+        defer {
+            if access { url.stopAccessingSecurityScopedResource() }
+            discardTemporaryCopy(url)
+        }
         let size = try url.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
         guard size > 0 && size <= 25 * 1024 * 1024 else {
             throw PdfError("Choose a PDF smaller than 25 MB.")
@@ -27,6 +30,18 @@ enum StatementPdfReader {
         let hash = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
         return ["text": text, "id": hash]
     }
+}
+
+/// The document picker and share handoff copy statements into the app's caches or
+/// temporary directory. Remove that plaintext copy once its text is in memory.
+private func discardTemporaryCopy(_ url: URL) {
+    let manager = FileManager.default
+    let path = url.standardizedFileURL.resolvingSymlinksInPath().path
+    let scratch = [manager.temporaryDirectory] + manager.urls(for: .cachesDirectory, in: .userDomainMask)
+    guard scratch.contains(where: { path.hasPrefix($0.standardizedFileURL.resolvingSymlinksInPath().path + "/") }) else {
+        return
+    }
+    try? manager.removeItem(at: url)
 }
 
 private struct PdfError: LocalizedError {
