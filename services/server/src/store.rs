@@ -1,4 +1,4 @@
-use std::{path::Path, time::Duration};
+use std::{collections::HashSet, path::Path, time::Duration};
 
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
@@ -104,6 +104,107 @@ impl Store {
         )?;
         tx.commit()?;
         Ok(id)
+    }
+
+    pub fn import_statement(&mut self, statement: &crate::mobile::Statement) -> Result<()> {
+        let tx = self
+            .0
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS mobile_statements (
+                seq INTEGER PRIMARY KEY, id TEXT NOT NULL UNIQUE, body TEXT NOT NULL
+            ) STRICT;",
+        )?;
+        let body = serde_json::to_string(statement)?;
+        if let Some(previous) = tx
+            .query_row(
+                "SELECT body FROM mobile_statements WHERE id = ?",
+                [&statement.id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            ensure!(
+                previous == body,
+                "statement already imported with different postings"
+            );
+            return Ok(());
+        }
+
+        let mut records = confirmed(&tx)?;
+        for item in snapshot(&tx)?.pending {
+            ensure!(item.conflict.is_none(), "ledger has pending conflicts");
+            records.push(item.record);
+        }
+        let mut accounts: HashSet<String> = records
+            .iter()
+            .filter_map(|record| {
+                if let Entry::Open { account, .. } = &record.entry {
+                    Some(account.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let mut entries = Vec::new();
+        let opening = chrono::NaiveDate::from_ymd_opt(1900, 1, 1).unwrap();
+        for entry in statement.entries()? {
+            if let Entry::Transaction { postings, .. } = &entry {
+                for posting in postings {
+                    if accounts.insert(posting.account.clone()) {
+                        entries.push(Entry::Open {
+                            date: opening,
+                            account: posting.account.clone(),
+                            currencies: Vec::new(),
+                            booking: Default::default(),
+                        });
+                    }
+                }
+            }
+            entries.push(entry);
+        }
+        let new_records: Vec<_> = entries
+            .into_iter()
+            .map(|entry| Record {
+                id: uuid::Uuid::new_v4().to_string(),
+                entry,
+            })
+            .collect();
+        records.extend(new_records.iter().cloned());
+        Ledger::build(records)?;
+        for record in new_records {
+            let encoded = serde_json::to_string(&record.entry)?;
+            tx.execute(
+                "INSERT INTO entries(id, body) VALUES(?, ?)",
+                params![record.id, encoded],
+            )?;
+        }
+        tx.execute(
+            "INSERT INTO mobile_statements(id, body) VALUES(?, ?)",
+            params![statement.id, body],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn statement_page(&self, after: i64) -> Result<Vec<(i64, crate::mobile::Statement)>> {
+        let initialized: bool = self.0.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'mobile_statements')",
+            [], |row| row.get(0),
+        )?;
+        if !initialized {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.0.prepare(
+            "SELECT seq, body FROM mobile_statements WHERE seq > ? ORDER BY seq LIMIT 8",
+        )?;
+        let mut rows = stmt.query([after])?;
+        let mut page = Vec::new();
+        while let Some(row) = rows.next()? {
+            let body: String = row.get(1)?;
+            page.push((row.get(0)?, serde_json::from_str(&body)?));
+        }
+        Ok(page)
     }
 
     pub fn snapshot(&self) -> Result<Snapshot> {
