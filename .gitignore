@@ -1,3 +1,15 @@
 /target/
 *.db
 *.db-*
+
+/apps/ios/PeanutCount.xcodeproj/
+/apps/ios/node_modules/
+/apps/ios/.expo/
+/apps/ios/ios/
+/apps/ios/dist/
+/apps/ios/DerivedData/
+xcuserdata/
+__pycache__/
+/training/statement-parser/data/
+/training/statement-parser/artifacts/
+/mobile-data/

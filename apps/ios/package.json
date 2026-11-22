@@ -1,0 +1,22 @@
+{
+  "name": "peanut-count-mobile",
+  "private": true,
+  "version": "0.1.0",
+  "main": "index.js",
+  "scripts": {
+    "start": "expo start",
+    "ios": "expo run:ios",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "expo": "~56.0.24",
+    "expo-crypto": "~56.0.5",
+    "expo-document-picker": "~56.0.4",
+    "expo-secure-store": "~56.0.4",
+    "expo-sharing": "~56.0.27",
+    "expo-sqlite": "~56.0.6",
+    "react": "19.2.3",
+    "react-native": "0.85.3",
+    "react-native-safe-area-context": "~5.7.0"
+  }
+}

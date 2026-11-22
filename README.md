@@ -5,6 +5,16 @@ bundles SQLite and serves MCP directly. Each device has its own SQLite file and
 can record entries offline. An optional self-hosted libSQL server (sqld) holds
 the shared history. Beancount text is generated on demand.
 
+## Repository layout
+
+| Directory | Component |
+| --- | --- |
+| [services/server](services/server) | Rust CLI, ledger, sync, and MCP server |
+| [apps/ios](apps/ios) | React Native iOS client with PDF statement import |
+| [training/statement-parser](training/statement-parser) | Training and evaluation for statement-row classification |
+
+The root Cargo workspace keeps builds and tests available from the repo root.
+
 ## Build and start a ledger
 
 Build with Rust 1.89 or newer and a C compiler for the bundled SQLite library.
@@ -155,6 +165,27 @@ that can send a configured bearer token. Add the public hostname with
 `--allow-host` if the proxy preserves it. Requests from browser origins are
 rejected. This server uses a configured bearer token, so connect from an MCP
 client that supports custom authorization headers.
+
+## Mobile accounts and statement sync
+
+The iOS client can keep a ledger on the device or sign in to a mobile sync
+server. Start the mobile API with a private data directory:
+
+```sh
+umask 077
+peanut-count mobile-serve --data ./mobile-data
+```
+
+Expose the loopback listener at port 8766 behind an HTTPS reverse proxy.
+Configure login and signup rate limits at the proxy before exposing it.
+The app accepts the HTTPS base URL when the user signs up or signs in.
+Each account has an isolated SQLite ledger. The API returns its ledger ID
+at signup and sign-in. An operator can use the CLI with
+`--db mobile-data/<ledger-id>.db` to report on it, export it, or sync its
+entries to a dedicated self-hosted libSQL database. Mobile devices exchange
+statement imports through the mobile API.
+
+See the [iOS setup guide](apps/ios/README.md) for the share and import flow.
 
 ## Verification
 

@@ -1,5 +1,6 @@
 mod ledger;
 mod mcp;
+mod mobile;
 mod store;
 mod sync;
 
@@ -63,6 +64,14 @@ enum Command {
     Status,
     /// Withdraw a pending entry from the local queue.
     DiscardPending { id: Uuid },
+    /// Serve account signup and statement sync for mobile clients.
+    MobileServe {
+        #[arg(long, default_value = "127.0.0.1:8766")]
+        listen: SocketAddr,
+        /// Directory for the account registry and individual ledgers.
+        #[arg(long)]
+        data: PathBuf,
+    },
     /// Serve the Streamable HTTP MCP endpoint.
     Serve {
         #[arg(long, default_value = "127.0.0.1:8765")]
@@ -154,6 +163,9 @@ async fn main() -> Result<()> {
         }
         Command::Status => print_json(&Store::open(&db)?.status()?)?,
         Command::DiscardPending { id } => Store::open(&db)?.discard_pending(&id.to_string())?,
+        Command::MobileServe { listen, data } => {
+            mobile::serve(listen, data).await?;
+        }
         Command::Serve {
             listen,
             allow_write,
