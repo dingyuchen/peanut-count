@@ -2,13 +2,16 @@
   "name": "peanut-count-mobile",
   "private": true,
   "version": "0.1.0",
-  "main": "index.js",
+  "main": "index.ts",
   "scripts": {
     "start": "expo start",
     "ios": "expo run:ios",
-    "test": "node --test"
+    "typecheck": "tsc",
+    "test": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --import ./tests/support/hooks.mjs --test",
+    "db:generate": "drizzle-kit generate"
   },
   "dependencies": {
+    "drizzle-orm": "~0.45.4",
     "expo": "~56.0.24",
     "expo-crypto": "~56.0.5",
     "expo-document-picker": "~56.0.4",
@@ -18,5 +21,13 @@
     "react": "19.2.3",
     "react-native": "0.85.3",
     "react-native-safe-area-context": "~5.7.0"
+  },
+  "devDependencies": {
+    "@types/node": "~26.6.6",
+    "@types/react": "~19.2.14",
+    "babel-plugin-inline-import": "^3.0.0",
+    "babel-preset-expo": "~56.0.0",
+    "drizzle-kit": "~0.31.11",
+    "typescript": "~6.0.3"
   }
 }
