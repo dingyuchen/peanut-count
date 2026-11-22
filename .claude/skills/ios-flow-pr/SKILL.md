@@ -41,7 +41,7 @@ Output goes to `.flows/<branch>/`, which is gitignored.
 5. **Open or update the PR.**
    - Commit and push the branch, then open the PR against `main`. Use `pull_request_create` when available, otherwise `gh pr create`.
    - Run `.claude/skills/ios-flow-pr/scripts/publish-media.sh <pr-number>`. This creates the `flow-media` prerelease if needed and replaces this PR's earlier assets.
-   - Put its output in the PR body, under the summary, with `gh pr edit <n> --body-file`.
+   - Put its output in the PR body, under the summary. Use `gh api -X PATCH repos/<owner>/<repo>/pulls/<n> -F body=@<file>`; `gh pr edit` fails on this repo because of the Projects (classic) deprecation.
    - When later pushes change user-facing behavior, re-record and re-run the publish step; the assets are overwritten in place.
 
 ## PR body template
