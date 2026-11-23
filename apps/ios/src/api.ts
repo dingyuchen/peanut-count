@@ -1,12 +1,32 @@
 import { fetch } from 'expo/fetch';
 import * as Crypto from 'expo-crypto';
 import * as SecureStore from 'expo-secure-store';
-import { applyPage, conflictCount, getCursor, markSent, pendingStatements } from './storage';
+import { applyPage, conflictCount, getCursor, markSent, pendingStatements, type Statement } from './storage';
+
+export interface Profile {
+  server: string;
+  scope: string;
+  username: string;
+  token: string;
+}
+
+export type AuthMode = 'login' | 'signup';
+
+interface LoginResponse {
+  username: string;
+  token: string;
+  ledger_id: string;
+}
+
+interface StatementPage {
+  statements: Statement[];
+  after: number;
+}
 
 const SESSION_KEY = 'peanut.account';
 
-function serverUrl(input) {
-  let url;
+function serverUrl(input: string): string {
+  let url: URL;
   try {
     url = new URL(input.trim());
   } catch {
@@ -19,13 +39,15 @@ function serverUrl(input) {
 }
 
 class RequestError extends Error {
-  constructor(status, message) {
+  status: number;
+
+  constructor(status: number, message: string) {
     super(message);
     this.status = status;
   }
 }
 
-async function request(server, path, { token, body } = {}) {
+async function request<T>(server: string, path: string, { token, body }: { token?: string; body?: unknown } = {}): Promise<T> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 20000);
   try {
@@ -41,48 +63,48 @@ async function request(server, path, { token, body } = {}) {
       signal: controller.signal,
     });
     if (!response.ok) {
-      const payload = await response.json().catch(() => ({}));
+      const payload: { error?: string } = await response.json().catch(() => ({}));
       throw new RequestError(response.status, payload.error || `Server returned HTTP ${response.status}.`);
     }
-    return response.status === 204 ? null : await response.json();
+    return (response.status === 204 ? null : await response.json()) as T;
   } finally {
     clearTimeout(timeout);
   }
 }
 
-export async function account(mode, address, username, password) {
+export async function account(mode: AuthMode, address: string, username: string, password: string): Promise<Profile> {
   const server = serverUrl(address);
-  const login = await request(server, mode, { body: { username, password } });
+  const login = await request<LoginResponse>(server, mode, { body: { username, password } });
   const scope = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, `${server}:${login.ledger_id}`);
-  const profile = { server, scope, username: login.username, token: login.token };
+  const profile: Profile = { server, scope, username: login.username, token: login.token };
   await SecureStore.setItemAsync(SESSION_KEY, JSON.stringify(profile));
   return profile;
 }
 
-export async function storedProfile() {
+export async function storedProfile(): Promise<Profile | null> {
   const value = await SecureStore.getItemAsync(SESSION_KEY);
-  return value ? JSON.parse(value) : null;
+  return value ? (JSON.parse(value) as Profile) : null;
 }
 
-export function clearProfile() {
+export function clearProfile(): Promise<void> {
   return SecureStore.deleteItemAsync(SESSION_KEY);
 }
 
-export async function syncStatements(profile) {
+export async function syncStatements(profile: Profile): Promise<void> {
   const { server, scope, token } = profile;
-  let rejected;
+  let rejected: RequestError | undefined;
   for (const statement of await pendingStatements(scope)) {
     try {
-      await request(server, 'statements', { token, body: statement });
+      await request<null>(server, 'statements', { token, body: statement });
       await markSent(scope, statement.id);
     } catch (error) {
-      if (error.status !== 422) throw error;
+      if (!(error instanceof RequestError) || error.status !== 422) throw error;
       rejected = error;
     }
   }
   let after = await getCursor(scope);
   for (;;) {
-    const page = await request(server, `statements?after=${after}`, { token });
+    const page = await request<StatementPage>(server, `statements?after=${after}`, { token });
     if (page.statements.length === 0) break;
     if (page.after <= after) throw new Error('Server returned an invalid sync cursor.');
     await applyPage(scope, page.statements, page.after);

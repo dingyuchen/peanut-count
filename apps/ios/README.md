@@ -57,6 +57,20 @@ device only through an encrypted backup. If the key is missing, the app
 cannot read the ledger and offers to erase it. Copies of statement PDFs
 in the app's caches or temporary folder are deleted after their text is read.
 
+Queries go through [Drizzle ORM](https://orm.drizzle.team/) on expo-sqlite's
+async API, so they run on a background thread and never block the JavaScript
+thread. `src/db/client.ts` runs all queries on the one keyed connection, one at
+a time, and holds it for the length of a transaction. The tables are defined
+in `src/db/schema.ts`. After changing the schema, run
+`npm run db:generate` to add a migration under `drizzle/`. The app applies
+pending migrations when it opens the ledger. The first migration uses
+`CREATE TABLE IF NOT EXISTS` so it adopts ledgers created before Drizzle.
+
+The app uses Drizzle's `sqlite-proxy` driver because the Expo driver in
+drizzle-orm 0.45 is synchronous. Drizzle 1.0 adds an async Expo driver. Switch
+to it once 1.0 is stable; `src/db/client.ts` notes what to replace and what to
+keep.
+
 ## Sync
 
 Sync is optional and off by default. Without an account, the app never
@@ -67,4 +81,9 @@ the server is unreachable. Use **Sync now** in **Account**, or pull down on
 the ledger, to retry or pull from other devices. The device-only ledger stays separate from account-backed ledgers.
 Signing up does not upload existing local-only imports.
 
-`npm test` runs the parser fixtures.
+## Development
+
+The app is written in TypeScript. `npm run typecheck` checks the types, and
+`npm test` runs the parser, spending, and storage tests with Node's built-in type
+stripping (Node 24 or later). The storage tests run the real queries against
+`node:sqlite` through test doubles in `tests/support/`.

@@ -1,6 +1,6 @@
-const test = require('node:test');
-const assert = require('node:assert/strict');
-const { parseStatement } = require('../src/parser.cjs');
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { detectDateOrder, parseStatement } from '../src/parser.ts';
 
 test('keeps exact amounts and suggests counter-accounts for signed cash flows', () => {
   const statement = parseStatement([
@@ -35,7 +35,6 @@ test('only reads signed amounts from running-balance layouts with an explicit he
 });
 
 test('detects the statement date format', () => {
-  const { detectDateOrder } = require('../src/parser.cjs');
   assert.equal(detectDateOrder('2026-04-01 A -1.00\n2026-04-02 B -1.00'), 'ISO');
   assert.equal(detectDateOrder('21/04/2026 A -1.00\n02/05/2026 B -1.00'), 'DMY');
   assert.equal(detectDateOrder('04/21/2026 A -1.00\n05/02/2026 B -1.00'), 'MDY');

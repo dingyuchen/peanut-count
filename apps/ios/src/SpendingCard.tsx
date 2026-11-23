@@ -1,23 +1,31 @@
-import React, { useMemo } from 'react';
+import { useMemo } from 'react';
 import { Pressable, Text, View } from 'react-native';
+import { breakdown, shares, shiftMonth, spendingIndex, trend } from './spending';
+import type { Statement } from './storage';
 import { Money, Segmented, formatCents, monthTitle, useTheme } from './ui';
-
-const { spendingIndex, trend, breakdown, shares, shiftMonth } = require('./spending.cjs');
 
 const COLUMN_HEIGHT = 88;
 const SHORT_MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-const shortMonth = (month) => SHORT_MONTHS[Number(month.slice(5, 7)) - 1];
-const longMonth = (month) => monthTitle(`${month}-01`).split(' ')[0];
-const ratio = (value, max) => (max > 0n && value > 0n ? Number((value * 10000n) / max) / 10000 : 0);
+const shortMonth = (month: string): string => SHORT_MONTHS[Number(month.slice(5, 7)) - 1];
+const longMonth = (month: string): string => monthTitle(`${month}-01`).split(' ')[0];
+const ratio = (value: bigint, max: bigint): number => (max > 0n && value > 0n ? Number((value * 10000n) / max) / 10000 : 0);
 
 // Copilot/Penny-style spending card: a six-month column trend (tap to pick a month)
 // above ranked horizontal bars for that month's expense categories. The selected month
 // is owned by the home screen so the transaction list below follows it.
-export default function SpendingCard({ statements, month, first, last, onMonthChange, currency: chosen, onCurrencyChange }) {
+export default function SpendingCard({ statements, month, first, last, onMonthChange, currency: chosen, onCurrencyChange }: {
+  statements: Statement[];
+  month: string | undefined;
+  first: string | undefined;
+  last: string | undefined;
+  onMonthChange: (month: string) => void;
+  currency: string | null;
+  onCurrencyChange: (currency: string) => void;
+}) {
   const { c, s } = useTheme();
   const index = useMemo(() => spendingIndex(statements), [statements]);
-  const currency = index.currencies.includes(chosen) ? chosen : index.currencies[0];
-  if (!currency || !month) return null;
+  const currency = chosen && index.currencies.includes(chosen) ? chosen : index.currencies[0];
+  if (!currency || !month || !first || !last) return null;
 
   const ledger = index.byCurrency[currency];
   const windowEnd = month > shiftMonth(last, -6) ? last : month;
@@ -38,7 +46,7 @@ export default function SpendingCard({ statements, month, first, last, onMonthCh
 
   const canGoBack = month > first;
   const canGoForward = month < last;
-  const Arrow = ({ label, glyph, enabled, delta }) => <Pressable accessibilityRole="button" accessibilityLabel={label}
+  const Arrow = ({ label, glyph, enabled, delta }: { label: string; glyph: string; enabled: boolean; delta: number }) => <Pressable accessibilityRole="button" accessibilityLabel={label}
     hitSlop={10} disabled={!enabled} onPress={() => onMonthChange(shiftMonth(month, delta))}
     style={({ pressed }) => [{ paddingHorizontal: 8 }, pressed && s.pressed, !enabled && s.disabled]}>
     <Text style={[s.headline, { color: c.accent }]}>{glyph}</Text>

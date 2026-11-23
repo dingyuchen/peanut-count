@@ -1,21 +1,46 @@
 // Monthly spending by expense category, computed with exact integer cents.
 // An outflow to Expenses:X adds to X; a refund (inflow from Expenses:X) reduces it.
 
+export interface SpendingRow {
+  date: string;
+  amount: string;
+  account: string;
+}
+
+export interface MonthSpending {
+  total: bigint;
+  categories: Record<string, bigint>;
+}
+
+export interface CurrencyLedger {
+  months: Record<string, MonthSpending>;
+}
+
+export interface SpendingIndex {
+  currencies: string[];
+  byCurrency: Record<string, CurrencyLedger>;
+}
+
+export interface CategoryShare {
+  name: string;
+  value: bigint;
+  other?: boolean;
+}
+
 const TOP_CATEGORIES = 5;
 const TREND_MONTHS = 6;
 
-const cents = (amount) => BigInt(amount.replace('.', ''));
+const cents = (amount: string): bigint => BigInt(amount.replace('.', ''));
 
-function shiftMonth(month, delta) {
+export function shiftMonth(month: string, delta: number): string {
   const [year, number] = month.split('-').map(Number);
   const index = year * 12 + (number - 1) + delta;
   return `${Math.floor(index / 12)}-${String((index % 12) + 1).padStart(2, '0')}`;
 }
 
-// statements: [{ currency, rows: [{ date, amount, account }] }]
-// Returns { currencies, byCurrency: { USD: { months: { '2026-11': { total, categories: { Dining: 475n } } } } } }
-function spendingIndex(statements) {
-  const byCurrency = {};
+// Example: { currencies: ['USD'], byCurrency: { USD: { months: { '2026-11': { total, categories: { Dining: 475n } } } } } }
+export function spendingIndex(statements: readonly { currency: string; rows: readonly SpendingRow[] }[]): SpendingIndex {
+  const byCurrency: Record<string, CurrencyLedger> = {};
   for (const statement of statements) {
     for (const row of statement.rows) {
       // Every month with a transaction exists, so months with only income still show as zero spending.
@@ -33,12 +58,12 @@ function spendingIndex(statements) {
   return { currencies, byCurrency };
 }
 
-const latestMonth = (ledger) => Object.keys(ledger.months).sort().at(-1);
-const earliestMonth = (ledger) => Object.keys(ledger.months).sort()[0];
+export const latestMonth = (ledger: CurrencyLedger): string | undefined => Object.keys(ledger.months).sort().at(-1);
+export const earliestMonth = (ledger: CurrencyLedger): string | undefined => Object.keys(ledger.months).sort()[0];
 
 // Whole percentages that add up to 100: floor each share, then hand the remaining
 // points to the largest remainders (ties go to the larger value, which comes first).
-function shares(values) {
+export function shares(values: readonly bigint[]): number[] {
   const total = values.reduce((sum, value) => sum + value, 0n);
   if (total <= 0n) return values.map(() => 0);
   const parts = values.map((value, index) => ({ index, floor: (value * 100n) / total, rest: (value * 100n) % total }));
@@ -52,7 +77,7 @@ function shares(values) {
 }
 
 // The six months ending at `month`, oldest first, with months without data as zero.
-function trend(ledger, month) {
+export function trend(ledger: CurrencyLedger, month: string): { month: string; total: bigint }[] {
   return Array.from({ length: TREND_MONTHS }, (_, index) => {
     const key = shiftMonth(month, index - TREND_MONTHS + 1);
     return { month: key, total: ledger.months[key]?.total ?? 0n };
@@ -60,7 +85,7 @@ function trend(ledger, month) {
 }
 
 // Categories with positive net spending, largest first; the tail folds into "Other".
-function breakdown(ledger, month) {
+export function breakdown(ledger: CurrencyLedger, month: string): CategoryShare[] {
   const entries = Object.entries(ledger.months[month]?.categories ?? {})
     .filter(([, value]) => value > 0n)
     .sort(([nameA, a], [nameB, b]) => (a === b ? nameA.localeCompare(nameB) : a > b ? -1 : 1));
@@ -71,5 +96,3 @@ function breakdown(ledger, month) {
     { name: 'Other', value: other, other: true },
   ];
 }
-
-module.exports = { spendingIndex, latestMonth, earliestMonth, trend, breakdown, shares, shiftMonth };

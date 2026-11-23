@@ -1,5 +1,10 @@
-import React, { useMemo } from 'react';
-import { ActivityIndicator, Pressable, StyleSheet, Text, TextInput, View, useColorScheme } from 'react-native';
+import type { ReactNode } from 'react';
+import {
+  ActivityIndicator, Pressable, StyleSheet, Text, TextInput, View, useColorScheme,
+  type StyleProp, type TextInputProps, type TextStyle, type ViewStyle,
+} from 'react-native';
+
+type PaletteName = 'light' | 'dark';
 
 const palettes = {
   light: {
@@ -40,9 +45,11 @@ const palettes = {
     errorSurface: '#3B1A18',
     successSurface: '#173022',
   },
-};
+} satisfies Record<PaletteName, Record<string, string>>;
 
-function createStyles(c) {
+export type Palette = typeof palettes.light;
+
+function createStyles(c: Palette) {
   return StyleSheet.create({
     screen: { flex: 1, backgroundColor: c.background },
     content: { paddingHorizontal: 20, paddingBottom: 48, gap: 16 },
@@ -92,16 +99,34 @@ function createStyles(c) {
   });
 }
 
-const themes = Object.fromEntries(Object.entries(palettes).map(([name, c]) => [name, { c, s: createStyles(c), dark: name === 'dark' }]));
+export interface Theme {
+  c: Palette;
+  s: ReturnType<typeof createStyles>;
+  dark: boolean;
+}
 
-export function useTheme() {
+const themes: Record<PaletteName, Theme> = {
+  light: { c: palettes.light, s: createStyles(palettes.light), dark: false },
+  dark: { c: palettes.dark, s: createStyles(palettes.dark), dark: true },
+};
+
+export function useTheme(): Theme {
   const scheme = useColorScheme();
   return themes[scheme === 'dark' ? 'dark' : 'light'];
 }
 
-export function Button({ label, onPress, variant = 'primary', disabled, loading, compact }) {
+type ButtonVariant = 'primary' | 'secondary' | 'plain' | 'destructive';
+
+export function Button({ label, onPress, variant = 'primary', disabled, loading, compact }: {
+  label: string;
+  onPress?: () => void;
+  variant?: ButtonVariant;
+  disabled?: boolean;
+  loading?: boolean;
+  compact?: boolean;
+}) {
   const { c, s } = useTheme();
-  const tones = {
+  const tones: Record<ButtonVariant, [string, string]> = {
     primary: [c.accent, c.onAccent],
     secondary: [c.accentSoft, c.accent],
     plain: ['transparent', c.accent],
@@ -124,7 +149,7 @@ export function Button({ label, onPress, variant = 'primary', disabled, loading,
   </Pressable>;
 }
 
-export function NavBar({ left, title, right }) {
+export function NavBar({ left, title, right }: { left?: ReactNode; title: string; right?: ReactNode }) {
   const { s } = useTheme();
   return <View style={s.navBar}>
     <View style={[s.navSide, { alignItems: 'flex-start' }]}>{left}</View>
@@ -133,7 +158,12 @@ export function NavBar({ left, title, right }) {
   </View>;
 }
 
-export function Field({ label, hint, invalid, autoCapitalize = 'none', style, ...properties }) {
+export function Field({ label, hint, invalid, autoCapitalize = 'none', style, ...properties }: TextInputProps & {
+  label?: string;
+  hint?: string;
+  invalid?: boolean;
+  style?: StyleProp<ViewStyle>;
+}) {
   const { c, s } = useTheme();
   return <View style={[s.field, style]}>
     {label && <Text style={s.fieldLabel}>{label}</Text>}
@@ -143,7 +173,12 @@ export function Field({ label, hint, invalid, autoCapitalize = 'none', style, ..
   </View>;
 }
 
-export function Segmented({ options, value, onChange, label }) {
+export function Segmented<T extends string>({ options, value, onChange, label }: {
+  options: readonly { value: T; label: string }[];
+  value: T;
+  onChange: (value: T) => void;
+  label?: string;
+}) {
   const { s } = useTheme();
   return <View style={s.field}>
     {label && <Text style={s.fieldLabel}>{label}</Text>}
@@ -159,7 +194,7 @@ export function Segmented({ options, value, onChange, label }) {
   </View>;
 }
 
-export function Chips({ values, onSelect }) {
+export function Chips({ values, onSelect }: { values: readonly string[]; onSelect: (value: string) => void }) {
   const { s } = useTheme();
   if (!values.length) return null;
   return <View style={s.chips}>
@@ -170,7 +205,7 @@ export function Chips({ values, onSelect }) {
   </View>;
 }
 
-export function Pill({ label, tone = 'accent' }) {
+export function Pill({ label, tone = 'accent' }: { label: string; tone?: 'accent' | 'muted' }) {
   const { c, s } = useTheme();
   const [background, foreground] = tone === 'muted' ? [c.surfaceMuted, c.muted] : [c.accentSoft, c.accent];
   return <View style={[s.pill, { backgroundColor: background }]}>
@@ -179,14 +214,22 @@ export function Pill({ label, tone = 'accent' }) {
   </View>;
 }
 
-export function Banner({ tone = 'info', text, onDismiss, children }) {
+export type BannerTone = 'info' | 'warning' | 'error' | 'success';
+
+export function Banner({ tone = 'info', text, onDismiss, children }: {
+  tone?: BannerTone;
+  text: string;
+  onDismiss?: () => void;
+  children?: ReactNode;
+}) {
   const { c, s } = useTheme();
-  const [background, foreground] = {
+  const tones: Record<BannerTone, [string, string]> = {
     info: [c.surfaceMuted, c.text],
     warning: [c.warningSurface, c.warningText],
     error: [c.errorSurface, c.danger],
     success: [c.successSurface, c.positive],
-  }[tone];
+  };
+  const [background, foreground] = tones[tone];
   return <View style={[s.banner, { backgroundColor: background }]} accessibilityLiveRegion="polite">
     <View style={{ flex: 1, gap: 10 }}>
       <Text style={[s.bannerText, { color: foreground }]}>{text}</Text>
@@ -201,13 +244,13 @@ export function Banner({ tone = 'info', text, onDismiss, children }) {
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 const LONG_MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
 
-export const shortDate = (date) => `${MONTHS[Number(date.slice(5, 7)) - 1]} ${Number(date.slice(8, 10))}`;
-export const monthTitle = (date) => `${LONG_MONTHS[Number(date.slice(5, 7)) - 1]} ${date.slice(0, 4)}`;
+export const shortDate = (date: string): string => `${MONTHS[Number(date.slice(5, 7)) - 1]} ${Number(date.slice(8, 10))}`;
+export const monthTitle = (date: string): string => `${LONG_MONTHS[Number(date.slice(5, 7)) - 1]} ${date.slice(0, 4)}`;
 
 // Amounts are exact decimal strings with two fraction digits ("-1250.00").
-export const toCents = (amount) => BigInt(amount.replace('.', ''));
+export const toCents = (amount: string): bigint => BigInt(amount.replace('.', ''));
 
-export function formatCents(cents, { signed = false } = {}) {
+export function formatCents(cents: bigint, { signed = false }: { signed?: boolean } = {}): string {
   const negative = cents < 0n;
   const digits = (negative ? -cents : cents).toString().padStart(3, '0');
   const whole = digits.slice(0, -2).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
@@ -215,11 +258,17 @@ export function formatCents(cents, { signed = false } = {}) {
   return `${sign}${whole}.${digits.slice(-2)}`;
 }
 
-export const formatAmount = (amount) => formatCents(toCents(amount), { signed: true });
+export const formatAmount = (amount: string): string => formatCents(toCents(amount), { signed: true });
 
 // An amount with price-tag cents: the cents are set smaller and aligned to the top of
 // the whole units, without a decimal point. Screen readers get the full amount.
-export function Money({ cents, size = 17, weight = '700', color, unit }) {
+export function Money({ cents, size = 17, weight = '700', color, unit }: {
+  cents: bigint;
+  size?: number;
+  weight?: TextStyle['fontWeight'];
+  color?: string;
+  unit?: string;
+}) {
   const { c } = useTheme();
   const text = formatCents(cents);
   const ink = color ?? c.text;

@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState, type Dispatch, type ReactElement, type ReactNode, type SetStateAction } from 'react';
 import {
   ActivityIndicator, Alert, FlatList, KeyboardAvoidingView, Linking, Modal, RefreshControl, ScrollView,
   SectionList, StatusBar, StyleSheet, Switch, Text, View,
@@ -7,23 +7,54 @@ import { SafeAreaProvider, SafeAreaView, useSafeAreaInsets } from 'react-native-
 import { requireNativeModule } from 'expo';
 import * as DocumentPicker from 'expo-document-picker';
 import { useIncomingShare } from 'expo-sharing';
-import { account, clearProfile, storedProfile, syncStatements } from './api';
+import { account, clearProfile, storedProfile, syncStatements, type AuthMode, type Profile } from './api';
+import { currencyPattern, detectDateOrder, parseStatement, validAccount, type DateOrder } from './parser';
+import SpendingCard from './SpendingCard';
 import {
   LockedLedgerError, addStatement, conflictCount, eraseLocalLedger, loadMode, resolveConflicts, saveMode, statements,
+  type LedgerMode, type Statement, type StatementRow,
 } from './storage';
 import {
   Banner, Button, Chips, Field, NavBar, Pill, Segmented, formatAmount, formatCents, monthTitle, shortDate, toCents, useTheme,
+  type BannerTone,
 } from './ui';
-import SpendingCard from './SpendingCard';
 
-const { validAccount, currencyPattern, parseStatement, detectDateOrder } = require('./parser.cjs');
-const pdf = requireNativeModule('StatementPdf');
+const pdf = requireNativeModule<{ read(uri: string): Promise<{ id: string; text: string }> }>('StatementPdf');
 
 const LOCAL_SCOPE = 'device';
-const isStatementAccount = (value) => validAccount(value) && /^(Assets|Liabilities):/.test(value);
-const plural = (count, word) => `${count} ${word}${count === 1 ? '' : 's'}`;
+const isStatementAccount = (value: string): boolean => validAccount(value) && /^(Assets|Liabilities):/.test(value);
+const plural = (count: number, word: string): string => `${count} ${word}${count === 1 ? '' : 's'}`;
 
-function BottomBar({ children }) {
+type Phase = 'loading' | 'locked' | 'ready';
+type Busy = 'import' | 'post' | 'sync' | 'mode' | 'auth' | 'signout' | null;
+type Notice = { tone: BannerTone; text: string } | null;
+
+interface DraftRow extends StatementRow {
+  excluded?: boolean;
+}
+
+// A statement being imported: the PDF's text, the details entered on the setup
+// screen, and (after "Find transactions") the parsed rows under review.
+interface Draft {
+  id: string;
+  text: string;
+  source: string;
+  currency: string;
+  order: DateOrder;
+  detected: DateOrder | 'ISO' | null;
+  rows: DraftRow[] | null;
+  skipped: number;
+}
+
+interface ReviewDraft extends Draft {
+  rows: DraftRow[];
+}
+
+type SetDraft = Dispatch<SetStateAction<Draft | null>>;
+
+const message = (error: unknown): string => (error instanceof Error ? error.message : String(error));
+
+function BottomBar({ children }: { children: ReactNode }) {
   const { s } = useTheme();
   const insets = useSafeAreaInsets();
   return <View style={[s.bottomBar, { paddingBottom: Math.max(insets.bottom, 12) }]}>{children}</View>;
@@ -40,17 +71,17 @@ export default function App() {
 }
 
 function Ledger() {
-  const [phase, setPhase] = useState('loading');
+  const [phase, setPhase] = useState<Phase>('loading');
   const [lockReason, setLockReason] = useState('');
-  const [mode, setMode] = useState('local');
-  const [profile, setProfile] = useState(null);
+  const [mode, setMode] = useState<LedgerMode>('local');
+  const [profile, setProfile] = useState<Profile | null>(null);
   const [showSync, setShowSync] = useState(false);
-  const [busy, setBusy] = useState(null);
-  const [notice, setNotice] = useState(null);
-  const [items, setItems] = useState([]);
+  const [busy, setBusy] = useState<Busy>(null);
+  const [notice, setNotice] = useState<Notice>(null);
+  const [items, setItems] = useState<Statement[]>([]);
   const [conflicts, setConflicts] = useState(0);
-  const [draft, setDraft] = useState(null);
-  const [defaults, setDefaults] = useState({ source: '', currency: '', order: 'MDY' });
+  const [draft, setDraft] = useState<Draft | null>(null);
+  const [defaults, setDefaults] = useState<{ source: string; currency: string; order: DateOrder }>({ source: '', currency: '', order: 'MDY' });
   const active = useRef(false);
   const share = useIncomingShare();
   // Without an account there is no server to talk to: the device ledger is the only ledger.
@@ -69,7 +100,7 @@ function Ledger() {
         setLockReason(error.message);
         setPhase('locked');
       } else {
-        setNotice({ tone: 'error', text: error.message });
+        setNotice({ tone: 'error', text: message(error) });
         setPhase('ready');
       }
     }
@@ -83,21 +114,21 @@ function Ledger() {
     setConflicts(0);
     if (scope) Promise.all([statements(scope), conflictCount(scope)]).then(([records, count]) => {
       if (current) { setItems(records); setConflicts(count); }
-    }).catch((error) => { if (current) setNotice({ tone: 'error', text: error.message }); });
+    }).catch((error: unknown) => { if (current) setNotice({ tone: 'error', text: message(error) }); });
     return () => { current = false; };
   }, [scope]);
 
-  async function perform(key, work) {
+  async function perform(key: Exclude<Busy, null>, work: () => Promise<void>) {
     if (active.current) return;
     active.current = true;
     setBusy(key);
     setNotice(null);
     try { await work(); }
-    catch (error) { setNotice({ tone: 'error', text: error.message }); }
+    catch (error) { setNotice({ tone: 'error', text: message(error) }); }
     finally { active.current = false; setBusy(null); }
   }
 
-  async function read(uri) {
+  async function read(uri: string) {
     const document = await pdf.read(uri);
     const detected = detectDateOrder(document.text);
     setDraft({
@@ -135,18 +166,18 @@ function Ledger() {
     }
   }, [scope, busy, draft, share.sharedPayloads, share.isResolving, share.error, share.resolvedSharedPayloads]);
 
-  async function selectMode(next) {
+  async function selectMode(next: LedgerMode) {
     await saveMode(next);
     setMode(next);
   }
 
-  async function refresh(target = scope) {
+  async function refresh(target: string) {
     const [records, count] = await Promise.all([statements(target), conflictCount(target)]);
     setItems(records);
     setConflicts(count);
   }
 
-  async function synchronize(session = profile) {
+  async function synchronize(session: Profile) {
     try {
       await syncStatements(session);
     } finally {
@@ -155,6 +186,7 @@ function Ledger() {
   }
 
   function preview() {
+    if (!draft) return;
     const source = draft.source.trim();
     const currency = draft.currency.trim().toUpperCase();
     try {
@@ -163,11 +195,11 @@ function Ledger() {
       if (rows.length > 500) throw new Error('Choose a statement with at most 500 transaction rows.');
       setNotice(null);
       setDraft({ ...draft, source, currency, rows, skipped });
-    } catch (error) { setNotice({ tone: 'error', text: error.message }); }
+    } catch (error) { setNotice({ tone: 'error', text: message(error) }); }
   }
 
-  async function post() {
-    const rows = draft.rows.filter((row) => !row.excluded).map(({ excluded, ...row }) => ({
+  async function post(draft: ReviewDraft, scope: string) {
+    const rows = draft.rows.filter((row) => !row.excluded).map(({ excluded: _, ...row }) => ({
       ...row, account: row.account.trim(),
     }));
     if (!rows.length || rows.some((row) => !validAccount(row.account) || row.account === draft.source)) {
@@ -176,17 +208,17 @@ function Ledger() {
     await addStatement(scope, { id: draft.id, source: draft.source, currency: draft.currency, rows }, synced);
     setDefaults({ source: draft.source, currency: draft.currency, order: draft.order });
     setDraft(null);
-    await refresh();
+    await refresh(scope);
     const added = `Added ${plural(rows.length, 'transaction')}.`;
     if (!synced) {
       setNotice({ tone: 'success', text: added });
       return;
     }
     try {
-      await synchronize();
+      await synchronize(profile);
       setNotice({ tone: 'success', text: `${added} Synced.` });
     } catch (error) {
-      setNotice({ tone: 'warning', text: `${added} Saved on this iPhone; upload will retry on the next sync. ${error.message}` });
+      setNotice({ tone: 'warning', text: `${added} Saved on this iPhone; upload will retry on the next sync. ${message(error)}` });
     }
   }
 
@@ -202,19 +234,25 @@ function Ledger() {
     await boot();
   }} />;
 
-  const banner = notice && <Banner tone={notice.tone} text={notice.text} onDismiss={() => setNotice(null)} />;
+  const banner = notice ? <Banner tone={notice.tone} text={notice.text} onDismiss={() => setNotice(null)} /> : null;
 
-  if (draft?.rows) return <ReviewScreen
-    draft={draft} setDraft={setDraft} banner={banner} busy={busy}
-    onBack={() => { setNotice(null); setDraft({ ...draft, rows: null }); }}
-    onSubmit={() => {
-      const confirm = () => perform('post', post);
-      if (draft.skipped) Alert.alert('Import the parsed transactions?', `${plural(draft.skipped, 'dated line')} could not be read and will be left out.`, [
-        { text: 'Cancel', style: 'cancel' }, { text: 'Import', onPress: confirm },
-      ]);
-      else confirm();
-    }}
-  />;
+  // Past the loading and locked phases, the ledger scope is always known.
+  if (!scope) return null;
+
+  if (draft?.rows) {
+    const review: ReviewDraft = { ...draft, rows: draft.rows };
+    return <ReviewScreen
+      draft={review} setDraft={setDraft} banner={banner} busy={busy}
+      onBack={() => { setNotice(null); setDraft({ ...review, rows: null }); }}
+      onSubmit={() => {
+        const confirm = () => perform('post', () => post(review, scope));
+        if (review.skipped) Alert.alert('Import the parsed transactions?', `${plural(review.skipped, 'dated line')} could not be read and will be left out.`, [
+          { text: 'Cancel', style: 'cancel' }, { text: 'Import', onPress: confirm },
+        ]);
+        else confirm();
+      }}
+    />;
+  }
 
   if (draft) return <SetupScreen
     draft={draft} setDraft={setDraft} known={known} banner={banner}
@@ -231,14 +269,16 @@ function Ledger() {
       })}
       onOpenSync={() => { setNotice(null); setShowSync(true); }}
       onSync={() => perform('sync', async () => {
-        await synchronize();
+        if (!profile) return;
+        await synchronize(profile);
         setNotice({ tone: 'success', text: 'Up to date.' });
       })}
       onResolve={() => Alert.alert('Use the server copies?', 'This iPhone’s versions of the conflicting imports will be archived on this device.', [
         { text: 'Cancel', style: 'cancel' },
         { text: 'Use server copies', onPress: () => perform('sync', async () => {
+          if (!profile) return;
           await resolveConflicts(scope);
-          await synchronize();
+          await synchronize(profile);
         }) },
       ])}
     />
@@ -246,7 +286,8 @@ function Ledger() {
       visible={showSync} onClose={() => setShowSync(false)}
       profile={profile} synced={synced} busy={busy} banner={banner}
       onSync={() => perform('sync', async () => {
-        await synchronize();
+        if (!profile) return;
+        await synchronize(profile);
         setNotice({ tone: 'success', text: 'Up to date.' });
       })}
       onSelectLedger={(next) => perform('mode', () => selectMode(next))}
@@ -269,19 +310,30 @@ function Ledger() {
   </>;
 }
 
-function HomeScreen({ items, synced, profile, conflicts, busy, banner, onImport, onOpenSync, onSync, onResolve }) {
+function HomeScreen({ items, synced, profile, conflicts, busy, banner, onImport, onOpenSync, onSync, onResolve }: {
+  items: Statement[];
+  synced: boolean;
+  profile: Profile | null;
+  conflicts: number;
+  busy: Busy;
+  banner: ReactElement | null;
+  onImport: () => void;
+  onOpenSync: () => void;
+  onSync: () => void;
+  onResolve: () => void;
+}) {
   const { c, s } = useTheme();
   const rows = useMemo(() => items
     .flatMap((statement) => statement.rows.map((row, index) => ({
       ...row, source: statement.source, currency: statement.currency, key: `${statement.id}:${index}`,
     })))
     .sort((a, b) => b.date.localeCompare(a.date)), [items]);
-  const [chosenMonth, setMonth] = useState(null);
-  const [currency, setCurrency] = useState(null);
+  const [chosenMonth, setMonth] = useState<string | null>(null);
+  const [currency, setCurrency] = useState<string | null>(null);
   const first = rows.at(-1)?.date.slice(0, 7);
   const last = rows[0]?.date.slice(0, 7);
   // Follow the newest month by default, and again after an import adds a newer one.
-  const month = chosenMonth && chosenMonth >= first && chosenMonth <= last ? chosenMonth : last;
+  const month = chosenMonth && first && last && chosenMonth >= first && chosenMonth <= last ? chosenMonth : last;
   useEffect(() => { setMonth(null); }, [last]);
   // The list shows the month picked in the spending card, so the two always agree.
   const sections = useMemo(() => {
@@ -296,7 +348,7 @@ function HomeScreen({ items, synced, profile, conflicts, busy, banner, onImport,
         <Text style={s.largeTitle} accessibilityRole="header">Peanut Count</Text>
         <View style={[s.row, { gap: 8, flexWrap: 'wrap' }]}>
           <Pill label="Encrypted" />
-          <Pill tone={synced ? 'accent' : 'muted'} label={synced ? `Synced · ${profile.username}` : 'On this iPhone only'} />
+          <Pill tone={synced ? 'accent' : 'muted'} label={synced && profile ? `Synced · ${profile.username}` : 'On this iPhone only'} />
         </View>
       </View>
       <View style={{ marginTop: 4 }}>
@@ -335,7 +387,7 @@ function HomeScreen({ items, synced, profile, conflicts, busy, banner, onImport,
   />;
 }
 
-function Stat({ value, label }) {
+function Stat({ value, label }: { value: string; label: string }) {
   const { s } = useTheme();
   return <View style={s.stat}>
     <Text style={s.statValue} numberOfLines={1} adjustsFontSizeToFit>{value}</Text>
@@ -343,7 +395,9 @@ function Stat({ value, label }) {
   </View>;
 }
 
-function TransactionRow({ item, showSource, first, last }) {
+type TransactionItem = StatementRow & { source: string; currency: string; key: string };
+
+function TransactionRow({ item, showSource, first, last }: { item: TransactionItem; showSource: boolean; first: boolean; last: boolean }) {
   const { c, s } = useTheme();
   const inflow = !item.amount.startsWith('-');
   return <View style={{
@@ -366,7 +420,7 @@ function TransactionRow({ item, showSource, first, last }) {
   </View>;
 }
 
-function EmptyState({ synced }) {
+function EmptyState({ synced }: { synced: boolean }) {
   const { s } = useTheme();
   const steps = [
     ['Import a statement', 'Choose a PDF above, or share one from another app. Text is read on this iPhone.'],
@@ -386,9 +440,16 @@ function EmptyState({ synced }) {
   </View>;
 }
 
-function SetupScreen({ draft, setDraft, known, banner, onCancel, onContinue }) {
+function SetupScreen({ draft, setDraft, known, banner, onCancel, onContinue }: {
+  draft: Draft;
+  setDraft: SetDraft;
+  known: { sources: string[]; currencies: string[] };
+  banner: ReactElement | null;
+  onCancel: () => void;
+  onContinue: () => void;
+}) {
   const { s } = useTheme();
-  const update = (patch) => setDraft((previous) => ({ ...previous, ...patch }));
+  const update = (patch: Partial<Draft>) => setDraft((previous) => previous && { ...previous, ...patch });
   const source = draft.source.trim();
   const currency = draft.currency.trim().toUpperCase();
   const sourceInvalid = source.length > 0 && !isStatementAccount(source);
@@ -435,19 +496,26 @@ function SetupScreen({ draft, setDraft, known, banner, onCancel, onContinue }) {
   </KeyboardAvoidingView>;
 }
 
-function ReviewScreen({ draft, setDraft, banner, busy, onBack, onSubmit }) {
+function ReviewScreen({ draft, setDraft, banner, busy, onBack, onSubmit }: {
+  draft: ReviewDraft;
+  setDraft: SetDraft;
+  banner: ReactElement | null;
+  busy: Busy;
+  onBack: () => void;
+  onSubmit: () => void;
+}) {
   const { c, s } = useTheme();
   const included = draft.rows.filter((row) => !row.excluded);
   const totals = included.reduce(([inflow, outflow], row) => {
     const cents = toCents(row.amount);
     return cents > 0n ? [inflow + cents, outflow] : [inflow, outflow + cents];
   }, [0n, 0n]);
-  const rowInvalid = (row) => !validAccount(row.account.trim()) || row.account.trim() === draft.source;
+  const rowInvalid = (row: DraftRow): boolean => !validAccount(row.account.trim()) || row.account.trim() === draft.source;
   const invalid = included.filter(rowInvalid).length;
-  const edit = (index, patch) => setDraft((previous) => ({
+  const edit = (index: number, patch: Partial<DraftRow>) => setDraft((previous) => previous?.rows ? {
     ...previous,
     rows: previous.rows.map((row, position) => position === index ? { ...row, ...patch } : row),
-  }));
+  } : previous);
 
   return <KeyboardAvoidingView behavior="padding" style={{ flex: 1 }}>
     <NavBar left={<Button compact variant="plain" label="‹ Back" disabled={!!busy} onPress={onBack} />} title="Review" />
@@ -503,7 +571,18 @@ function ReviewScreen({ draft, setDraft, banner, busy, onBack, onSubmit }) {
   </KeyboardAvoidingView>;
 }
 
-function SyncSheet({ visible, onClose, profile, synced, busy, banner, onSync, onSelectLedger, onAuthenticate, onSignOut }) {
+function SyncSheet({ visible, onClose, profile, synced, busy, banner, onSync, onSelectLedger, onAuthenticate, onSignOut }: {
+  visible: boolean;
+  onClose: () => void;
+  profile: Profile | null;
+  synced: boolean;
+  busy: Busy;
+  banner: ReactElement | null;
+  onSync: () => void;
+  onSelectLedger: (mode: LedgerMode) => void;
+  onAuthenticate: (kind: AuthMode, address: string, username: string, password: string) => void;
+  onSignOut: () => void;
+}) {
   const { c, s } = useTheme();
   return <Modal visible={visible} animationType="slide" presentationStyle="pageSheet" onRequestClose={onClose}>
     <View style={[s.screen, { paddingTop: 8 }]}>
@@ -555,9 +634,12 @@ function SyncSheet({ visible, onClose, profile, synced, busy, banner, onSync, on
   </Modal>;
 }
 
-function AuthForm({ busy, onSubmit }) {
+function AuthForm({ busy, onSubmit }: {
+  busy: Busy;
+  onSubmit: (kind: AuthMode, address: string, username: string, password: string) => void;
+}) {
   const { s } = useTheme();
-  const [kind, setKind] = useState('login');
+  const [kind, setKind] = useState<AuthMode>('login');
   const [address, setAddress] = useState('');
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
@@ -574,7 +656,7 @@ function AuthForm({ busy, onSubmit }) {
   </View>;
 }
 
-function LockedScreen({ reason, onErase }) {
+function LockedScreen({ reason, onErase }: { reason: string; onErase: () => Promise<void> }) {
   const { s } = useTheme();
   const [working, setWorking] = useState(false);
   return <ScrollView contentContainerStyle={[s.content, { paddingTop: 48 }]}>
@@ -590,7 +672,7 @@ function LockedScreen({ reason, onErase }) {
         { text: 'Erase', style: 'destructive', onPress: async () => {
           setWorking(true);
           try { await onErase(); }
-          catch (error) { Alert.alert('Could not erase the ledger', error.message); }
+          catch (error) { Alert.alert('Could not erase the ledger', message(error)); }
           finally { setWorking(false); }
         } },
       ])} />

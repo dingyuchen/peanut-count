@@ -1,10 +1,23 @@
+export type DateOrder = 'DMY' | 'MDY';
+
+export interface ParsedRow {
+  date: string;
+  description: string;
+  amount: string;
+  account: string;
+}
+
 const accountPattern = /^(Assets|Liabilities|Income|Expenses|Equity)(:[A-Z0-9][A-Za-z0-9-]*)+$/;
-const validAccount = (account) => account.length <= 255 && accountPattern.test(account);
-const currencyPattern = /^[A-Z]{3}$/;
+export const validAccount = (account: string): boolean => account.length <= 255 && accountPattern.test(account);
+export const currencyPattern = /^[A-Z]{3}$/;
 const dateStart = /^(\d{4}-\d{2}-\d{2}|\d{1,2}[/.]\d{1,2}[/.]\d{4})\s+/;
+const currenciesBySymbol: Record<string, string[]> = {
+  '$': ['USD', 'CAD', 'AUD', 'NZD', 'SGD', 'HKD'],
+  '£': ['GBP'], '€': ['EUR'],
+};
 const amountPattern = /^(?<sign>[+-]?)(?<whole>(?:\d{1,3}(?:,\d{3})+|\d+))\.(?<fraction>\d{2})$/;
 
-function readDate(value, dateOrder) {
+function readDate(value: string, dateOrder: DateOrder): string | null {
   let date = value;
   if (!value.includes('-')) {
     const [first, second, year] = value.split(/[/.]/);
@@ -18,7 +31,7 @@ function readDate(value, dateOrder) {
   return date;
 }
 
-function readAmount(value, marker) {
+function readAmount(value: string, marker: string | undefined): string | null {
   const parens = value.startsWith('(') && value.endsWith(')');
   const cleaned = (parens ? value.slice(1, -1) : value).replace(/^(?<sign>[+-]?)[$£€]/, '$<sign>');
   const parts = cleaned.match(amountPattern)?.groups;
@@ -29,7 +42,7 @@ function readAmount(value, marker) {
   return `${parts.sign === '-' || parens || marker === 'DR' ? '-' : ''}${whole}.${parts.fraction}`;
 }
 
-function category(description, amount) {
+function category(description: string, amount: string): string {
   if (!amount.startsWith('-')) {
     return /\b(payroll|salary|wages)\b/i.test(description)
       ? 'Income:Salary' : 'Income:Uncategorized';
@@ -40,9 +53,9 @@ function category(description, amount) {
   return 'Expenses:Uncategorized';
 }
 
-function parseStatement(text, currency, dateOrder) {
+export function parseStatement(text: string, currency: string, dateOrder: DateOrder): { rows: ParsedRow[]; skipped: number } {
   if (!currencyPattern.test(currency)) throw new Error('Enter a three-letter statement currency.');
-  const rows = [];
+  const rows: ParsedRow[] = [];
   let skipped = 0;
   let hasRunningBalance = false;
   for (const original of text.split(/\r?\n/)) {
@@ -64,20 +77,17 @@ function parseStatement(text, currency, dateOrder) {
         continue;
       }
     }
-    let marker;
-    let code;
+    let marker: string | undefined;
+    let code: string | undefined;
     for (let index = 0; index < 2; index++) {
       const tail = fields.at(-1) ?? '';
-      if (!marker && /^(CR|DR)$/i.test(tail)) marker = fields.pop().toUpperCase();
+      if (!marker && /^(CR|DR)$/i.test(tail)) marker = fields.pop()!.toUpperCase();
       else if (!code && /^[A-Z]{3}$/.test(tail)) code = fields.pop();
       else break;
     }
     const amountToken = fields.pop() ?? '';
     const symbol = amountToken.match(/[$£€]/)?.[0];
-    const symbolMatches = !symbol || {
-      '$': ['USD', 'CAD', 'AUD', 'NZD', 'SGD', 'HKD'],
-      '£': ['GBP'], '€': ['EUR']
-    }[symbol].includes(currency);
+    const symbolMatches = !symbol || currenciesBySymbol[symbol].includes(currency);
     const amount = readAmount(amountToken, marker);
     const description = fields.join(' ');
     if (!date || !amount || !symbolMatches || (code && code !== currency) || !description
@@ -94,7 +104,7 @@ function parseStatement(text, currency, dateOrder) {
 // Work out the statement's date format from its dated lines. Returns 'ISO' when every
 // date is YYYY-MM-DD, 'DMY' or 'MDY' when a day above 12 settles it, or null when the
 // dates are ambiguous or contradict each other.
-function detectDateOrder(text) {
+export function detectDateOrder(text: string): DateOrder | 'ISO' | null {
   let iso = 0;
   let slashed = 0;
   let dmy = false;
@@ -112,5 +122,3 @@ function detectDateOrder(text) {
   if (dmy !== mdy) return dmy ? 'DMY' : 'MDY';
   return null;
 }
-
-module.exports = { validAccount, currencyPattern, parseStatement, detectDateOrder };
