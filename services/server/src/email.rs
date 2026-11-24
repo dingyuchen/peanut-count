@@ -9,7 +9,7 @@ use std::{collections::BTreeMap, sync::LazyLock};
 
 use anyhow::{Context, Result};
 use chrono::{Datelike, Days, NaiveDate};
-use mail_parser::{Message, MessageParser, decoders::html::html_to_text};
+use mail_parser::{Message, MessageParser, PartType, decoders::html::html_to_text};
 use regex::Regex;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -56,11 +56,34 @@ pub fn parse(raw: &[u8]) -> Result<Email> {
     let outer = MessageParser::default()
         .parse(raw)
         .context("input is not an email message")?;
+    let email = read(&outer, raw);
+    drop_iteratively(outer);
+    Ok(email)
+}
+
+/// Drops a parsed message without recursion. mail-parser parses nested
+/// message/rfc822 parts iteratively but owns them as a tree, so dropping a
+/// few hundred thousand levels, which fit in 4 MiB, would overflow the stack.
+fn drop_iteratively(message: Message) {
+    let mut pending = vec![message];
+    while let Some(mut message) = pending.pop() {
+        for part in &mut message.parts {
+            if let PartType::Message(_) = part.body {
+                let body = std::mem::replace(&mut part.body, PartType::Multipart(Vec::new()));
+                if let PartType::Message(nested) = body {
+                    pending.push(nested);
+                }
+            }
+        }
+    }
+}
+
+fn read(outer: &Message, raw: &[u8]) -> Email {
     // A forward "as attachment" carries the original alert as message/rfc822.
     let message = outer
         .attachments()
         .find_map(|part| part.message())
-        .unwrap_or(&outer);
+        .unwrap_or(outer);
     let id = match message.message_id().or(outer.message_id()) {
         Some(message_id) => fingerprint(&["peanut-email", message_id.trim()]),
         None => format!("{:x}", Sha256::digest(raw)),
@@ -79,7 +102,7 @@ pub fn parse(raw: &[u8]) -> Result<Email> {
     let sent = message.date().and_then(|date| {
         NaiveDate::from_ymd_opt(date.year.into(), date.month.into(), date.day.into())
     });
-    Ok(Email {
+    Email {
         id,
         from: clean(truncate(&from, MAX_HEADER)),
         subject: strip_forward_prefix(&clean(truncate(
@@ -89,7 +112,7 @@ pub fn parse(raw: &[u8]) -> Result<Email> {
         .to_owned(),
         sent,
         body: truncate(&join_split_amounts(&clean(&body_text(message))), MAX_TEXT).to_owned(),
-    })
+    }
 }
 
 static BLOCK_TAG: LazyLock<Regex> = LazyLock::new(|| {
@@ -229,7 +252,7 @@ const NUMBER: &str = r"[0-9]{1,3}(?:,[0-9]{3})+(?:\.[0-9]{1,3})?|[0-9]+(?:\.[0-9
 const THREE_DECIMALS: [&str; 7] = ["BHD", "IQD", "JOD", "KWD", "LYD", "OMR", "TND"];
 
 static CODE_BEFORE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(&format!(r"\b({CODES}) ?-?$")).unwrap());
+    LazyLock::new(|| Regex::new(&format!(r"\b({CODES}) ?(?:[-−] ?)?$")).unwrap());
 
 /// A code right after an amount, bare or alone in parentheses as in "(USD)".
 /// "(USD 18.50)" is a second amount, not an annotation.
@@ -243,7 +266,7 @@ const SYMBOLS: &str = r"\b(?:US|CA|AU|HK|NZ|SG) ?\$|S\$|A\$|C\$|\$|€|£|¥|₹
 /// A currency symbol or code followed by a number, as in "S$12.50" or "SGD 12.50".
 static PREFIX_AMOUNT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(
-        r"(?:(?P<symbol>{SYMBOLS})|\b(?P<code>{CODES})) ?-?(?P<number>{NUMBER})"
+        r"(?:(?P<symbol>{SYMBOLS})|\b(?P<code>{CODES})) ?(?:[-−] ?)?(?P<number>{NUMBER})"
     ))
     .unwrap()
 });
@@ -535,6 +558,7 @@ pub fn dates(text: &str, anchor: NaiveDate) -> Vec<(NaiveDate, String)> {
         "december",
     ];
     let earliest = anchor - Days::new(400);
+    let first = NaiveDate::from_ymd_opt(1900, 1, 1).unwrap();
     let latest = anchor + Days::new(1);
     let mut found: Vec<(NaiveDate, String)> = Vec::new();
     for (kind, pattern) in DATES.iter().enumerate() {
@@ -582,7 +606,10 @@ pub fn dates(text: &str, anchor: NaiveDate) -> Vec<(NaiveDate, String)> {
                         }
                     }),
                 };
-                let Some(date) = date.filter(|date| (earliest..=latest).contains(date)) else {
+                // An explicit year is kept back to 1900, so an old alert forwarded
+                // today keeps its date. An inferred year stays within the window.
+                let start = if year.is_some() { first } else { earliest };
+                let Some(date) = date.filter(|date| (start..=latest).contains(date)) else {
                     continue;
                 };
                 if found.len() < MAX_CANDIDATES && !found.iter().any(|(seen, _)| *seen == date) {
@@ -1210,6 +1237,7 @@ Available balance: SGD 1,204.33.\r\n";
                 "2026-11-20",
                 "2026-11-23",
                 "2026-11-03",
+                "1990-01-01",
                 "2026-11-22",
                 "2026-09-30",
                 "2026-11-05",
@@ -1235,6 +1263,8 @@ Available balance: SGD 1,204.33.\r\n";
             dates("Transaction time: 2026-11-23T23:58:00+08:00", anchor)[0].0,
             date("2026-11-23")
         );
+        // An explicit year older than the window is kept for old forwarded alerts.
+        assert_eq!(dates("Paid on 2024-03-05", anchor)[0].0, date("2024-03-05"));
         // A yearless date after the anchor belongs to the previous year.
         assert_eq!(dates("on 30 Dec", anchor)[0].0, date("2025-12-30"));
     }
@@ -1308,6 +1338,13 @@ Available balance: SGD 1,204.33.\r\n";
             .map(|(m, _)| (m.number, m.currency))
             .collect();
         assert_eq!(found, [("5".into(), None), ("6".into(), None)]);
+        assert_eq!(
+            amounts("Refund CAD −$25.00 and CAD - $26.00")
+                .into_iter()
+                .map(|(m, _)| m.currency.unwrap())
+                .collect::<Vec<_>>(),
+            ["CAD", "CAD"]
+        );
         // A sign between the code and "$" keeps the code; three decimals only
         // for currencies that have them.
         let found: Vec<_> = amounts("Refund CAD -$25.00, KWD 12.345, 1.500 OMR, EUR 1.234, $2.345")
@@ -1357,6 +1394,15 @@ Content-Type: multipart/alternative; boundary=b\r\n\r\n--b\r\nContent-Type: text
             "{:?}",
             started.elapsed()
         );
+    }
+
+    #[test]
+    fn deeply_nested_messages_do_not_overflow_the_stack() {
+        // Test threads have 2 MiB stacks; a recursive drop aborts here.
+        let mut raw = "Content-Type: message/rfc822\r\n\r\n".repeat(120_000);
+        raw.push_str("Message-ID: <deep@x.example>\r\nSubject: x\r\n\r\nSGD 1.00\r\n");
+        assert!(raw.len() < crate::inbound::MAX_EMAIL_BYTES);
+        parse(raw.as_bytes()).unwrap();
     }
 
     #[test]
