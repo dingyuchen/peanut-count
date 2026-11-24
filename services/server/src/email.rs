@@ -267,11 +267,15 @@ static SUFFIX_AMOUNT: LazyLock<Regex> = LazyLock::new(|| {
 
 /// A line holding only a currency marker before a line starting with a number,
 /// or a number before a line holding only a code, as table cells often render.
-static SPLIT_PREFIX: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(&format!(r"(?m)^((?:{CODES})|{SYMBOLS})\n+([0-9])")).unwrap());
+static SPLIT_PREFIX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(&format!(
+        r"(?m)^((?:{CODES})|{SYMBOLS})\n+((?:[-−+] ?)?[0-9])"
+    ))
+    .unwrap()
+});
 static SPLIT_SUFFIX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(
-        r"(?m)^((?:(?:{SYMBOLS}) ?)?[0-9][0-9,.]*)\n+((?:{CODES})$)"
+        r"(?m)^((?:(?:{SYMBOLS}) ?)?(?:[-−+] ?)?[0-9][0-9,.]*)\n+((?:{CODES})$)"
     ))
     .unwrap()
 });
@@ -503,7 +507,7 @@ fn payment_tier(label: &str) -> u8 {
 /// "ending in 1234", or "XXXX1234".
 static CARD_DIGITS: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?i)(?:\bending(?: in| with)?\s*|\bends (?:in|with)\s*|[x*•]{2,}[ -]?)(?P<tail>[0-9]{3,4})\b|\b(?:account|acct|a/c|card)(?: (?:no\.?|num\.?|number))?[ \t]*[:#.]?[ \t]*(?:[x*•]+[ -]?)?(?P<number>[0-9]{3,19}(?:-[0-9]{1,19}| [0-9]{3,19}){0,4})\b",
+        r"(?i)(?:\bending(?: in| with)?\s*|\bends (?:in|with)\s*|[x*•]{2,}[ -]?)(?P<tail>[0-9]{3,4})\b|\b(?:account|acct|a/c|card)(?: (?:no\.?|num\.?|number))?[ \t]*[:#.]?[ \t]*(?:\r?\n[ \t]*){0,2}(?:[x*•]+[ -]?)?(?P<number>[0-9]{3,19}(?:-[0-9]{1,19}| [0-9]{3,19}){0,4})\b",
     )
     .unwrap()
 });
@@ -564,7 +568,7 @@ static DATES: LazyLock<[Regex; 5]> = LazyLock::new(|| {
         // A yearless "11/24" right after a date label, or on the next line,
         // so fractions and ratios elsewhere are not read as dates.
         Regex::new(
-            r"(?i)\b(?:date|dated|on)\b[ \t]*:?[ \t]*(?:\r?\n[ \t]*)?(?P<a>[0-9]{1,2})/(?P<b>[0-9]{1,2})\b",
+            r"(?i)\b(?:date|dated|on)\b[ \t]*:?[ \t]*(?:\r?\n[ \t]*){0,2}(?P<a>[0-9]{1,2})/(?P<b>[0-9]{1,2})\b",
         )
         .unwrap(),
     ]
@@ -1317,6 +1321,14 @@ Available balance: SGD 1,204.33.\r\n";
                 .map(|(money, _)| money.number)
                 .collect();
         assert_eq!(found, ["100.00", "1400.00"]);
+        // A signed amount split from its code by HTML blocks.
+        let split =
+            join_split_amounts("Amount credited\nUSD\n\n+100.00\nAvailable balance: USD 1,400.00");
+        let found: Vec<_> = amounts(&split)
+            .into_iter()
+            .map(|(money, _)| money.number)
+            .collect();
+        assert_eq!(found, ["100.00", "1400.00"], "{split:?}");
         // An unknown symbol does not hide a code after the amount.
         let found = amounts("Total R$ 10.00 BRL");
         assert_eq!(found.len(), 1);
@@ -1604,6 +1616,11 @@ Content-Transfer-Encoding: base64\r\n\r\n{}",
         assert!(names_number("Liabilities:Citi-1234", "1234"));
         assert!(!names_number("Liabilities:Visa-91234567", "1234"));
         assert!(!names_number("Assets:Checking", "1234"));
+        // A label and its number in separate HTML blocks.
+        let html = "Message-ID: <c@bank.example>\r\nContent-Type: text/html\r\n\r\n\
+<div>Card number:</div><div>5678</div><p>You spent SGD 3.00</p>\r\n";
+        let email = parse(html.as_bytes()).unwrap();
+        assert_eq!(cited_numbers(&email.body), ["5678"], "{:?}", email.body);
         // Grouped account names compare as one number.
         let grouped = "Assets:Checking-123-45678-9012";
         assert!(!names_number(grouped, "987654329012"));
