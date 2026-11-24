@@ -289,6 +289,7 @@ Duplicates are detected by the original message's Message-ID. A relay retry
 or a re-forward of the same email as an attachment is recorded once.
 Forwarding it inline twice creates a new message, which is recorded twice.
 Amounts need a currency symbol or ISO code and a dot decimal separator.
+Three decimals are read only for currencies that use them, such as KWD.
 The codes ALL, BOB, CUP, CVE, GEL, MAD, MOP, PEN, SOS, and TOP are not
 recognized, because they are also common words in capitals.
 Amounts grouped with spaces or apostrophes, or written with a decimal comma,

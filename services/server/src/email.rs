@@ -222,10 +222,14 @@ pub struct Money {
 /// MOP, PEN, SOS, TOP) and fund codes are left out, so "ALL 3 ITEMS" is not
 /// read as an amount.
 const CODES: &str = "AED|AFN|AMD|AOA|ARS|AUD|AWG|AZN|BAM|BBD|BDT|BGN|BHD|BIF|BMD|BND|BRL|BSD|BTN|BWP|BYN|BZD|CAD|CDF|CHF|CLP|CNY|COP|CRC|CZK|DJF|DKK|DOP|DZD|EGP|ERN|ETB|EUR|FJD|FKP|GBP|GHS|GIP|GMD|GNF|GTQ|GYD|HKD|HNL|HTG|HUF|IDR|ILS|INR|IQD|IRR|ISK|JMD|JOD|JPY|KES|KGS|KHR|KMF|KPW|KRW|KWD|KYD|KZT|LAK|LBP|LKR|LRD|LSL|LYD|MDL|MGA|MKD|MMK|MNT|MRU|MUR|MVR|MWK|MXN|MYR|MZN|NAD|NGN|NIO|NOK|NPR|NZD|OMR|PAB|PGK|PHP|PKR|PLN|PYG|QAR|RON|RSD|RUB|RWF|SAR|SBD|SCR|SDG|SEK|SGD|SHP|SLE|SRD|SSP|STN|SVC|SYP|SZL|THB|TJS|TMT|TND|TRY|TTD|TWD|TZS|UAH|UGX|USD|UYU|UZS|VED|VES|VND|VUV|WST|XAF|XCD|XCG|XOF|XPF|YER|ZAR|ZMW|ZWG|RMB";
-const NUMBER: &str = r"[0-9]{1,3}(?:,[0-9]{3})+(?:\.[0-9]{1,2})?|[0-9]+(?:\.[0-9]{1,2})?";
+const NUMBER: &str = r"[0-9]{1,3}(?:,[0-9]{3})+(?:\.[0-9]{1,3})?|[0-9]+(?:\.[0-9]{1,3})?";
+
+/// Currencies with three minor-unit digits, such as "KWD 12.345". Elsewhere
+/// "EUR 1.234" is a grouped thousand, so three decimals are skipped.
+const THREE_DECIMALS: [&str; 7] = ["BHD", "IQD", "JOD", "KWD", "LYD", "OMR", "TND"];
 
 static CODE_BEFORE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(&format!(r"\b({CODES}) ?$")).unwrap());
+    LazyLock::new(|| Regex::new(&format!(r"\b({CODES}) ?-?$")).unwrap());
 
 /// A code right after an amount, bare or alone in parentheses as in "(USD)".
 /// "(USD 18.50)" is a second amount, not an annotation.
@@ -386,6 +390,10 @@ pub fn amounts(text: &str) -> Vec<(Money, String)> {
                 }),
         }
         .map(|code| if code == "RMB" { "CNY" } else { code });
+        let decimals = span.as_str().split_once('.').map_or(0, |(_, f)| f.len());
+        if decimals == 3 && !currency.is_some_and(|code| THREE_DECIMALS.contains(&code)) {
+            continue;
+        }
         let money = Money {
             number,
             currency: currency.map(str::to_owned),
@@ -1300,6 +1308,20 @@ Available balance: SGD 1,204.33.\r\n";
             .map(|(m, _)| (m.number, m.currency))
             .collect();
         assert_eq!(found, [("5".into(), None), ("6".into(), None)]);
+        // A sign between the code and "$" keeps the code; three decimals only
+        // for currencies that have them.
+        let found: Vec<_> = amounts("Refund CAD -$25.00, KWD 12.345, 1.500 OMR, EUR 1.234, $2.345")
+            .into_iter()
+            .map(|(m, _)| (m.number, m.currency.unwrap()))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                ("25.00".into(), "CAD".into()),
+                ("12.345".into(), "KWD".into()),
+                ("1.500".into(), "OMR".into())
+            ]
+        );
         let found = amounts("Purchase amount: $25.00 (USD). Settled amount: SGD 33.50");
         assert_eq!(found[0].0.currency.as_deref(), Some("USD"));
         // A parenthesised second amount is not an annotation of the first.
