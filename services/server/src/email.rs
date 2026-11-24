@@ -97,8 +97,8 @@ fn read(outer: MessageRef, raw: &[u8]) -> Email {
         sent,
         // Bound the text before cleaning it, leaving room for whitespace that
         // cleaning removes and for a currency code just past the limit.
-        body: truncate(
-            &join_split_amounts(&clean(truncate(&body_text(message), MAX_TEXT * 4))),
+        body: truncate_lines(
+            &join_split_amounts(&clean(truncate_lines(&body_text(message), MAX_TEXT * 4))),
             MAX_TEXT,
         )
         .to_owned(),
@@ -138,8 +138,11 @@ fn body_text(message: MessageRef) -> String {
             // carries no amount; read the HTML alternative instead.
             match html_part {
                 Some(html)
-                    if amounts(truncate(&clean(truncate(&text, MAX_TEXT * 4)), MAX_TEXT))
-                        .is_empty() =>
+                    if amounts(truncate_lines(
+                        &clean(truncate_lines(&text, MAX_TEXT * 4)),
+                        MAX_TEXT,
+                    ))
+                    .is_empty() =>
                 {
                     as_text(html)
                 }
@@ -203,6 +206,20 @@ fn truncate_bytes(text: &str, bytes: usize) -> &str {
         end -= 1;
     }
     &text[..end]
+}
+
+/// Like [`truncate`], but ends at the last line break (or, for one long line,
+/// whitespace) within the limit, so no amount or date is cut in half: a
+/// "USD 125.00" cut to "USD 12" would read as a smaller amount.
+fn truncate_lines(text: &str, chars: usize) -> &str {
+    let cut = truncate(text, chars);
+    if cut.len() == text.len() {
+        return text;
+    }
+    match cut.rfind('\n').or_else(|| cut.rfind(char::is_whitespace)) {
+        Some(end) => &cut[..end],
+        None => "",
+    }
 }
 
 fn truncate(text: &str, chars: usize) -> &str {
@@ -367,11 +384,18 @@ pub fn amounts(text: &str) -> Vec<(Money, String)> {
                 .captures(&text[..symbol.start()])
                 .map(|caps| caps.get(1).unwrap().as_str())
         });
-        let trailing_code = caps.name("symbol").and(
-            CODE_AFTER
-                .captures(after)
-                .map(|caps| caps.get(1).or(caps.get(2)).unwrap().as_str()),
-        );
+        let trailing_code = caps
+            .name("symbol")
+            .and(CODE_AFTER.captures(after).and_then(|code| {
+                // A bare code followed by a number, as in "USD $25.00 SGD 33.50",
+                // introduces the next amount rather than annotating this one.
+                let rest =
+                    after[code.get(0).unwrap().end()..].trim_start_matches([' ', '-', '−', '+']);
+                if code.get(2).is_some() && rest.starts_with(|c: char| c.is_ascii_digit()) {
+                    return None;
+                }
+                Some(code.get(1).or(code.get(2)).unwrap().as_str())
+            }));
         // Codes on both sides that disagree, as in "CAD $25.00 USD", are ambiguous.
         if let (Some(a), Some(b)) = (leading_code, trailing_code)
             && a != b
@@ -582,11 +606,11 @@ static DATES: LazyLock<[Regex; 5]> = LazyLock::new(|| {
         Regex::new(r"\b(?P<year>[0-9]{4})[-/.](?P<m>[0-9]{1,2})[-/.](?P<day>[0-9]{1,2})(?:T|\b)")
             .unwrap(),
         Regex::new(&format!(
-            r"\b(?P<day>[0-9]{{1,2}})(?:st|nd|rd|th)?[ -]{MONTH}(?:[ ,-]+(?P<year>[0-9]{{4}}))?\b"
+            r"\b(?P<day>[0-9]{{1,2}})(?:st|nd|rd|th)?[ -]{MONTH}(?:[ ,-]+(?P<year>[0-9]{{4}}|[0-9]{{2}}))?\b"
         ))
         .unwrap(),
         Regex::new(&format!(
-            r"\b{MONTH} (?P<day>[0-9]{{1,2}})(?:st|nd|rd|th)?(?:,? (?P<year>[0-9]{{4}}))?\b"
+            r"\b{MONTH} (?P<day>[0-9]{{1,2}})(?:st|nd|rd|th)?(?:,? (?P<year>[0-9]{{4}}|[0-9]{{2}}))?\b"
         ))
         .unwrap(),
         Regex::new(
@@ -627,7 +651,13 @@ pub fn dates(text: &str, anchor: NaiveDate) -> Vec<(NaiveDate, String)> {
         for caps in pattern.captures_iter(text) {
             let whole = caps.get(0).unwrap();
             let number = |name| caps.name(name).and_then(|m| m.as_str().parse::<u32>().ok());
-            let year = number("year").map(|year| if year < 100 { year + 2000 } else { year });
+            // A two-digit "year" followed by ":" is an hour, as in "23 Nov 10:15".
+            let year = number("year")
+                .filter(|_| {
+                    caps.name("year")
+                        .is_none_or(|year| year.len() == 4 || !text[year.end()..].starts_with(':'))
+                })
+                .map(|year| if year < 100 { year + 2000 } else { year });
             let readings: Vec<(Option<u32>, u32, u32)> = match kind {
                 0 => {
                     let (Some(month), Some(day)) = (number("m"), number("day")) else {
@@ -1338,6 +1368,10 @@ Available balance: SGD 1,204.33.\r\n";
         );
         // An explicit year older than the window is kept for old forwarded alerts.
         assert_eq!(dates("Paid on 2024-03-05", anchor)[0].0, date("2024-03-05"));
+        // Two-digit years after named months, but not an hour.
+        assert_eq!(dates("Date: 23-Nov-25", anchor)[0].0, date("2025-11-23"));
+        assert_eq!(dates("Nov 3, 25", anchor)[0].0, date("2025-11-03"));
+        assert_eq!(dates("on 23 Nov 10:15", anchor)[0].0, date("2026-11-23"));
         // A yearless date after the anchor belongs to the previous year.
         assert_eq!(dates("on 30 Dec", anchor)[0].0, date("2025-12-30"));
     }
@@ -1369,6 +1403,18 @@ Available balance: SGD 1,204.33.\r\n";
             assert_eq!(found.len(), 1, "{split:?}");
             assert_eq!(found[0].0.currency.as_deref(), Some("USD"), "{split:?}");
         }
+        // A code that starts the next cell's amount is not a trailing code.
+        let found: Vec<_> = amounts("USD $25.00 SGD 33.50")
+            .into_iter()
+            .map(|(m, _)| (m.number, m.currency.unwrap()))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                ("25.00".into(), "USD".into()),
+                ("33.50".into(), "SGD".into())
+            ]
+        );
         // An unknown symbol does not hide a code after the amount.
         let found = amounts("Total R$ 10.00 BRL");
         assert_eq!(found.len(), 1);
@@ -1625,6 +1671,16 @@ Content-Transfer-Encoding: base64\r\n\r\n{}",
         );
         let email = parse(legacy.as_bytes()).unwrap();
         assert!(email.body.contains("SGD 7.20"), "{:?}", email.body);
+    }
+
+    #[test]
+    fn cuts_text_at_line_boundaries() {
+        let text = format!("{}\nTotal paid: USD 125.00", "x".repeat(40));
+        let cut = truncate_lines(&text, 60);
+        assert_eq!(cut, "x".repeat(40));
+        assert!(amounts(cut).is_empty());
+        assert_eq!(truncate_lines("short", 60), "short");
+        assert_eq!(truncate_lines("USD 125.00 total", 8), "USD");
     }
 
     #[test]
