@@ -88,7 +88,7 @@ pub fn parse(raw: &[u8]) -> Result<Email> {
         )))
         .to_owned(),
         sent,
-        body: truncate(&clean(&body_text(message)), MAX_TEXT).to_owned(),
+        body: truncate(&join_split_amounts(&clean(&body_text(message))), MAX_TEXT).to_owned(),
     })
 }
 
@@ -212,12 +212,35 @@ static CODE_BEFORE: LazyLock<Regex> =
 static CODE_AFTER: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(&format!(r"^ ?({CODES})\b")).unwrap());
 
-static AMOUNT: LazyLock<Regex> = LazyLock::new(|| {
+const SYMBOLS: &str = r"US\$|CA\$|AU\$|S\$|A\$|C\$|HK\$|NZ\$|\$|€|£|¥|₹";
+
+/// A currency symbol or code followed by a number, as in "S$12.50" or "SGD 12.50".
+static PREFIX_AMOUNT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(
-        r"(?:(?P<symbol>US\$|CA\$|AU\$|S\$|A\$|C\$|HK\$|NZ\$|\$|€|£|¥|₹)|\b(?P<code>{CODES})) ?-?(?P<number>{NUMBER})|\b(?P<number2>{NUMBER}) ?(?P<code2>{CODES})\b"
+        r"(?:(?P<symbol>{SYMBOLS})|\b(?P<code>{CODES})) ?-?(?P<number>{NUMBER})"
     ))
     .unwrap()
 });
+
+/// A number followed by a currency code, as in "12.50 SGD". Matched separately
+/// from [`PREFIX_AMOUNT`] so that in "Ref 123 SGD 12.50" both readings are
+/// offered and the model chooses.
+static SUFFIX_AMOUNT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(&format!(r"\b(?P<number2>{NUMBER}) ?(?P<code2>{CODES})\b")).unwrap()
+});
+
+/// A line holding only a currency marker before a line starting with a number,
+/// or a number before a line holding only a code, as table cells often render.
+static SPLIT_PREFIX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(&format!(r"(?m)^((?:{CODES})|{SYMBOLS})\n+([0-9])")).unwrap());
+static SPLIT_SUFFIX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(&format!(r"(?m)^([0-9][0-9,.]*)\n+((?:{CODES})$)")).unwrap());
+
+/// Joins a currency marker and its number that layout split across lines.
+fn join_split_amounts(text: &str) -> String {
+    let text = SPLIT_PREFIX.replace_all(text, "$1 $2");
+    SPLIT_SUFFIX.replace_all(&text, "$1 $2").into_owned()
+}
 
 /// Whether `number` is only part of a longer or differently formatted number,
 /// such as "12.505", "€12,34", "€12.٣٤", the "56" in "1.234,56 EUR", or the
@@ -255,11 +278,24 @@ fn partial_number(before: &str, number: &str, after: &str) -> bool {
 /// Every distinct amount written with a currency symbol or ISO code.
 pub fn amounts(text: &str) -> Vec<(Money, String)> {
     let mut found: Vec<(Money, String)> = Vec::new();
-    for caps in AMOUNT.captures_iter(text) {
+    let mut matches: Vec<_> = PREFIX_AMOUNT
+        .captures_iter(text)
+        .chain(SUFFIX_AMOUNT.captures_iter(text))
+        .collect();
+    matches.sort_by_key(|caps| caps.get(0).unwrap().start());
+    for caps in matches {
         let whole = caps.get(0).unwrap();
         let span = caps.name("number").or(caps.name("number2")).unwrap();
         let after = &text[span.end()..];
         let before = &text[..span.start()];
+        // A symbol before the number makes it a prefix amount, already handled.
+        if caps.name("number2").is_some()
+            && before
+                .trim_end_matches(' ')
+                .ends_with(['$', '€', '£', '¥', '₹'])
+        {
+            continue;
+        }
         if partial_number(before, span.as_str(), after) {
             continue;
         }
@@ -710,12 +746,17 @@ pub async fn extract(
     // Keep the account the email identifies. If the chosen amount is in a
     // currency it cannot hold, such as a foreign purchase price, ask which
     // amount was settled in a currency the account holds.
-    let fits = |money: &Money| {
-        money
-            .currency
-            .as_deref()
-            .is_none_or(|c| accepts(&source, c))
+    // A bare "$" takes the account's only currency, or the configured default.
+    let resolve = |money: &Money| {
+        money.currency.clone().unwrap_or_else(|| {
+            let account = find(&source).cloned().unwrap_or_default();
+            match (&account.declared[..], &account.posted[..]) {
+                ([only], _) | ([], [only]) => only.clone(),
+                _ => default_currency.to_owned(),
+            }
+        })
     };
+    let fits = |money: &Money| accepts(&source, &resolve(money));
     let (chosen, label) = &amounts[chosen_amount];
     let money = if fits(chosen) {
         chosen.clone()
@@ -759,13 +800,7 @@ pub async fn extract(
             Err(_) => return Err(unsettled()),
         }
     };
-    let currency = money.currency.clone().unwrap_or_else(|| {
-        let account = find(&source).cloned().unwrap_or_default();
-        match (&account.declared[..], &account.posted[..]) {
-            ([only], _) | ([], [only]) => only.clone(),
-            _ => default_currency.to_owned(),
-        }
-    });
+    let currency = resolve(&money);
     if !accepts(&source, &currency) {
         return Err(rejected(format!("{source} does not accept {currency}.")));
     }
@@ -1007,6 +1042,16 @@ Available balance: SGD 1,204.33.\r\n";
         assert!(amounts("EUR 1 234.56 and 1\u{202f}234 USD and CHF 1'234.50").is_empty());
         assert_eq!(amounts("SGD 12 on 3 Nov").len(), 1);
         assert!(amounts("€1’234.56 and R$10 and NT$300 and €12.٣٤").is_empty());
+        // A code between two numbers offers both readings.
+        let found: Vec<_> = amounts("Ref 123 SGD 12.50")
+            .into_iter()
+            .map(|(money, _)| money.number)
+            .collect();
+        assert_eq!(found, ["123", "12.50"]);
+        assert_eq!(
+            join_split_amounts("Amount\nSGD\n\n12.50\n7.25\nUSD"),
+            "Amount\nSGD 12.50\n7.25 USD"
+        );
         // Codes pair with amounts on the same line only.
         let found = amounts("Card currency: CAD\n$25.00 USD and CAD $26 USD");
         assert_eq!(found.len(), 1);
@@ -1071,16 +1116,17 @@ Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain
         // Table cells stay on separate lines, so "SGD 12.50" keeps its amount.
         let html = "Message-ID: <h1@bank.example>\r\nSubject: Alert\r\nContent-Type: text/html\r\n\r\n\
 <table><tr><td>Amount</td><td>SGD 12.50</td><td>23 Nov 2026</td></tr>\
-<tr><td>Charged</td><td>SGD</td><td>7.25</td></tr><tr><td>Total</td><td>S$9.90</td></tr></table>\r\n";
+<tr><td>Charged</td><td>SGD</td><td>7.25</td></tr><tr><td>Total</td><td>S$9.90</td></tr>\
+<tr><td><div>Paid</div></td><td><div>SGD</div></td><td><div>4.10</div></td></tr></table>\r\n";
         let email = parse(html.as_bytes()).unwrap();
         let found: Vec<_> = amounts(&email.body)
             .into_iter()
             .map(|(money, _)| money.number)
             .collect();
-        assert_eq!(found, ["12.50", "7.25", "9.90"], "{:?}", email.body);
+        assert_eq!(found, ["12.50", "7.25", "9.90", "4.10"], "{:?}", email.body);
         assert_eq!(
             email.body.lines().filter(|line| !line.is_empty()).count(),
-            3,
+            5,
             "{:?}",
             email.body
         );
@@ -1274,6 +1320,37 @@ Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain
             calls[2]["category"]["criteria"]
                 .get("Expenses:Dining")
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn bare_dollar_is_checked_in_its_resolved_currency() {
+        let mut email = parse(ALERT.as_bytes()).unwrap();
+        email.body =
+            "Card ending 1234 charged $25.00, settled as CAD 34.50, on 23 Nov 2026.".into();
+        let accounts = vec![account("Liabilities:Card-1234", &["CAD", "EUR"], &[])];
+        let answers = Answers::from([
+            ("transaction".into(), Answer::Noul { noul: 0.95 }),
+            ("direction".into(), choice("out", &[])),
+            ("amount".into(), choice("1", &[])),
+            ("date".into(), choice("1", &[])),
+            ("payee".into(), choice("none", &[])),
+            ("settled".into(), choice("1", &[])),
+            (
+                "category".into(),
+                choice("Expenses:Shopping", &[("Expenses:Shopping", 0.8)]),
+            ),
+        ]);
+        // "$25.00" resolves to the default USD, which the card cannot hold.
+        let statement = extract(&email, &accounts, &[], "USD", &fixed(answers))
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                statement.currency.as_str(),
+                statement.rows[0].amount.as_str()
+            ),
+            ("CAD", "-34.50")
         );
     }
 
