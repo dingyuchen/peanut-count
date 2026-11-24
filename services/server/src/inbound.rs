@@ -185,9 +185,12 @@ pub async fn ingest(
             {
                 Err(Unavailable(error))
             }
-            Err(error) => Err(Rejected(format!(
-                "The ledger rejected the transaction: {error:#}"
-            ))),
+            // The ledger's error can name accounts and balances, and the
+            // reason goes back to the relay or into a bounce, so keep it out.
+            Err(_) => Err(Rejected(
+                "The ledger rejected the transaction, for example because it conflicts with a balance assertion or a closed account."
+                    .into(),
+            )),
         }
     })
     .await

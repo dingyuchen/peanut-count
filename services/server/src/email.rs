@@ -499,18 +499,19 @@ fn payment_tier(label: &str) -> u8 {
 /// "ending in 1234", or "XXXX1234".
 static CARD_DIGITS: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?i)(?:\bending(?: in| with)?\s*|\bends (?:in|with)\s*|[x*•]{2,}[ -]?)(?P<tail>[0-9]{3,4})\b|\b(?:account|acct|a/c|card)(?: (?:no\.?|num\.?|number))?[ \t]*[:#.]?[ \t]*(?:[x*•]+[ -]?)?(?P<number>[0-9]{3,19})\b",
+        r"(?i)(?:\bending(?: in| with)?\s*|\bends (?:in|with)\s*|[x*•]{2,}[ -]?)(?P<tail>[0-9]{3,4})\b|\b(?:account|acct|a/c|card)(?: (?:no\.?|num\.?|number))?[ \t]*[:#.]?[ \t]*(?:[x*•]+[ -]?)?(?P<number>[0-9]{3,19}(?:[ -][0-9]{3,19}){0,4})\b",
     )
     .unwrap()
 });
 
 /// The card and account numbers `text` cites, as in "ending 1234",
-/// "XXXX1234", "Account number: 123456789", or "Card: 1234".
-fn cited_numbers(text: &str) -> Vec<&str> {
+/// "XXXX1234", "Account number: 123-456789", or "Card: 1234". Grouping
+/// spaces and hyphens are removed, so a group is never matched alone.
+fn cited_numbers(text: &str) -> Vec<String> {
     CARD_DIGITS
         .captures_iter(text)
         .filter_map(|caps| caps.name("tail").or(caps.name("number")))
-        .map(|number| number.as_str())
+        .map(|number| number.as_str().replace([' ', '-'], ""))
         .collect()
 }
 
@@ -545,10 +546,10 @@ static DATES: LazyLock<[Regex; 5]> = LazyLock::new(|| {
             r"\b(?P<a>[0-9]{1,2})(?P<s1>[/.-])(?P<b>[0-9]{1,2})(?P<s2>[/.-])(?P<year>[0-9]{4}|[0-9]{2})\b",
         )
         .unwrap(),
-        // A yearless "11/24" right after a date label, so fractions and
-        // ratios elsewhere are not read as dates.
+        // A yearless "11/24" right after a date label, or on the next line,
+        // so fractions and ratios elsewhere are not read as dates.
         Regex::new(
-            r"(?i)\b(?:date|dated|on)\b[ \t]*:?[ \t]*(?P<a>[0-9]{1,2})/(?P<b>[0-9]{1,2})\b",
+            r"(?i)\b(?:date|dated|on)\b[ \t]*:?[ \t]*(?:\r?\n[ \t]*)?(?P<a>[0-9]{1,2})/(?P<b>[0-9]{1,2})\b",
         )
         .unwrap(),
     ]
@@ -1260,6 +1261,14 @@ Available balance: SGD 1,204.33.\r\n";
             .collect();
         assert!(found.contains(&"2026-11-24".to_string()), "{found:?}");
         assert!(dates("Add 1/2 cup and 3/4 spoon", anchor_25).is_empty());
+        let next_line: Vec<_> = dates("Transaction date:\n11/24", anchor_25)
+            .into_iter()
+            .map(|(date, _)| date.to_string())
+            .collect();
+        assert!(
+            next_line.contains(&"2026-11-24".to_string()),
+            "{next_line:?}"
+        );
         // One full date; the yearless pattern does not add a second reading.
         assert_eq!(dates("Paid on 11/24/2026", anchor_25).len(), 1);
         // Year-first slash dates count, even when forwarded in a later month.
@@ -1555,6 +1564,14 @@ Content-Transfer-Encoding: base64\r\n\r\n{}",
             ),
             ["123456789", "1234", "5678", "9999"]
         );
+        assert_eq!(
+            cited_numbers(
+                "Account number: 123-456789. Card: 4111 1111 1111 1234. Card: 1234 23 Nov"
+            ),
+            ["123456789", "4111111111111234", "1234"]
+        );
+        // The first group alone must not match an account ending in it.
+        assert!(!names_number("Assets:Checking-123", "123456789"));
         assert!(names_number("Assets:Checking-6789", "123456789"));
         assert!(names_number("Liabilities:Citi-1234", "1234"));
         assert!(!names_number("Liabilities:Visa-91234567", "1234"));
