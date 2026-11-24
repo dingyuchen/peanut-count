@@ -318,6 +318,7 @@ fn partial_number(before: &str, number: &str, after: &str) -> bool {
 /// Every distinct amount written with a currency symbol or ISO code.
 pub fn amounts(text: &str) -> Vec<(Money, String)> {
     let mut found: Vec<(Money, String, u8)> = Vec::new();
+    let mut claimed = std::collections::HashSet::new();
     let mut matches: Vec<_> = PREFIX_AMOUNT
         .captures_iter(text)
         .chain(SUFFIX_AMOUNT.captures_iter(text))
@@ -328,12 +329,11 @@ pub fn amounts(text: &str) -> Vec<(Money, String)> {
         let span = caps.name("number").or(caps.name("number2")).unwrap();
         let after = &text[span.end()..];
         let before = &text[..span.start()];
-        // A symbol before the number makes it a prefix amount, already handled.
-        if caps.name("number2").is_some()
-            && before
-                .trim_end_matches(' ')
-                .ends_with(['$', '€', '£', '¥', '₹'])
-        {
+        // A number the prefix pass already read, or found ambiguous, is not
+        // read again as "number code". An unknown symbol such as "R$" in
+        // "R$ 10.00 BRL" claims nothing, so the code still applies.
+        let key = (span.start(), span.end());
+        if caps.name("number2").is_some() && claimed.contains(&key) {
             continue;
         }
         if partial_number(before, span.as_str(), after) {
@@ -363,6 +363,7 @@ pub fn amounts(text: &str) -> Vec<(Money, String)> {
         if let (Some(a), Some(b)) = (leading_code, trailing_code)
             && a != b
         {
+            claimed.insert(key);
             continue;
         }
         let code = leading_code.or(trailing_code);
@@ -373,6 +374,9 @@ pub fn amounts(text: &str) -> Vec<(Money, String)> {
             && text[..symbol.start()].ends_with(|c: char| c.is_alphabetic())
         {
             continue;
+        }
+        if caps.name("number").is_some() {
+            claimed.insert(key);
         }
         let symbol = caps.name("symbol").map(|m| m.as_str().replace(' ', ""));
         let currency = match symbol.as_deref() {
@@ -499,7 +503,7 @@ fn payment_tier(label: &str) -> u8 {
 /// "ending in 1234", or "XXXX1234".
 static CARD_DIGITS: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?i)(?:\bending(?: in| with)?\s*|\bends (?:in|with)\s*|[x*•]{2,}[ -]?)(?P<tail>[0-9]{3,4})\b|\b(?:account|acct|a/c|card)(?: (?:no\.?|num\.?|number))?[ \t]*[:#.]?[ \t]*(?:[x*•]+[ -]?)?(?P<number>[0-9]{3,19}(?:[ -][0-9]{3,19}){0,4})\b",
+        r"(?i)(?:\bending(?: in| with)?\s*|\bends (?:in|with)\s*|[x*•]{2,}[ -]?)(?P<tail>[0-9]{3,4})\b|\b(?:account|acct|a/c|card)(?: (?:no\.?|num\.?|number))?[ \t]*[:#.]?[ \t]*(?:[x*•]+[ -]?)?(?P<number>[0-9]{3,19}(?:-[0-9]{1,19}| [0-9]{3,19}){0,4})\b",
     )
     .unwrap()
 });
@@ -974,9 +978,9 @@ pub async fn extract(
             .map(|a| a.declared.join(", "))
             .unwrap_or_default();
         let unsettled = || {
-            rejected(format!(
-                "{source} holds only {held}, and the email has no settled amount in that currency."
-            ))
+            // Rejection reasons reach the relay or a bounce, so they name no
+            // account and no configured currency.
+            rejected("The email has no settled amount in a currency the account accepts.")
         };
         if compatible.is_empty() {
             return Err(unsettled());
@@ -1009,7 +1013,9 @@ pub async fn extract(
     };
     let currency = resolve(&money);
     if !accepts(&source, &currency) {
-        return Err(rejected(format!("{source} does not accept {currency}.")));
+        return Err(rejected(
+            "The account does not accept the transaction's currency.",
+        ));
     }
 
     // Ask for the category separately: in the same call the model tends to
@@ -1060,9 +1066,9 @@ pub async fn extract(
                 "Income:Uncategorized"
             };
             if is_closed(fallback) || !accepts(fallback, &currency) {
-                Err(rejected(format!(
-                    "No category fits and the fallback {fallback} cannot take {currency}."
-                )))
+                Err(rejected(
+                    "No category fits, and the fallback category is closed or does not accept the transaction's currency.",
+                ))
             } else {
                 Ok(fallback.to_owned())
             }
@@ -1293,6 +1299,10 @@ Available balance: SGD 1,204.33.\r\n";
         assert!(amounts("EUR 1 234.56 and 1\u{202f}234 USD and CHF 1'234.50").is_empty());
         assert_eq!(amounts("SGD 12 on 3 Nov").len(), 1);
         assert!(amounts("€1’234.56 and R$10 and NT$300 and €12.٣٤").is_empty());
+        // An unknown symbol does not hide a code after the amount.
+        let found = amounts("Total R$ 10.00 BRL");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0.currency.as_deref(), Some("BRL"));
         // A code between two numbers offers both readings.
         let found: Vec<_> = amounts("Ref 123 SGD 12.50")
             .into_iter()
@@ -1566,9 +1576,9 @@ Content-Transfer-Encoding: base64\r\n\r\n{}",
         );
         assert_eq!(
             cited_numbers(
-                "Account number: 123-456789. Card: 4111 1111 1111 1234. Card: 1234 23 Nov"
+                "Account number: 123-456789. Card: 4111 1111 1111 1234. Card: 1234 23 Nov. A/C 123-45678-9"
             ),
-            ["123456789", "4111111111111234", "1234"]
+            ["123456789", "4111111111111234", "1234", "123456789"]
         );
         // The first group alone must not match an account ending in it.
         assert!(!names_number("Assets:Checking-123", "123456789"));
