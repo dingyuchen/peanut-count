@@ -281,7 +281,7 @@ fn partial_number(before: &str, number: &str, after: &str) -> bool {
 
 /// Every distinct amount written with a currency symbol or ISO code.
 pub fn amounts(text: &str) -> Vec<(Money, String)> {
-    let mut found: Vec<(Money, String)> = Vec::new();
+    let mut found: Vec<(Money, String, u8)> = Vec::new();
     let mut matches: Vec<_> = PREFIX_AMOUNT
         .captures_iter(text)
         .chain(SUFFIX_AMOUNT.captures_iter(text))
@@ -366,42 +366,79 @@ pub fn amounts(text: &str) -> Vec<(Money, String)> {
             number,
             currency: currency.map(str::to_owned),
         };
-        if !found.iter().any(|(seen, _)| *seen == money) {
-            let label = format!(
-                "{}, in “{}”",
-                whole.as_str(),
-                context(text, whole.start(), whole.end())
-            );
-            found.push((money, label));
+        let label = format!(
+            "{}, in “{}”",
+            whole.as_str(),
+            context(text, whole.start(), whole.end())
+        );
+        // The label is the text on the same line just before the amount.
+        let line = &text[..whole.start()];
+        let line = &line[line.rfind('\n').map_or(0, |at| at + 1)..];
+        let tier = payment_tier(line);
+        match found.iter_mut().position(|(seen, _, _)| *seen == money) {
+            // Keep the strongest label for a repeated amount.
+            Some(at) if tier < found[at].2 => found[at] = (money, label, tier),
+            Some(_) => {}
+            None => found.push((money, label, tier)),
         }
     }
     // An itemised receipt can list more prices than the model is offered.
-    // Keep amounts labelled as the payment ahead of line items.
+    // Keep payment amounts and grand totals ahead of line items.
     if found.len() > MAX_CANDIDATES {
-        let labelled = |label: &str| {
-            let label = label.to_lowercase();
-            [
-                "total",
-                "paid",
-                "charged",
-                "amount",
-                "payment",
-                "debited",
-                "credited",
-                "spent",
-                "refund",
-                "transaction",
-            ]
-            .iter()
-            .any(|word| label.contains(word))
-        };
         let mut ranked: Vec<_> = found.into_iter().enumerate().collect();
-        ranked.sort_by_key(|(i, (_, label))| (!labelled(label), *i));
+        ranked.sort_by_key(|(i, (_, _, tier))| (*tier, *i));
         ranked.truncate(MAX_CANDIDATES);
         ranked.sort_by_key(|(i, _)| *i);
         found = ranked.into_iter().map(|(_, item)| item).collect();
     }
     found
+        .into_iter()
+        .map(|(money, label, _)| (money, label))
+        .collect()
+}
+
+/// How strongly a label marks the amount after it as the payment: 0 for a
+/// payment or grand total, 1 for another total or amount, 2 for the rest,
+/// including line totals and subtotals.
+fn payment_tier(label: &str) -> u8 {
+    let label = label.to_lowercase();
+    let tail: String = label
+        .chars()
+        .rev()
+        .take(40)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let has = |words: &[&str]| words.iter().any(|word| tail.contains(word));
+    if has(&[
+        "subtotal",
+        "sub-total",
+        "line total",
+        "item total",
+        "unit price",
+    ]) {
+        2
+    } else if has(&[
+        "grand total",
+        "total paid",
+        "amount paid",
+        "total charged",
+        "paid",
+        "charged",
+        "payment",
+        "debited",
+        "credited",
+        "spent",
+        "refund",
+        "transaction",
+    ]) {
+        0
+    } else if has(&["total", "amount"]) {
+        1
+    } else {
+        2
+    }
 }
 
 /// The trailing digits of a card or account number, as in "ending 1234",
@@ -418,7 +455,9 @@ const MONTH: &str = r"(?P<month>(?i:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|
 static DATES: LazyLock<[Regex; 4]> = LazyLock::new(|| {
     [
         // Also the date of an ISO timestamp such as 2026-11-23T23:58:00+08:00.
-        Regex::new(r"\b(?P<year>[0-9]{4})-(?P<m>[0-9]{1,2})-(?P<day>[0-9]{1,2})(?:T|\b)").unwrap(),
+        // Year first, as in 2026-11-23, 2026/11/23, or 2026-11-23T23:58.
+        Regex::new(r"\b(?P<year>[0-9]{4})[-/.](?P<m>[0-9]{1,2})[-/.](?P<day>[0-9]{1,2})(?:T|\b)")
+            .unwrap(),
         Regex::new(&format!(
             r"\b(?P<day>[0-9]{{1,2}})(?:st|nd|rd|th)?[ -]{MONTH}(?:[ ,-]+(?P<year>[0-9]{{4}}))?\b"
         ))
@@ -662,9 +701,12 @@ pub async fn extract(
         .collect();
     let offer_none = !cited.is_empty()
         && !numbered.is_empty()
-        && !cited
-            .iter()
-            .any(|number| numbered.iter().any(|name| name.contains(number)));
+        && !cited.iter().any(|number| {
+            numbered.iter().any(|name| {
+                name.split([':', '-'])
+                    .any(|part| part.bytes().all(|b| b.is_ascii_digit()) && part.ends_with(number))
+            })
+        });
     // Offer each kind the ledger lacks, so the first alert for a new credit
     // card is not booked to the only bank account.
     for (name, text) in DEFAULT_SOURCES {
@@ -742,7 +784,7 @@ pub async fn extract(
             "criteria": criteria,
         }));
     }
-    if sources.len() > 1 {
+    if sources.len() > 1 || offer_none {
         let mut criteria: Map<String, Value> = sources
             .iter()
             .map(|(name, text)| (name.clone(), Value::String(text.clone())))
@@ -806,7 +848,7 @@ pub async fn extract(
     let find = |name: &str| accounts.iter().find(|account| account.name == name);
     // Accounts created on import accept any currency.
     let accepts = |name: &str, currency: &str| find(name).is_none_or(|a| a.accepts(currency));
-    let source = if sources.len() == 1 {
+    let source = if sources.len() == 1 && !offer_none {
         sources.keys().next().unwrap().clone()
     } else {
         let keys: Vec<&str> = sources
@@ -1112,6 +1154,11 @@ Available balance: SGD 1,204.33.\r\n";
                 "2026-05-11"
             ]
         );
+        // Year-first slash dates count, even when forwarded in a later month.
+        assert_eq!(
+            dates("Receipt date: 2026/11/23", date("2026-12-01"))[0].0,
+            date("2026-11-23")
+        );
         // The calendar date of an ISO timestamp counts.
         assert_eq!(
             dates("Transaction time: 2026-11-23T23:58:00+08:00", anchor)[0].0,
@@ -1147,6 +1194,13 @@ Available balance: SGD 1,204.33.\r\n";
             + "Total paid: USD 143.27";
         let found = amounts(&receipt);
         assert_eq!(found.len(), MAX_CANDIDATES);
+        assert!(found.iter().any(|(money, _)| money.number == "143.27"));
+        // Line totals rank below the grand total.
+        let receipt: String = (1..=14)
+            .map(|i| format!("Item {i} Line total USD {i}.00\n"))
+            .collect::<String>()
+            + "Total paid: USD 143.27";
+        let found = amounts(&receipt);
         assert!(found.iter().any(|(money, _)| money.number == "143.27"));
         // Codes pair with amounts on the same line only.
         let found = amounts("Card currency: CAD\n$25.00 USD and CAD $26 USD");
@@ -1533,6 +1587,34 @@ Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain
             if offered {
                 assert!(matches!(result, Err(Failure::Rejected(_))));
             }
+        }
+        // "none" is asked even with one open source, and a cited number must
+        // end a numeric account part, not appear inside it.
+        let cases = [
+            (
+                vec![account("Assets:Checking-1234", &[], &[])],
+                vec!["Liabilities:CreditCard".to_string()],
+                "Card ending 5678: you paid $8.00 to Grab on 2026-11-23.",
+            ),
+            (
+                vec![
+                    account("Liabilities:Visa-91234567", &[], &[]),
+                    account("Assets:Wallet", &[], &[]),
+                ],
+                vec![],
+                "Visa ending 1234: you paid $8.00 to Grab on 2026-11-23.",
+            ),
+        ];
+        for (accounts, closed, body) in cases {
+            email.body = body.into();
+            let model = fixed(answers.clone());
+            let result = extract(&email, &accounts, &closed, "USD", &model).await;
+            assert!(matches!(result, Err(Failure::Rejected(_))), "{body}");
+            let calls = model.calls.into_inner().unwrap();
+            assert!(
+                calls[0]["account"]["criteria"].get("none").is_some(),
+                "{body}"
+            );
         }
         email.body = "You paid $8.00 to Grab on 2026-11-23.".into();
 
