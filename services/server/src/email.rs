@@ -22,6 +22,8 @@ use crate::{
 /// Longest email text, in characters, that is searched and sent to the model.
 const MAX_TEXT: usize = 12_000;
 const MAX_CANDIDATES: usize = 12;
+/// Longest subject or sender, in characters.
+const MAX_HEADER: usize = 300;
 /// The model's minimum P(yes) that the email reports a transaction.
 const MIN_TRANSACTION: f64 = 0.5;
 /// Below this probability the counter-account falls back to Uncategorized.
@@ -78,8 +80,12 @@ pub fn parse(raw: &[u8]) -> Result<Email> {
     });
     Ok(Email {
         id,
-        from: clean(&from),
-        subject: strip_forward_prefix(&clean(message.subject().unwrap_or_default())).to_owned(),
+        from: clean(truncate(&from, MAX_HEADER)),
+        subject: strip_forward_prefix(&clean(truncate(
+            message.subject().unwrap_or_default(),
+            MAX_HEADER,
+        )))
+        .to_owned(),
         sent,
         body: truncate(&clean(&body_text(message)), MAX_TEXT).to_owned(),
     })
@@ -136,16 +142,23 @@ fn clean(text: &str) -> String {
 }
 
 fn strip_forward_prefix(mut subject: &str) -> &str {
-    loop {
-        let lower = subject.to_ascii_lowercase();
-        let Some(rest) = ["fwd:", "fw:", "re:"]
-            .iter()
-            .find_map(|prefix| lower.starts_with(prefix).then(|| &subject[prefix.len()..]))
-        else {
-            return subject;
-        };
-        subject = rest.trim_start();
+    while let Some(prefix) = ["fwd:", "fw:", "re:"].iter().find(|prefix| {
+        subject
+            .get(..prefix.len())
+            .is_some_and(|start| start.eq_ignore_ascii_case(prefix))
+    }) {
+        subject = subject[prefix.len()..].trim_start();
     }
+    subject
+}
+
+/// The longest prefix of `text` within `bytes`, ending on a character boundary.
+fn truncate_bytes(text: &str, bytes: usize) -> &str {
+    let mut end = text.len().min(bytes);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 fn truncate(text: &str, chars: usize) -> &str {
@@ -180,7 +193,7 @@ pub struct Money {
 }
 
 const CODES: &str = "USD|SGD|EUR|GBP|JPY|AUD|CAD|HKD|NZD|CHF|CNY|RMB|MYR|INR|IDR|THB|PHP|KRW|TWD|VND|SEK|NOK|DKK|MXN|BRL|ZAR|AED";
-const NUMBER: &str = r"\d{1,3}(?:,\d{3})+(?:\.\d{1,2})?|\d+(?:\.\d{1,2})?";
+const NUMBER: &str = r"[0-9]{1,3}(?:,[0-9]{3})+(?:\.[0-9]{1,2})?|[0-9]+(?:\.[0-9]{1,2})?";
 
 static AMOUNT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(
@@ -194,16 +207,23 @@ pub fn amounts(text: &str) -> Vec<(Money, String)> {
     let mut found: Vec<(Money, String)> = Vec::new();
     for caps in AMOUNT.captures_iter(text) {
         let whole = caps.get(0).unwrap();
-        // Skip a match that stops inside a longer number, such as "12.505".
-        if text[whole.end()..].starts_with(|c: char| c.is_ascii_digit()) {
+        let span = caps.name("number").or(caps.name("number2")).unwrap();
+        // Skip part of a longer or differently formatted number, such as
+        // "12.505", "€12,34", or the "56" in "1.234,56 EUR".
+        let after = &text[span.end()..];
+        let before = &text[..span.start()];
+        let digit = |c: Option<char>| c.is_some_and(|c| c.is_ascii_digit());
+        let mut ahead = after.chars();
+        let mut behind = before.chars().rev();
+        let (next, prev) = (ahead.next(), behind.next());
+        if digit(next)
+            || digit(prev)
+            || (matches!(next, Some(',' | '.')) && digit(ahead.next()))
+            || (matches!(prev, Some(',' | '.')) && digit(behind.next()))
+        {
             continue;
         }
-        let number = caps
-            .name("number")
-            .or(caps.name("number2"))
-            .unwrap()
-            .as_str()
-            .replace(',', "");
+        let number = span.as_str().replace(',', "");
         let number = match number.trim_start_matches('0') {
             rest if rest.is_empty() || rest.starts_with('.') => format!("0{rest}"),
             rest => rest.to_owned(),
@@ -251,16 +271,17 @@ const MONTH: &str = r"(?P<month>(?i:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|
 
 static DATES: LazyLock<[Regex; 4]> = LazyLock::new(|| {
     [
-        Regex::new(r"\b(?P<year>\d{4})-(?P<m>\d{1,2})-(?P<day>\d{1,2})\b").unwrap(),
+        Regex::new(r"\b(?P<year>[0-9]{4})-(?P<m>[0-9]{1,2})-(?P<day>[0-9]{1,2})\b").unwrap(),
         Regex::new(&format!(
-            r"\b(?P<day>\d{{1,2}})(?:st|nd|rd|th)?[ -]{MONTH}(?:[ ,-]+(?P<year>\d{{4}}))?\b"
+            r"\b(?P<day>[0-9]{{1,2}})(?:st|nd|rd|th)?[ -]{MONTH}(?:[ ,-]+(?P<year>[0-9]{{4}}))?\b"
         ))
         .unwrap(),
         Regex::new(&format!(
-            r"\b{MONTH} (?P<day>\d{{1,2}})(?:st|nd|rd|th)?(?:,? (?P<year>\d{{4}}))?\b"
+            r"\b{MONTH} (?P<day>[0-9]{{1,2}})(?:st|nd|rd|th)?(?:,? (?P<year>[0-9]{{4}}))?\b"
         ))
         .unwrap(),
-        Regex::new(r"\b(?P<a>\d{1,2})[/.](?P<b>\d{1,2})[/.](?P<year>\d{4}|\d{2})\b").unwrap(),
+        Regex::new(r"\b(?P<a>[0-9]{1,2})[/.](?P<b>[0-9]{1,2})[/.](?P<year>[0-9]{4}|[0-9]{2})\b")
+            .unwrap(),
     ]
 });
 
@@ -290,17 +311,27 @@ pub fn dates(text: &str, anchor: NaiveDate) -> Vec<(NaiveDate, String)> {
             let number = |name| caps.name(name).and_then(|m| m.as_str().parse::<u32>().ok());
             let year = number("year").map(|year| if year < 100 { year + 2000 } else { year });
             let readings: Vec<(Option<u32>, u32, u32)> = match kind {
-                0 => vec![(year, number("m").unwrap(), number("day").unwrap())],
-                1 | 2 => {
-                    // Accept "Nov", "Sept", or "November", but not "market".
-                    let word = caps.name("month").unwrap().as_str().to_ascii_lowercase();
-                    let Some(month) = MONTHS.iter().position(|m| m.starts_with(&word)) else {
+                0 => {
+                    let (Some(month), Some(day)) = (number("m"), number("day")) else {
                         continue;
                     };
-                    vec![(year, month as u32 + 1, number("day").unwrap())]
+                    vec![(year, month, day)]
+                }
+                1 | 2 => {
+                    // Accept "Nov", "Sept", or "November", but not "market".
+                    let word = caps["month"].to_ascii_lowercase();
+                    let (Some(month), Some(day)) = (
+                        MONTHS.iter().position(|m| m.starts_with(&word)),
+                        number("day"),
+                    ) else {
+                        continue;
+                    };
+                    vec![(year, month as u32 + 1, day)]
                 }
                 _ => {
-                    let (a, b) = (number("a").unwrap(), number("b").unwrap());
+                    let (Some(a), Some(b)) = (number("a"), number("b")) else {
+                        continue;
+                    };
                     vec![(year, b, a), (year, a, b)]
                 }
             };
@@ -426,9 +457,11 @@ const DEFAULT_CATEGORIES: [(&str, &str); 14] = [
 pub async fn extract(
     email: &Email,
     accounts: &[(String, Vec<String>)],
+    closed: &[String],
     default_currency: &str,
     model: &impl Decide,
 ) -> Result<Statement, Failure> {
+    let is_closed = |name: &str| closed.iter().any(|closed| closed == name);
     let text = format!("{}\n{}", email.subject, email.body);
     if text.trim().is_empty() {
         return Err(rejected("The email has no readable text."));
@@ -466,7 +499,17 @@ pub async fn extract(
         .map(|(name, _)| (name.clone(), describe_account(name, false)))
         .collect();
     if sources.is_empty() {
-        sources.extend(DEFAULT_SOURCES.map(|(name, text)| (name.to_owned(), text.to_owned())));
+        sources.extend(
+            DEFAULT_SOURCES
+                .iter()
+                .filter(|(name, _)| !is_closed(name))
+                .map(|(name, text)| (name.to_string(), text.to_string())),
+        );
+    }
+    if sources.is_empty() {
+        return Err(rejected(
+            "The ledger has no open asset or liability account.",
+        ));
     }
     let mut counters: BTreeMap<String, String> = accounts
         .iter()
@@ -477,9 +520,11 @@ pub async fn extract(
         })
         .collect();
     for (name, text) in DEFAULT_CATEGORIES {
-        counters
-            .entry(name.to_owned())
-            .or_insert_with(|| text.to_owned());
+        if !is_closed(name) {
+            counters
+                .entry(name.to_owned())
+                .or_insert_with(|| text.to_owned());
+        }
     }
     // Decision APIs accept at most 255 options per question.
     counters = counters.into_iter().take(250).collect();
@@ -619,14 +664,23 @@ pub async fn extract(
             )));
         }
     }
-    .unwrap_or_else(|| {
-        if outgoing {
-            "Expenses:Uncategorized"
-        } else {
-            "Income:Uncategorized"
-        }
-        .to_owned()
-    });
+    .map_or_else(
+        || {
+            let fallback = if outgoing {
+                "Expenses:Uncategorized"
+            } else {
+                "Income:Uncategorized"
+            };
+            if is_closed(fallback) {
+                Err(rejected(format!(
+                    "No category fits and the fallback {fallback} is closed."
+                )))
+            } else {
+                Ok(fallback.to_owned())
+            }
+        },
+        Ok,
+    )?;
 
     let currency = money.currency.clone().unwrap_or_else(|| {
         match accounts.iter().find(|(name, _)| *name == source) {
@@ -643,7 +697,8 @@ pub async fn extract(
         currency,
         rows: vec![StatementRow {
             date,
-            description: truncate(&description, 200).to_owned(),
+            // Statement rows allow 512 bytes.
+            description: truncate_bytes(truncate(&description, 200), 512).to_owned(),
             amount: if outgoing {
                 format!("-{}", money.number)
             } else {
@@ -771,6 +826,22 @@ Available balance: SGD 1,204.33.\r\n";
     }
 
     #[test]
+    fn rejects_partial_and_non_ascii_numbers() {
+        assert!(amounts("€12,34 and 1.234,56 EUR and S$12.505").is_empty());
+        // Arabic-Indic digits are not dates and must not panic.
+        assert!(dates("٢٣/١١/٢٠٢٦ ٢٠٢٦-١١-٢٣ ٢٣ Nov", date("2026-11-24")).is_empty());
+    }
+
+    #[test]
+    fn bounds_header_text() {
+        assert_eq!(strip_forward_prefix("FWD: fw:Re:  Alert"), "Alert");
+        let subject = "fw:".repeat(1_000_000);
+        assert_eq!(strip_forward_prefix(&subject), "");
+        let cjk = "交".repeat(180);
+        assert_eq!(truncate_bytes(&cjk, 512).len(), 510);
+    }
+
+    #[test]
     fn finds_payee_phrases() {
         assert_eq!(
             payees(
@@ -828,7 +899,9 @@ Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain
             ),
         ]);
         let model = fixed(answers.clone());
-        let statement = extract(&email, &accounts, "USD", &model).await.unwrap();
+        let statement = extract(&email, &accounts, &[], "USD", &model)
+            .await
+            .unwrap();
         // The category is asked on its own, without the chosen source account.
         let calls = model.calls.into_inner().unwrap();
         assert_eq!(calls.len(), 2);
@@ -867,7 +940,7 @@ Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain
                 &[("Expenses:Coffee", 0.2), ("Income:Salary", 0.19)],
             ),
         );
-        let row = extract(&email, &accounts, "USD", &fixed(unsure))
+        let row = extract(&email, &accounts, &[], "USD", &fixed(unsure))
             .await
             .unwrap()
             .rows
@@ -877,10 +950,29 @@ Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain
             ("12.50", "Income:Uncategorized")
         );
 
+        // Closed accounts are never offered or used as a fallback.
+        let closed = [
+            "Expenses:Dining".to_string(),
+            "Expenses:Uncategorized".to_string(),
+        ];
+        let mut unsure_out = answers.clone();
+        unsure_out.insert(
+            "category".into(),
+            choice("Expenses:Coffee", &[("Expenses:Coffee", 0.1)]),
+        );
+        let model = fixed(unsure_out);
+        let result = extract(&email, &accounts, &closed, "USD", &model).await;
+        assert!(matches!(result, Err(Failure::Rejected(_))));
+        let calls = model.calls.into_inner().unwrap();
+        let options = calls[1]["category"]["criteria"].as_object().unwrap();
+        assert!(
+            !options.contains_key("Expenses:Dining") && options.contains_key("Expenses:Groceries")
+        );
+
         let mut promo = answers;
         promo.insert("transaction".into(), Answer::Noul { noul: 0.1 });
         assert!(matches!(
-            extract(&email, &accounts, "USD", &fixed(promo)).await,
+            extract(&email, &accounts, &[], "USD", &fixed(promo)).await,
             Err(Failure::Rejected(_))
         ));
     }
@@ -901,7 +993,7 @@ Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain
             ),
         ]);
         let only = vec![("Assets:Wallet".to_string(), vec!["SGD".to_string()])];
-        let statement = extract(&email, &only, "USD", &fixed(answers.clone()))
+        let statement = extract(&email, &only, &[], "USD", &fixed(answers.clone()))
             .await
             .unwrap();
         assert_eq!(
@@ -912,7 +1004,9 @@ Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain
 
         let mut answers = answers;
         answers.insert("account".into(), choice("Assets:Checking", &[]));
-        let statement = extract(&email, &[], "AUD", &fixed(answers)).await.unwrap();
+        let statement = extract(&email, &[], &[], "AUD", &fixed(answers))
+            .await
+            .unwrap();
         assert_eq!(
             (statement.source.as_str(), statement.currency.as_str()),
             ("Assets:Checking", "AUD")

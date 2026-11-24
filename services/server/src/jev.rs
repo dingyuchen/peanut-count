@@ -7,6 +7,9 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+/// Largest accepted reply. Answers to a few hundred options are a few kilobytes.
+const MAX_REPLY_BYTES: usize = 1024 * 1024;
+
 /// One typed answer. Only the shapes this server asks for are decoded.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
@@ -78,16 +81,24 @@ impl Decide for Jev {
         if let Some(token) = &self.token {
             request = request.bearer_auth(token);
         }
-        let response = request.send().await.context("reach decision model")?;
+        let mut response = request.send().await.context("reach decision model")?;
         let status = response.status();
+        // Never log the body: an error page can echo the request, which holds the email.
         if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            let body: String = body.chars().take(300).collect();
-            bail!("decision model returned HTTP {status}: {body}");
+            bail!("decision model returned HTTP {status}");
         }
-        Ok(response
-            .json::<Reply>()
+        let mut body = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
             .await
+            .context("read decision model answers")?
+        {
+            body.extend_from_slice(&chunk);
+            if body.len() > MAX_REPLY_BYTES {
+                bail!("decision model answers exceed {MAX_REPLY_BYTES} bytes");
+            }
+        }
+        Ok(serde_json::from_slice::<Reply>(&body)
             .context("decode decision model answers")?
             .answers)
     }

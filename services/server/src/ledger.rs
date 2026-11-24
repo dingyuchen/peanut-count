@@ -218,6 +218,17 @@ impl Ledger {
         open
     }
 
+    pub fn closed_accounts(&self) -> Vec<String> {
+        let mut closed: Vec<_> = self
+            .accounts
+            .iter()
+            .filter(|(_, account)| account.closed)
+            .map(|(name, _)| name.clone())
+            .collect();
+        closed.sort();
+        closed
+    }
+
     pub fn canonical_entry(&self, id: &str) -> Result<&Entry> {
         self.records
             .iter()

@@ -192,7 +192,7 @@ async fn main() -> Result<()> {
             recipient,
             inbound,
         } => {
-            let code = inbound::ingest_stdin(data, inbound.config()?, recipient).await?;
+            let code = inbound::ingest_stdin(data, inbound.config(), recipient).await;
             if code != 0 {
                 std::process::exit(code);
             }

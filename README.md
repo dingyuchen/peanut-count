@@ -220,7 +220,8 @@ llama.cpp. A hosted model receives the text of every forwarded email.
 | `PEANUT_INBOUND_TOKEN` | Shared secret for the mail relay webhook. The webhook is off unless it is set. |
 | `PEANUT_EMAIL_CURRENCY` | Currency for a bare `$` when the account has no single currency. Defaults to USD. |
 
-Each variable also has a command-line flag. Run `peanut-count mobile-serve --help`.
+The two tokens are read only from the environment. The other variables also
+have command-line flags. Run `peanut-count mobile-serve --help`.
 Create or replace an account's address with its session token. Replacing an
 address disables the old one immediately.
 
@@ -244,7 +245,7 @@ in `X-Peanut-Recipient`. Messages may be up to 4 MiB.
 | 200 | Already imported | Accept |
 | 404 | Unknown address | Reject |
 | 422 | Not a transaction, or the ledger rejected it. The body has the reason. | Reject |
-| 503 | Decision model unset or unreachable | Retry later |
+| 503 | Decision model unset or unreachable, storage busy, or too many deliveries at once | Retry later |
 
 **Local MTA pipe.** `peanut-count ingest-email` reads one message from
 standard input. It exits with 0 for an import or duplicate, 67 for an unknown

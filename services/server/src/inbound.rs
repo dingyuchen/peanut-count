@@ -13,14 +13,16 @@ use anyhow::{Context, Result, ensure};
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{DefaultBodyLimit, State},
+    extract::{DefaultBodyLimit, Request, State},
     http::{HeaderMap, StatusCode, header},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::post,
 };
 use rusqlite::{OptionalExtension, params};
 use serde_json::json;
 use subtle::ConstantTimeEq;
+use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 use crate::{
@@ -32,6 +34,9 @@ use crate::{
 
 /// Largest accepted raw message. Alerts are small; this leaves room for HTML and inline images.
 pub const MAX_EMAIL_BYTES: usize = 4 * 1024 * 1024;
+/// Relay deliveries processed at once. Each holds up to one message in memory
+/// and waits on the decision model, so excess deliveries are deferred.
+static RELAY_SLOTS: Semaphore = Semaphore::const_new(4);
 
 #[derive(clap::Args)]
 pub struct InboundArgs {
@@ -129,22 +134,22 @@ pub async fn ingest(
         if store.has_statement(&email.id).map_err(Unavailable)? {
             return Ok((user, email, None));
         }
-        let accounts = store
-            .snapshot()
-            .map_err(Unavailable)?
-            .ledger
-            .open_accounts();
-        Ok((user, email, Some(accounts)))
+        let ledger = store.snapshot().map_err(Unavailable)?.ledger;
+        Ok((
+            user,
+            email,
+            Some((ledger.open_accounts(), ledger.closed_accounts())),
+        ))
     })
     .await
     .map_err(|error| Unavailable(error.into()))??;
     let (user, email, accounts) = prepared;
-    let Some(accounts) = accounts else {
+    let Some((accounts, closed)) = accounts else {
         return Ok(Outcome::Duplicate(email.id));
     };
 
     let model = inbound.model.as_ref().ok_or(NotConfigured)?;
-    let statement = email::extract(&email, &accounts, &inbound.default_currency, model)
+    let statement = email::extract(&email, &accounts, &closed, &inbound.default_currency, model)
         .await
         .map_err(|failure| match failure {
             Failure::Rejected(reason) => Rejected(reason),
@@ -162,8 +167,12 @@ pub async fn ingest(
                 Ok(Outcome::Imported(statement.id))
             }
             // A concurrent delivery of the same message won the race.
-            Err(_) if store.has_statement(&statement.id).unwrap_or(false) => {
+            Err(_) if store.has_statement(&statement.id).map_err(Unavailable)? => {
                 Ok(Outcome::Duplicate(statement.id))
+            }
+            // Storage errors such as a lock timeout may succeed on retry.
+            Err(error) if error.chain().any(|cause| cause.is::<rusqlite::Error>()) => {
+                Err(Unavailable(error))
             }
             Err(error) => Err(Rejected(format!(
                 "The ledger rejected the transaction: {error:#}"
@@ -227,11 +236,48 @@ pub fn routes(data: Arc<PathBuf>, inbound: Arc<Inbound>, relay_token: Option<Str
             post(receive).layer(DefaultBodyLimit::max(MAX_EMAIL_BYTES)),
         );
     }
-    routes.with_state(InboundState {
+    let state = InboundState {
         data,
         inbound,
         relay_token: relay_token.map(Arc::from),
-    })
+    };
+    // Layers added later run first: authenticate, then take a slot, before reading the body.
+    routes
+        .route_layer(middleware::from_fn(relay_slot))
+        .route_layer(middleware::from_fn_with_state(state.clone(), relay_auth))
+        .with_state(state)
+}
+
+/// Checks the relay token for /v1/inbound-email before its body is read.
+async fn relay_auth(State(state): State<InboundState>, request: Request, next: Next) -> Response {
+    if request.uri().path() != "/v1/inbound-email" {
+        return next.run(request).await;
+    }
+    let token = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .unwrap_or_default();
+    let expected = state.relay_token.as_deref().unwrap_or_default();
+    if expected.is_empty() || !bool::from(token.as_bytes().ct_eq(expected.as_bytes())) {
+        return mobile::UNAUTHORIZED.into_response();
+    }
+    next.run(request).await
+}
+
+async fn relay_slot(request: Request, next: Next) -> Response {
+    if request.uri().path() != "/v1/inbound-email" {
+        return next.run(request).await;
+    }
+    let Ok(_permit) = RELAY_SLOTS.try_acquire() else {
+        return ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Email import is busy. Retry later.",
+        )
+        .into_response();
+    };
+    next.run(request).await
 }
 
 async fn new_address(
@@ -247,19 +293,9 @@ async fn new_address(
     .await
 }
 
-/// Accepts one raw message from a mail relay. The relay authenticates with
-/// `Authorization: Bearer $PEANUT_INBOUND_TOKEN` and names the envelope
-/// recipient in `X-Peanut-Recipient`.
+/// Accepts one raw message from a mail relay that [`relay_auth`] authenticated.
+/// The relay names the envelope recipient in `X-Peanut-Recipient`.
 async fn receive(State(state): State<InboundState>, headers: HeaderMap, raw: Bytes) -> Response {
-    let token = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .unwrap_or_default();
-    let expected = state.relay_token.as_deref().unwrap_or_default();
-    if expected.is_empty() || !bool::from(token.as_bytes().ct_eq(expected.as_bytes())) {
-        return mobile::UNAUTHORIZED.into_response();
-    }
     let Some(recipient) = headers
         .get("x-peanut-recipient")
         .and_then(|value| value.to_str().ok())
@@ -305,26 +341,38 @@ async fn receive(State(state): State<InboundState>, headers: HeaderMap, raw: Byt
 
 /// Reads one message from standard input, as a Postfix `pipe` or procmail
 /// delivery would, and returns a sysexits code the MTA understands.
+/// Configuration and I/O failures defer delivery so the MTA keeps the message.
 pub async fn ingest_stdin(
     data: PathBuf,
-    inbound: Option<Inbound>,
+    inbound: Result<Option<Inbound>>,
     recipient: String,
-) -> Result<i32> {
+) -> i32 {
     const EX_DATAERR: i32 = 65;
     const EX_NOUSER: i32 = 67;
     const EX_TEMPFAIL: i32 = 75;
 
-    let inbound = inbound.context("set --inbound-domain or PEANUT_INBOUND_DOMAIN")?;
-    mobile::init_registry(&data)?;
-    let mut raw = Vec::new();
-    std::io::stdin()
-        .take(MAX_EMAIL_BYTES as u64 + 1)
-        .read_to_end(&mut raw)?;
+    let prepared = (|| -> Result<_> {
+        let inbound = inbound?.context("set --inbound-domain or PEANUT_INBOUND_DOMAIN")?;
+        mobile::init_registry(&data)?;
+        let mut raw = Vec::new();
+        std::io::stdin()
+            .take(MAX_EMAIL_BYTES as u64 + 1)
+            .read_to_end(&mut raw)
+            .context("read message")?;
+        Ok((inbound, raw))
+    })();
+    let (inbound, raw) = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            eprintln!("peanut-count: {error:#}");
+            return EX_TEMPFAIL;
+        }
+    };
     if raw.len() > MAX_EMAIL_BYTES {
         eprintln!("peanut-count: message exceeds 4 MiB");
-        return Ok(EX_DATAERR);
+        return EX_DATAERR;
     }
-    Ok(
+    {
         match ingest(Arc::new(data), Arc::new(inbound), recipient, raw.into()).await {
             Ok(Outcome::Imported(id)) => {
                 println!("{}", json!({ "status": "imported", "statement": id }));
@@ -350,8 +398,8 @@ pub async fn ingest_stdin(
                 eprintln!("peanut-count: {error:#}");
                 EX_TEMPFAIL
             }
-        },
-    )
+        }
+    }
 }
 
 #[cfg(test)]
