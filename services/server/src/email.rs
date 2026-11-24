@@ -217,7 +217,11 @@ pub struct Money {
     pub currency: Option<String>,
 }
 
-const CODES: &str = "USD|SGD|EUR|GBP|JPY|AUD|CAD|HKD|NZD|CHF|CNY|RMB|MYR|INR|IDR|THB|PHP|KRW|TWD|VND|SEK|NOK|DKK|MXN|BRL|ZAR|AED";
+/// Active ISO 4217 currency codes, plus RMB for CNY. Codes that are common
+/// English words or abbreviations in capitals (ALL, BOB, CUP, CVE, GEL, MAD,
+/// MOP, PEN, SOS, TOP) and fund codes are left out, so "ALL 3 ITEMS" is not
+/// read as an amount.
+const CODES: &str = "AED|AFN|AMD|AOA|ARS|AUD|AWG|AZN|BAM|BBD|BDT|BGN|BHD|BIF|BMD|BND|BRL|BSD|BTN|BWP|BYN|BZD|CAD|CDF|CHF|CLP|CNY|COP|CRC|CZK|DJF|DKK|DOP|DZD|EGP|ERN|ETB|EUR|FJD|FKP|GBP|GHS|GIP|GMD|GNF|GTQ|GYD|HKD|HNL|HTG|HUF|IDR|ILS|INR|IQD|IRR|ISK|JMD|JOD|JPY|KES|KGS|KHR|KMF|KPW|KRW|KWD|KYD|KZT|LAK|LBP|LKR|LRD|LSL|LYD|MDL|MGA|MKD|MMK|MNT|MRU|MUR|MVR|MWK|MXN|MYR|MZN|NAD|NGN|NIO|NOK|NPR|NZD|OMR|PAB|PGK|PHP|PKR|PLN|PYG|QAR|RON|RSD|RUB|RWF|SAR|SBD|SCR|SDG|SEK|SGD|SHP|SLE|SRD|SSP|STN|SVC|SYP|SZL|THB|TJS|TMT|TND|TRY|TTD|TWD|TZS|UAH|UGX|USD|UYU|UZS|VED|VES|VND|VUV|WST|XAF|XCD|XCG|XOF|XPF|YER|ZAR|ZMW|ZWG|RMB";
 const NUMBER: &str = r"[0-9]{1,3}(?:,[0-9]{3})+(?:\.[0-9]{1,2})?|[0-9]+(?:\.[0-9]{1,2})?";
 
 static CODE_BEFORE: LazyLock<Regex> =
@@ -228,7 +232,9 @@ static CODE_BEFORE: LazyLock<Regex> =
 static CODE_AFTER: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(&format!(r"^ ?(?:\(({CODES})\)|({CODES})\b)")).unwrap());
 
-const SYMBOLS: &str = r"US\$|CA\$|AU\$|S\$|A\$|C\$|HK\$|NZ\$|\$|€|£|¥|₹";
+/// Two-letter prefixes may be spaced from "$", as in "US $19.99". One-letter
+/// prefixes must be attached, since "PLAN A $5" is not Australian dollars.
+const SYMBOLS: &str = r"\b(?:US|CA|AU|HK|NZ|SG) ?\$|S\$|A\$|C\$|\$|€|£|¥|₹";
 
 /// A currency symbol or code followed by a number, as in "S$12.50" or "SGD 12.50".
 static PREFIX_AMOUNT: LazyLock<Regex> = LazyLock::new(|| {
@@ -354,9 +360,11 @@ pub fn amounts(text: &str) -> Vec<(Money, String)> {
         {
             continue;
         }
-        let currency = match caps.name("symbol").map(|m| m.as_str()) {
+        let symbol = caps.name("symbol").map(|m| m.as_str().replace(' ', ""));
+        let currency = match symbol.as_deref() {
             Some("$" | "¥") if code.is_some() => code,
             Some("US$") => Some("USD"),
+            Some("SG$") => Some("SGD"),
             Some("CA$") => Some("CAD"),
             Some("AU$") => Some("AUD"),
             Some("S$") => Some("SGD"),
@@ -1279,6 +1287,19 @@ Available balance: SGD 1,204.33.\r\n";
             .map(|(money, _)| money.currency.unwrap())
             .collect();
         assert_eq!(currencies, ["CAD", "CAD", "CNY", "AUD", "CAD", "HKD"]);
+        let currencies: Vec<_> = amounts("Total paid: US $19.99, HK $5, PLN 49.99, 12.00 PLN")
+            .into_iter()
+            .map(|(money, _)| money.currency.unwrap())
+            .collect();
+        assert_eq!(currencies, ["USD", "HKD", "PLN", "PLN"]);
+        // English words in capitals are not currency codes, and a spaced
+        // one-letter prefix is a bare dollar.
+        let found = amounts("ALL 3 ITEMS. TOP 5 DEALS. PLAN A $5 on BUS $6");
+        let found: Vec<_> = found
+            .into_iter()
+            .map(|(m, _)| (m.number, m.currency))
+            .collect();
+        assert_eq!(found, [("5".into(), None), ("6".into(), None)]);
         let found = amounts("Purchase amount: $25.00 (USD). Settled amount: SGD 33.50");
         assert_eq!(found[0].0.currency.as_deref(), Some("USD"));
         // A parenthesised second amount is not an annotation of the first.
