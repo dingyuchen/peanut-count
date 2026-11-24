@@ -391,8 +391,14 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let mut store = Store::open(&temp.path().join("ledger.db")).unwrap();
         let mut item = statement();
-        store.import_statement(&item).unwrap();
-        store.import_statement(&item).unwrap();
+        assert!(
+            store.import_statement(&item).unwrap(),
+            "first import inserts"
+        );
+        assert!(
+            !store.import_statement(&item).unwrap(),
+            "repeat is a duplicate"
+        );
         assert_eq!(store.statement_page(0).unwrap().len(), 1);
 
         item.rows[0].account = "Expenses:Different".into();

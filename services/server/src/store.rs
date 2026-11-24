@@ -118,7 +118,9 @@ impl Store {
         Ok(id)
     }
 
-    pub fn import_statement(&mut self, statement: &crate::mobile::Statement) -> Result<()> {
+    /// Imports a statement atomically. Returns false when the same statement
+    /// was already imported, so a concurrent duplicate delivery can tell.
+    pub fn import_statement(&mut self, statement: &crate::mobile::Statement) -> Result<bool> {
         let tx = self
             .0
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -140,7 +142,7 @@ impl Store {
                 previous == body,
                 "statement already imported with different postings"
             );
-            return Ok(());
+            return Ok(false);
         }
 
         let mut records = confirmed(&tx)?;
@@ -198,7 +200,7 @@ impl Store {
             params![statement.id, body],
         )?;
         tx.commit()?;
-        Ok(())
+        Ok(true)
     }
 
     pub fn has_statement(&self, id: &str) -> Result<bool> {

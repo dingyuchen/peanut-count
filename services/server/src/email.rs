@@ -95,7 +95,13 @@ fn read(outer: MessageRef, raw: &[u8]) -> Email {
         )))
         .to_owned(),
         sent,
-        body: truncate(&join_split_amounts(&clean(&body_text(message))), MAX_TEXT).to_owned(),
+        // Bound the text before cleaning it, leaving room for whitespace that
+        // cleaning removes and for a currency code just past the limit.
+        body: truncate(
+            &join_split_amounts(&clean(truncate(&body_text(message), MAX_TEXT * 4))),
+            MAX_TEXT,
+        )
+        .to_owned(),
     }
 }
 
@@ -131,7 +137,10 @@ fn body_text(message: MessageRef) -> String {
             // A plain-text alternative such as "View this email in HTML"
             // carries no amount; read the HTML alternative instead.
             match html_part {
-                Some(html) if amounts(truncate(&clean(&text), MAX_TEXT)).is_empty() => {
+                Some(html)
+                    if amounts(truncate(&clean(truncate(&text, MAX_TEXT * 4)), MAX_TEXT))
+                        .is_empty() =>
+                {
                     as_text(html)
                 }
                 _ => text,

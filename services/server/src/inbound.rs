@@ -165,7 +165,8 @@ pub async fn ingest(
     tokio::task::spawn_blocking(move || {
         let mut store = Store::open(&mobile::ledger_path(&data, &user)).map_err(Unavailable)?;
         match store.import_statement(&statement) {
-            Ok(()) => {
+            Ok(false) => Ok(Outcome::Duplicate(statement.id)),
+            Ok(true) => {
                 eprintln!(
                     "Imported email statement {} into ledger {user}",
                     statement.id
