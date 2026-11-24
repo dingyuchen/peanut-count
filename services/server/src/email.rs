@@ -269,7 +269,7 @@ static SUFFIX_AMOUNT: LazyLock<Regex> = LazyLock::new(|| {
 /// or a number before a line holding only a code, as table cells often render.
 static SPLIT_PREFIX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(
-        r"(?m)^((?:{CODES})|{SYMBOLS})\n+((?:[-−+] ?)?[0-9])"
+        r"(?m)^((?:{CODES})|{SYMBOLS})\n+((?:[-−+] ?)?(?:(?:{SYMBOLS}) ?(?:[-−+] ?)?)?[0-9])"
     ))
     .unwrap()
 });
@@ -507,7 +507,10 @@ fn payment_tier(label: &str) -> u8 {
 /// "ending in 1234", or "XXXX1234".
 static CARD_DIGITS: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?i)(?:\bending(?: in| with)?\s*|\bends (?:in|with)\s*|[x*•]{2,}[ -]?)(?P<tail>[0-9]{3,4})\b|\b(?:account|acct|a/c|card)(?: (?:no\.?|num\.?|number))?[ \t]*[:#.]?[ \t]*(?:\r?\n[ \t]*){0,2}(?:[x*•]+[ -]?)?(?P<number>[0-9]{3,19}(?:-[0-9]{1,19}| [0-9]{3,19}){0,4})\b",
+        // A number may follow its label on the same line, or, after an
+        // explicit identifier label such as "Card number" or "Account:", on
+        // one of the next two lines, as separate HTML blocks render it.
+        r"(?i)(?:\bending(?: in| with)?\s*|\bends (?:in|with)\s*|[x*•]{2,}[ -]?)(?P<tail>[0-9]{3,4})\b|\b(?:account|acct|a/c|card)(?: (?:no\.?|num\.?|number))?[ \t]*[:#.]?[ \t]*(?:[x*•]+[ -]?)?(?P<number>[0-9]{3,19}(?:-[0-9]{1,19}| [0-9]{3,19}){0,4})\b|\b(?:account|acct|a/c|card)(?: (?:no\.?|num\.?|number)[ \t]*[:#.]?|[ \t]*[:#])[ \t]*(?:\r?\n[ \t]*){1,2}(?:[x*•]+[ -]?)?(?P<below>[0-9]{3,19}(?:-[0-9]{1,19}| [0-9]{3,19}){0,4})\b",
     )
     .unwrap()
 });
@@ -518,7 +521,18 @@ static CARD_DIGITS: LazyLock<Regex> = LazyLock::new(|| {
 fn cited_numbers(text: &str) -> Vec<String> {
     CARD_DIGITS
         .captures_iter(text)
-        .filter_map(|caps| caps.name("tail").or(caps.name("number")))
+        .filter_map(|caps| {
+            caps.name("tail")
+                .or(caps.name("number"))
+                .or(caps.name("below"))
+        })
+        // The integer part of an amount, such as the "100" of "100.00 USD",
+        // is not an account number.
+        .filter(|number| {
+            let after = text[number.end()..].as_bytes();
+            !(matches!(after.first(), Some(b'.' | b','))
+                && after.get(1).is_some_and(u8::is_ascii_digit))
+        })
         .map(|number| number.as_str().replace([' ', '-'], ""))
         .collect()
 }
@@ -568,7 +582,7 @@ static DATES: LazyLock<[Regex; 5]> = LazyLock::new(|| {
         // A yearless "11/24" right after a date label, or on the next line,
         // so fractions and ratios elsewhere are not read as dates.
         Regex::new(
-            r"(?i)\b(?:date|dated|on)\b[ \t]*:?[ \t]*(?:\r?\n[ \t]*){0,2}(?P<a>[0-9]{1,2})/(?P<b>[0-9]{1,2})\b",
+            r"(?i)(?:\b(?:date|dated)\b[ \t]*:?[ \t]*(?:\r?\n[ \t]*){0,2}|\bon[ \t]+)(?P<a>[0-9]{1,2})/(?P<b>[0-9]{1,2})\b",
         )
         .unwrap(),
     ]
@@ -1329,6 +1343,12 @@ Available balance: SGD 1,204.33.\r\n";
             .map(|(money, _)| money.number)
             .collect();
         assert_eq!(found, ["100.00", "1400.00"], "{split:?}");
+        // A code split from a symbol amount keeps its currency.
+        for split in ["USD\n\n+$100.00", "USD\n$100.00"] {
+            let found = amounts(&join_split_amounts(split));
+            assert_eq!(found.len(), 1, "{split:?}");
+            assert_eq!(found[0].0.currency.as_deref(), Some("USD"), "{split:?}");
+        }
         // An unknown symbol does not hide a code after the amount.
         let found = amounts("Total R$ 10.00 BRL");
         assert_eq!(found.len(), 1);
@@ -1621,6 +1641,11 @@ Content-Transfer-Encoding: base64\r\n\r\n{}",
 <div>Card number:</div><div>5678</div><p>You spent SGD 3.00</p>\r\n";
         let email = parse(html.as_bytes()).unwrap();
         assert_eq!(cited_numbers(&email.body), ["5678"], "{:?}", email.body);
+        // A loose "card" or "account" does not reach the next line, and an
+        // amount's integer part is never a card number.
+        assert!(cited_numbers("Credit to your card\n\n100.00 USD").is_empty());
+        assert!(cited_numbers("Card: 100.00 USD").is_empty());
+        assert_eq!(cited_numbers("Card:\n5678"), ["5678"]);
         // Grouped account names compare as one number.
         let grouped = "Assets:Checking-123-45678-9012";
         assert!(!names_number(grouped, "987654329012"));
