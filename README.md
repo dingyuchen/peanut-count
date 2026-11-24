@@ -203,9 +203,12 @@ liability accounts was used, and the category. The model only chooses among
 values that appear in the email and among your accounts, so it cannot make
 up an amount. Name accounts after the card or account number when you can,
 for example `Liabilities:Citi-Rewards-1234`, so that "card ending 1234"
-matches. Missing accounts and categories are opened automatically. A
-category the model is unsure about goes to `Expenses:Uncategorized` or
-`Income:Uncategorized`. Correct a wrong entry with a reversal.
+matches. If your numbered accounts don't include the number an email cites,
+the email can be rejected with a request to open that account first. Missing
+categories, and `Assets:Checking` or `Liabilities:CreditCard` when the ledger
+has no account of that kind, are opened automatically. A category the model
+is unsure about goes to `Expenses:Uncategorized` or `Income:Uncategorized`.
+Correct a wrong entry with a reversal.
 
 The decision model is any server that speaks TypeSafe Jev's `/v1/systemone`
 format. This includes hosted Jev and local servers such as LM Studio and

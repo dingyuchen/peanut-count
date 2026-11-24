@@ -233,8 +233,12 @@ static SUFFIX_AMOUNT: LazyLock<Regex> = LazyLock::new(|| {
 /// or a number before a line holding only a code, as table cells often render.
 static SPLIT_PREFIX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(&format!(r"(?m)^((?:{CODES})|{SYMBOLS})\n+([0-9])")).unwrap());
-static SPLIT_SUFFIX: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(&format!(r"(?m)^([0-9][0-9,.]*)\n+((?:{CODES})$)")).unwrap());
+static SPLIT_SUFFIX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(&format!(
+        r"(?m)^((?:(?:{SYMBOLS}) ?)?[0-9][0-9,.]*)\n+((?:{CODES})$)"
+    ))
+    .unwrap()
+});
 
 /// Joins a currency marker and its number that layout split across lines.
 fn join_split_amounts(text: &str) -> String {
@@ -362,7 +366,7 @@ pub fn amounts(text: &str) -> Vec<(Money, String)> {
             number,
             currency: currency.map(str::to_owned),
         };
-        if found.len() < MAX_CANDIDATES && !found.iter().any(|(seen, _)| *seen == money) {
+        if !found.iter().any(|(seen, _)| *seen == money) {
             let label = format!(
                 "{}, in “{}”",
                 whole.as_str(),
@@ -371,14 +375,50 @@ pub fn amounts(text: &str) -> Vec<(Money, String)> {
             found.push((money, label));
         }
     }
+    // An itemised receipt can list more prices than the model is offered.
+    // Keep amounts labelled as the payment ahead of line items.
+    if found.len() > MAX_CANDIDATES {
+        let labelled = |label: &str| {
+            let label = label.to_lowercase();
+            [
+                "total",
+                "paid",
+                "charged",
+                "amount",
+                "payment",
+                "debited",
+                "credited",
+                "spent",
+                "refund",
+                "transaction",
+            ]
+            .iter()
+            .any(|word| label.contains(word))
+        };
+        let mut ranked: Vec<_> = found.into_iter().enumerate().collect();
+        ranked.sort_by_key(|(i, (_, label))| (!labelled(label), *i));
+        ranked.truncate(MAX_CANDIDATES);
+        ranked.sort_by_key(|(i, _)| *i);
+        found = ranked.into_iter().map(|(_, item)| item).collect();
+    }
     found
 }
+
+/// The trailing digits of a card or account number, as in "ending 1234",
+/// "ending in 1234", or "XXXX1234".
+static CARD_DIGITS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)(?:\bending(?: in| with)?\s*|\bends (?:in|with)\s*|[x*•]{2,}[ -]?)([0-9]{3,4})\b",
+    )
+    .unwrap()
+});
 
 const MONTH: &str = r"(?P<month>(?i:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-zA-Z]*)\.?";
 
 static DATES: LazyLock<[Regex; 4]> = LazyLock::new(|| {
     [
-        Regex::new(r"\b(?P<year>[0-9]{4})-(?P<m>[0-9]{1,2})-(?P<day>[0-9]{1,2})\b").unwrap(),
+        // Also the date of an ISO timestamp such as 2026-11-23T23:58:00+08:00.
+        Regex::new(r"\b(?P<year>[0-9]{4})-(?P<m>[0-9]{1,2})-(?P<day>[0-9]{1,2})(?:T|\b)").unwrap(),
         Regex::new(&format!(
             r"\b(?P<day>[0-9]{{1,2}})(?:st|nd|rd|th)?[ -]{MONTH}(?:[ ,-]+(?P<year>[0-9]{{4}}))?\b"
         ))
@@ -606,13 +646,32 @@ pub async fn extract(
         .filter(|name| name.starts_with("Assets:") || name.starts_with("Liabilities:"))
         .map(|name| (name.clone(), describe_account(name, false)))
         .collect();
-    if sources.is_empty() {
-        sources.extend(
-            DEFAULT_SOURCES
-                .iter()
-                .filter(|(name, _)| !is_closed(name))
-                .map(|(name, text)| (name.to_string(), text.to_string())),
-        );
+    // The ledger may lack the card or account the email names. Only when the
+    // email cites a number, such as "ending 5678", that none of the numbered
+    // accounts carries can the model answer "none".
+    let cited: Vec<&str> = CARD_DIGITS
+        .captures_iter(&text)
+        .map(|caps| caps.get(1).unwrap().as_str())
+        .collect();
+    let numbered: Vec<&String> = sources
+        .keys()
+        .filter(|name| {
+            name.split([':', '-'])
+                .any(|part| part.len() >= 3 && part.bytes().all(|b| b.is_ascii_digit()))
+        })
+        .collect();
+    let offer_none = !cited.is_empty()
+        && !numbered.is_empty()
+        && !cited
+            .iter()
+            .any(|number| numbered.iter().any(|name| name.contains(number)));
+    // Offer each kind the ledger lacks, so the first alert for a new credit
+    // card is not booked to the only bank account.
+    for (name, text) in DEFAULT_SOURCES {
+        let kind = &name[..=name.find(':').unwrap()];
+        if !is_closed(name) && !sources.keys().any(|source| source.starts_with(kind)) {
+            sources.insert(name.to_owned(), text.to_owned());
+        }
     }
     if sources.is_empty() {
         return Err(rejected(
@@ -684,10 +743,20 @@ pub async fn extract(
         }));
     }
     if sources.len() > 1 {
+        let mut criteria: Map<String, Value> = sources
+            .iter()
+            .map(|(name, text)| (name.clone(), Value::String(text.clone())))
+            .collect();
+        if offer_none {
+            criteria.insert(
+                "none".into(),
+                "None of these: `email` names a different card or account.".into(),
+            );
+        }
         questions.insert("account".into(), json!({
             "type": "choice",
             "instructions": "Which of the user's accounts did the transaction in `email` use? Match bank names and card or account numbers where possible.",
-            "criteria": sources,
+            "criteria": criteria,
         }));
     }
 
@@ -740,8 +809,19 @@ pub async fn extract(
     let source = if sources.len() == 1 {
         sources.keys().next().unwrap().clone()
     } else {
-        let keys: Vec<&str> = sources.keys().map(String::as_str).collect();
-        choice(&answers, "account", &keys)?.to_owned()
+        let keys: Vec<&str> = sources
+            .keys()
+            .map(String::as_str)
+            .chain(offer_none.then_some("none"))
+            .collect();
+        match choice(&answers, "account", &keys)? {
+            "none" => {
+                return Err(rejected(
+                    "The email names an account that is not in the ledger. Open it, then forward the email again.",
+                ));
+            }
+            source => source.to_owned(),
+        }
     };
     // Keep the account the email identifies. If the chosen amount is in a
     // currency it cannot hold, such as a foreign purchase price, ask which
@@ -1032,6 +1112,11 @@ Available balance: SGD 1,204.33.\r\n";
                 "2026-05-11"
             ]
         );
+        // The calendar date of an ISO timestamp counts.
+        assert_eq!(
+            dates("Transaction time: 2026-11-23T23:58:00+08:00", anchor)[0].0,
+            date("2026-11-23")
+        );
         // A yearless date after the anchor belongs to the previous year.
         assert_eq!(dates("on 30 Dec", anchor)[0].0, date("2025-12-30"));
     }
@@ -1052,6 +1137,17 @@ Available balance: SGD 1,204.33.\r\n";
             join_split_amounts("Amount\nSGD\n\n12.50\n7.25\nUSD"),
             "Amount\nSGD 12.50\n7.25 USD"
         );
+        assert_eq!(join_split_amounts("$\n12.50\nCAD"), "$ 12.50 CAD");
+        let found = amounts(&join_split_amounts("$\n12.50\nCAD"));
+        assert_eq!(found[0].0.currency.as_deref(), Some("CAD"));
+        // An itemised receipt keeps its labelled total past the candidate cap.
+        let receipt: String = (1..=14)
+            .map(|i| format!("Item {i} USD {i}.00\n"))
+            .collect::<String>()
+            + "Total paid: USD 143.27";
+        let found = amounts(&receipt);
+        assert_eq!(found.len(), MAX_CANDIDATES);
+        assert!(found.iter().any(|(money, _)| money.number == "143.27"));
         // Codes pair with amounts on the same line only.
         let found = amounts("Card currency: CAD\n$25.00 USD and CAD $26 USD");
         assert_eq!(found.len(), 1);
@@ -1336,6 +1432,7 @@ Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain
             ("date".into(), choice("1", &[])),
             ("payee".into(), choice("none", &[])),
             ("settled".into(), choice("1", &[])),
+            ("account".into(), choice("Liabilities:Card-1234", &[])),
             (
                 "category".into(),
                 choice("Expenses:Shopping", &[("Expenses:Shopping", 0.8)]),
@@ -1391,9 +1488,19 @@ Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain
             ),
         ]);
         let only = vec![account("Assets:Wallet", &[], &["SGD"])];
-        let statement = extract(&email, &only, &[], "USD", &fixed(answers.clone()))
-            .await
-            .unwrap();
+        let mut wallet = answers.clone();
+        wallet.insert("account".into(), choice("Assets:Wallet", &[]));
+        let model = fixed(wallet);
+        let statement = extract(&email, &only, &[], "USD", &model).await.unwrap();
+        // A ledger with only a bank account is still offered a credit card.
+        let calls = model.calls.into_inner().unwrap();
+        let offered = calls[0]["account"]["criteria"].as_object().unwrap();
+        assert!(
+            ["Assets:Wallet", "Liabilities:CreditCard"]
+                .iter()
+                .all(|k| offered.contains_key(*k))
+        );
+        assert!(!offered.contains_key("none"), "no card number is cited");
         assert_eq!(
             (statement.source.as_str(), statement.currency.as_str()),
             ("Assets:Wallet", "SGD")
@@ -1401,13 +1508,43 @@ Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain
         assert_eq!(statement.rows[0].description, "Grab");
 
         let mut answers = answers;
+        // "none" is offered only for a cited number no numbered account carries.
+        answers.insert("account".into(), choice("none", &[]));
+        let numbered = vec![
+            account("Liabilities:Citi-1234", &[], &[]),
+            account("Assets:Wallet", &[], &[]),
+        ];
+        for (body, offered) in [
+            (
+                "Card ending 5678: you paid $8.00 to Grab on 2026-11-23.",
+                true,
+            ),
+            (
+                "Visa ending in 1234: you paid $8.00 to Grab on 2026-11-23.",
+                false,
+            ),
+        ] {
+            email.body = body.into();
+            let model = fixed(answers.clone());
+            let result = extract(&email, &numbered, &[], "USD", &model).await;
+            let calls = model.calls.into_inner().unwrap();
+            let none = calls[0]["account"]["criteria"].get("none").is_some();
+            assert_eq!(none, offered, "{body}");
+            if offered {
+                assert!(matches!(result, Err(Failure::Rejected(_))));
+            }
+        }
+        email.body = "You paid $8.00 to Grab on 2026-11-23.".into();
+
+        // An empty ledger has no "none": the defaults are all it can use.
         answers.insert("account".into(), choice("Assets:Checking", &[]));
-        let statement = extract(&email, &[], &[], "AUD", &fixed(answers))
-            .await
-            .unwrap();
+        let model = fixed(answers);
+        let statement = extract(&email, &[], &[], "AUD", &model).await.unwrap();
         assert_eq!(
             (statement.source.as_str(), statement.currency.as_str()),
             ("Assets:Checking", "AUD")
         );
+        let calls = model.calls.into_inner().unwrap();
+        assert!(calls[0]["account"]["criteria"].get("none").is_none());
     }
 }
