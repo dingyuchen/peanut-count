@@ -102,18 +102,29 @@ static CELL_TAG: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)<(/?t[dh]\b
 /// a space between table cells, so "Total" and "S$17.10" do not run together
 /// while "SGD" and "12.50" in one row stay on one line.
 fn body_text(message: &Message) -> String {
+    let html = |part: &mail_parser::MessagePart| {
+        // html_to_text collapses whitespace, so mark the breaks with
+        // private-use characters and restore them afterwards.
+        let html = part.text_contents().unwrap_or_default();
+        let html = BLOCK_TAG.replace_all(html, "\u{e000}<$1");
+        let html = CELL_TAG.replace_all(&html, "\u{e001}<$1");
+        html_to_text(&html)
+            .replace('\u{e000}', "\n")
+            .replace('\u{e001}', " ")
+    };
     match message.text_part(0) {
-        Some(part) if part.is_text_html() => {
-            // html_to_text collapses whitespace, so mark the breaks with
-            // private-use characters and restore them afterwards.
-            let html = part.text_contents().unwrap_or_default();
-            let html = BLOCK_TAG.replace_all(html, "\u{e000}<$1");
-            let html = CELL_TAG.replace_all(&html, "\u{e001}<$1");
-            html_to_text(&html)
-                .replace('\u{e000}', "\n")
-                .replace('\u{e001}', " ")
+        Some(part) if part.is_text_html() => html(part),
+        _ => {
+            let text = message.body_text(0).unwrap_or_default().into_owned();
+            // A plain-text alternative such as "View this email in HTML"
+            // carries no amount; read the HTML alternative instead.
+            match message.html_part(0) {
+                Some(part) if part.is_text_html() && amounts(&clean(&text)).is_empty() => {
+                    html(part)
+                }
+                _ => text,
+            }
         }
-        _ => message.body_text(0).unwrap_or_default().into_owned(),
     }
 }
 
@@ -210,7 +221,7 @@ static CODE_BEFORE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(&format!(r"\b({CODES}) ?$")).unwrap());
 
 static CODE_AFTER: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(&format!(r"^ ?({CODES})\b")).unwrap());
+    LazyLock::new(|| Regex::new(&format!(r"^ ?\(?({CODES})\b")).unwrap());
 
 const SYMBOLS: &str = r"US\$|CA\$|AU\$|S\$|A\$|C\$|HK\$|NZ\$|\$|€|£|¥|₹";
 
@@ -1042,18 +1053,23 @@ fn limit(
         .map(|caps| caps.get(1).unwrap().as_str())
         .collect();
     let text = text.to_lowercase();
-    // A name part in the email, or a numeric part ending in a cited card number.
-    let mentioned = |name: &str| {
-        name.split([':', '-']).skip(1).any(|part| {
-            (part.len() >= 3 && text.contains(&part.to_lowercase()))
-                || (part.bytes().all(|b| b.is_ascii_digit())
-                    && cited.iter().any(|number| part.ends_with(number)))
+    // A numeric part ending in a cited card number is the strongest match,
+    // then any name part that appears in the email.
+    let card = |name: &str| {
+        name.split([':', '-']).any(|part| {
+            part.bytes().all(|b| b.is_ascii_digit())
+                && cited.iter().any(|number| part.ends_with(number))
         })
+    };
+    let mentioned = |name: &str| {
+        name.split([':', '-'])
+            .skip(1)
+            .any(|part| part.len() >= 3 && text.contains(&part.to_lowercase()))
     };
     let mut ordered: Vec<_> = options.into_iter().collect();
     ordered.sort_by_key(|(name, _)| {
         let fallback = name.ends_with(":Uncategorized");
-        (!fallback, !mentioned(name), rank(name))
+        (!fallback, !card(name), !mentioned(name), rank(name))
     });
     ordered.truncate(MAX_CHOICES);
     ordered.into_iter().collect()
@@ -1258,6 +1274,8 @@ Available balance: SGD 1,204.33.\r\n";
             .map(|(money, _)| money.currency.unwrap())
             .collect();
         assert_eq!(currencies, ["CAD", "CAD", "CNY", "AUD", "CAD", "HKD"]);
+        let found = amounts("Purchase amount: $25.00 (USD). Settled amount: SGD 33.50");
+        assert_eq!(found[0].0.currency.as_deref(), Some("USD"));
         // Arabic-Indic digits are not dates and must not panic.
         assert!(dates("٢٣/١١/٢٠٢٦ ٢٠٢٦-١١-٢٣ ٢٣ Nov", date("2026-11-24")).is_empty());
     }
@@ -1303,6 +1321,14 @@ Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain
             "re-forwarding the same alert deduplicates"
         );
         assert!(inner.body.contains("STARBUCKS VIVOCITY"));
+
+        // A placeholder plain-text alternative falls back to the HTML part.
+        let alternative = "Message-ID: <a1@bank.example>\r\nSubject: Alert\r\nMIME-Version: 1.0\r\n\
+Content-Type: multipart/alternative; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain\r\n\r\n\
+Please view this email in an HTML-capable client.\r\n--b\r\nContent-Type: text/html\r\n\r\n\
+<p>You spent <b>SGD 12.50</b> at KOPITIAM.</p>\r\n--b--\r\n";
+        let email = parse(alternative.as_bytes()).unwrap();
+        assert!(email.body.contains("SGD 12.50"), "{:?}", email.body);
 
         // Table cells stay on separate lines, so "SGD 12.50" keeps its amount.
         let html = "Message-ID: <h1@bank.example>\r\nSubject: Alert\r\nContent-Type: text/html\r\n\r\n\
@@ -1548,6 +1574,14 @@ Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain
 
     #[test]
     fn limit_keeps_the_account_matching_a_cited_card_number() {
+        // Every account shares the issuer name, which the email also mentions.
+        let shared: BTreeMap<String, String> = (0..60)
+            .map(|i| (format!("Assets:Bank-{i:02}"), String::new()))
+            .chain([("Liabilities:Bank-Visa-91234".into(), String::new())])
+            .collect();
+        let kept = limit(shared, "Bank purchase on card ending 1234", |_| 1);
+        assert!(kept.contains_key("Liabilities:Bank-Visa-91234"));
+
         let options: BTreeMap<String, String> = (0..80)
             .map(|i| (format!("Assets:Bank{i:02}"), String::new()))
             .chain([("Liabilities:Visa-91234".into(), String::new())])
