@@ -64,6 +64,55 @@ pub fn parse(raw: &[u8]) -> Result<Email> {
 /// time grows with this count times the message size.
 const MAX_BOUNDARIES: usize = 256;
 
+/// Longest boundary value accepted, in raw bytes. RFC 2046 allows 70
+/// characters; this leaves room for quotes and folding. mail-parser compares
+/// the boundary at every "--" in the body, so a long one costs its length
+/// times the message size.
+const MAX_BOUNDARY_LEN: usize = 200;
+
+/// Most RFC 2231 parameter continuations, such as `name*1=`, accepted.
+/// mail-parser copies the value assembled so far for each one. Only numbered
+/// segments count, so CSS selectors such as `[style*="x"]` do not.
+const MAX_CONTINUATIONS: usize = 32;
+
+static CONTINUATION: LazyLock<regex::bytes::Regex> =
+    LazyLock::new(|| regex::bytes::Regex::new(r"\*[ \t]*[0-9]+[ \t]*\*?[ \t]*=").unwrap());
+
+/// The raw length of the value after a `boundary` match, reading past an
+/// optional continuation marker and "=", to the closing quote of a quoted
+/// value or the end of an unquoted token. An unterminated value counts in
+/// full, up to one byte past the limit.
+fn boundary_value_len(rest: &[u8]) -> usize {
+    let limit = MAX_BOUNDARY_LEN + 1;
+    let mut i = 0;
+    while i < rest.len() && i < 16 && rest[i] != b'=' {
+        i += 1;
+    }
+    if rest.get(i) != Some(&b'=') {
+        return 0;
+    }
+    let value = &rest[i + 1..];
+    let start = value
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .unwrap_or(value.len());
+    let value = &value[start..];
+    let len = if value.first() == Some(&b'"') {
+        value[1..]
+            .iter()
+            .take(limit)
+            .position(|&b| b == b'"')
+            .unwrap_or(limit)
+    } else {
+        value
+            .iter()
+            .take(limit)
+            .position(|&b| b == b';' || b.is_ascii_whitespace())
+            .unwrap_or(limit.min(value.len()))
+    };
+    len.min(limit)
+}
+
 static BOUNDARY: LazyLock<regex::bytes::Regex> =
     LazyLock::new(|| regex::bytes::Regex::new(r"(?i)boundary").unwrap());
 
@@ -92,6 +141,20 @@ fn parse_within(raw: &[u8], depth: u8) -> Result<Email> {
     anyhow::ensure!(
         BOUNDARY.find_iter(raw).take(MAX_BOUNDARIES + 1).count() <= MAX_BOUNDARIES,
         "the email has too many MIME parts"
+    );
+    anyhow::ensure!(
+        BOUNDARY
+            .find_iter(raw)
+            .all(|found| boundary_value_len(&raw[found.end()..]) <= MAX_BOUNDARY_LEN),
+        "the email has an overlong MIME boundary"
+    );
+    anyhow::ensure!(
+        CONTINUATION
+            .find_iter(raw)
+            .take(MAX_CONTINUATIONS + 1)
+            .count()
+            <= MAX_CONTINUATIONS,
+        "the email splits MIME parameters too many times"
     );
     let outer = parser()
         .parse(raw)
@@ -954,13 +1017,13 @@ pub async fn extract(
         .captures_iter(&text)
         .map(|caps| caps.get(1).unwrap().as_str())
         .collect();
-    let offer_none = !cited.is_empty()
-        && !cited.iter().any(|number| {
-            sources.keys().any(|name| {
-                name.split([':', '-'])
-                    .any(|part| part.bytes().all(|b| b.is_ascii_digit()) && part.ends_with(number))
-            })
-        });
+    // Any unmatched number counts: a transfer can cite both accounts.
+    let offer_none = cited.iter().any(|number| {
+        !sources.keys().any(|name| {
+            name.split([':', '-'])
+                .any(|part| part.bytes().all(|b| b.is_ascii_digit()) && part.ends_with(number))
+        })
+    });
     // Offer each kind the ledger lacks, so the first alert for a new credit
     // card is not booked to the only bank account.
     for (name, text) in DEFAULT_SOURCES {
@@ -1046,12 +1109,12 @@ pub async fn extract(
         if offer_none {
             criteria.insert(
                 "none".into(),
-                "None of these: `email` names a different card or account.".into(),
+                "None of these: the account this transaction moves money in or out of is not listed.".into(),
             );
         }
         questions.insert("account".into(), json!({
             "type": "choice",
-            "instructions": "Which of the user's accounts did the transaction in `email` use? Match bank names and card or account numbers where possible.",
+            "instructions": "Which of the user's accounts did the transaction in `email` move money in or out of? For a transfer between two accounts, choose the one the email reports as debited or charged if it is listed. Match bank names and card or account numbers where possible.",
             "criteria": criteria,
         }));
     }
@@ -1642,6 +1705,31 @@ Content-Type: multipart/alternative; boundary=b\r\n\r\n--b\r\nContent-Type: text
         assert!(parse(slow.as_bytes()).is_err());
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
 
+        // Overlong or unterminated boundaries and long continuation chains
+        // are refused before the parser's quadratic paths can run.
+        let long = "-".repeat(100_000);
+        let dashes = "-".repeat(2_000_000);
+        let overlong =
+            format!("Content-Type: multipart/mixed; boundary=\"{long}\"\r\n\r\n{dashes}\r\n");
+        let started = std::time::Instant::now();
+        assert!(parse(overlong.as_bytes()).is_err());
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        let unterminated = format!(
+            "Content-Type: multipart/mixed; boundary=\"{}\r\n\r\nx\r\n",
+            "a".repeat(300)
+        );
+        assert!(parse(unterminated.as_bytes()).is_err());
+        let segments: String = (0..1000).map(|i| format!("; name*{i}=\"x\"")).collect();
+        let continued = format!("Content-Type: text/plain{segments}\r\n\r\nSGD 1.00\r\n");
+        assert!(parse(continued.as_bytes()).is_err());
+        // CSS attribute selectors in an HTML body are not continuations.
+        let css = "td[style*=\"x\"]{color:red}".repeat(100);
+        let styled = format!(
+            "Message-ID: <css@x.example>\r\nContent-Type: text/html\r\n\r\n\
+<style>{css}</style><p>You spent SGD 3.00</p>\r\n"
+        );
+        assert!(parse(styled.as_bytes()).unwrap().body.contains("SGD 3.00"));
+
         // An ordinary forward with an encoded attachment still parses.
         let attached = format!(
             "Message-ID: <fwd@x.example>\r\nSubject: Fwd\r\nMIME-Version: 1.0\r\n\
@@ -2089,6 +2177,15 @@ Please view this email in an HTML-capable client.\r\n--b\r\nContent-Type: text/h
                 ],
                 vec![],
                 "Visa ending 1234: you paid $8.00 to Grab on 2026-11-23.",
+            ),
+            // A transfer citing a missing debited account and a known credited one.
+            (
+                vec![
+                    account("Assets:Savings-1234", &[], &[]),
+                    account("Assets:Wallet", &[], &[]),
+                ],
+                vec![],
+                "Transfer of $8.00 from account ending 5678 to account ending 1234 on 2026-11-23.",
             ),
             // No account names carry numbers at all.
             (
