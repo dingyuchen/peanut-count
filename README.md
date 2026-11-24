@@ -245,25 +245,46 @@ in `X-Peanut-Recipient`. Messages may be up to 4 MiB.
 | 200 | Already imported | Accept |
 | 404 | Unknown address | Reject |
 | 422 | Not a transaction, or the ledger rejected it. The body has the reason. | Reject |
-| 503 | Decision model unset or unreachable, storage busy, or too many deliveries at once | Retry later |
+| 503 | Decision model unset or unreachable, storage busy, ledger has unresolved sync conflicts, or too many deliveries at once | Retry later |
 
 **Local MTA pipe.** `peanut-count ingest-email` reads one message from
 standard input. It exits with 0 for an import or duplicate, 67 for an unknown
 recipient, 65 for a rejected message, and 75 to defer a retry. For Postfix,
-route the domain to a `pipe` transport that runs a wrapper. The wrapper exports
-the variables above and executes:
+route the domain to a `pipe` transport that delivers one recipient per call.
+Otherwise one exit status would acknowledge every recipient of the message.
 
-```sh
-exec peanut-count ingest-email --data /srv/peanut/mobile-data --recipient "$1"
+```
+# master.cf
+peanut    unix  -       n       n       -       -       pipe
+  user=peanut argv=/usr/local/bin/peanut-ingest ${recipient}
+# main.cf
+peanut_destination_recipient_limit = 1
+transport_maps = hash:/etc/postfix/transport
+# /etc/postfix/transport
+in.example.com  peanut:
 ```
 
-Pass `${recipient}` as the argument in `master.cf`. The command needs write
-access to the data directory.
+Also add the domain to `relay_domains` so that Postfix accepts its mail, and
+run `postmap /etc/postfix/transport`.
+
+The wrapper exports the variables above, defers anything but one recipient,
+and runs the import. The `peanut` user needs write access to the data directory.
+
+```sh
+#!/bin/sh
+[ "$#" -eq 1 ] || exit 75
+set -a
+. /etc/peanut/inbound.env
+set +a
+exec peanut-count ingest-email --data /srv/peanut/mobile-data --recipient "$1"
+```
 
 Duplicates are detected by the original message's Message-ID. A relay retry
 or a re-forward of the same email as an attachment is recorded once.
 Forwarding it inline twice creates a new message, which is recorded twice.
-Amounts need a currency symbol or ISO code and a dot decimal separator. An
+Amounts need a currency symbol or ISO code and a dot decimal separator.
+Amounts grouped with spaces or apostrophes, or written with a decimal comma,
+are skipped. An
 email that reports several transactions is recorded as one of them.
 
 ### Local decision model with LM Studio

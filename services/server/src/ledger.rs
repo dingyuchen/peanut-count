@@ -166,6 +166,22 @@ struct BookedTransaction {
     postings: Vec<BookedPosting>,
 }
 
+/// An open account and the currencies it accepts or has been posted in.
+#[derive(Clone, Debug, Default)]
+pub struct OpenAccount {
+    pub name: String,
+    /// Currencies the account is restricted to. Empty means any currency.
+    pub declared: Vec<String>,
+    /// Currencies the account has been posted in.
+    pub posted: Vec<String>,
+}
+
+impl OpenAccount {
+    pub fn accepts(&self, currency: &str) -> bool {
+        self.declared.is_empty() || self.declared.iter().any(|c| c == currency)
+    }
+}
+
 #[derive(Default)]
 pub struct Ledger {
     accounts: HashMap<String, Account>,
@@ -196,25 +212,23 @@ impl Ledger {
 
     /// Open accounts sorted by name, each with its declared currencies or,
     /// for an unconstrained account, the currencies it has been posted in.
-    pub fn open_accounts(&self) -> Vec<(String, Vec<String>)> {
+    pub fn open_accounts(&self) -> Vec<OpenAccount> {
         let mut open: Vec<_> = self
             .accounts
             .iter()
             .filter(|(_, account)| !account.closed)
-            .map(|(name, account)| {
-                let currencies = if account.currencies.is_empty() {
-                    self.balances
-                        .keys()
-                        .filter(|(held, _)| held == name)
-                        .map(|(_, currency)| currency.clone())
-                        .collect()
-                } else {
-                    account.currencies.clone()
-                };
-                (name.clone(), currencies)
+            .map(|(name, account)| OpenAccount {
+                name: name.clone(),
+                declared: account.currencies.clone(),
+                posted: self
+                    .balances
+                    .keys()
+                    .filter(|(held, _)| held == name)
+                    .map(|(_, currency)| currency.clone())
+                    .collect(),
             })
             .collect();
-        open.sort();
+        open.sort_by(|a, b| a.name.cmp(&b.name));
         open
     }
 

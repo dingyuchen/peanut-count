@@ -170,8 +170,13 @@ pub async fn ingest(
             Err(_) if store.has_statement(&statement.id).map_err(Unavailable)? => {
                 Ok(Outcome::Duplicate(statement.id))
             }
-            // Storage errors such as a lock timeout may succeed on retry.
-            Err(error) if error.chain().any(|cause| cause.is::<rusqlite::Error>()) => {
+            // Storage errors such as a lock timeout, and a ledger blocked by
+            // pending conflicts, may succeed on retry.
+            Err(error)
+                if error.chain().any(|cause| {
+                    cause.is::<rusqlite::Error>() || cause.is::<crate::store::LedgerBlocked>()
+                }) =>
+            {
                 Err(Unavailable(error))
             }
             Err(error) => Err(Rejected(format!(

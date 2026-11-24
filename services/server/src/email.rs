@@ -16,6 +16,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     jev::{Answer, Answers, Decide},
+    ledger::OpenAccount,
     mobile::{Statement, StatementRow},
 };
 
@@ -216,10 +217,17 @@ pub fn amounts(text: &str) -> Vec<(Money, String)> {
         let mut ahead = after.chars();
         let mut behind = before.chars().rev();
         let (next, prev) = (ahead.next(), behind.next());
+        // Separators include spaces, apostrophes, and thin spaces used for grouping.
+        let separator = |c: Option<char>| {
+            matches!(
+                c,
+                Some(',' | '.' | ' ' | '\'' | '\u{a0}' | '\u{202f}' | '\u{2009}')
+            )
+        };
         if digit(next)
             || digit(prev)
-            || (matches!(next, Some(',' | '.')) && digit(ahead.next()))
-            || (matches!(prev, Some(',' | '.')) && digit(behind.next()))
+            || (separator(next) && digit(ahead.next()))
+            || (separator(prev) && digit(behind.next()))
         {
             continue;
         }
@@ -456,7 +464,7 @@ const DEFAULT_CATEGORIES: [(&str, &str); 14] = [
 /// Chooses a statement row for `email` against the ledger's open accounts.
 pub async fn extract(
     email: &Email,
-    accounts: &[(String, Vec<String>)],
+    accounts: &[OpenAccount],
     closed: &[String],
     default_currency: &str,
     model: &impl Decide,
@@ -495,8 +503,9 @@ pub async fn extract(
 
     let mut sources: BTreeMap<String, String> = accounts
         .iter()
-        .filter(|(name, _)| name.starts_with("Assets:") || name.starts_with("Liabilities:"))
-        .map(|(name, _)| (name.clone(), describe_account(name, false)))
+        .map(|account| &account.name)
+        .filter(|name| name.starts_with("Assets:") || name.starts_with("Liabilities:"))
+        .map(|name| (name.clone(), describe_account(name, false)))
         .collect();
     if sources.is_empty() {
         sources.extend(
@@ -513,8 +522,9 @@ pub async fn extract(
     }
     let mut counters: BTreeMap<String, String> = accounts
         .iter()
-        .filter(|(name, _)| !name.starts_with("Equity:"))
-        .map(|(name, _)| {
+        .map(|account| &account.name)
+        .filter(|name| !name.starts_with("Equity:"))
+        .map(|name| {
             let transfer = name.starts_with("Assets:") || name.starts_with("Liabilities:");
             (name.clone(), describe_account(name, transfer))
         })
@@ -627,16 +637,50 @@ pub async fn extract(
             .ok()
             .map(|i| payees[i - 1].clone())
     };
+    let find = |name: &str| accounts.iter().find(|account| account.name == name);
+    // Accounts created on import accept any currency.
+    let accepts = |name: &str, currency: &str| find(name).is_none_or(|a| a.accepts(currency));
+    // Take the most likely source that accepts the amount's currency.
     let source = if sources.len() == 1 {
         sources.keys().next().unwrap().clone()
     } else {
         let keys: Vec<&str> = sources.keys().map(String::as_str).collect();
-        choice(&answers, "account", &keys)?.to_owned()
+        let chosen = choice(&answers, "account", &keys)?;
+        let mut ranked: Vec<(&str, f64)> = match answers.get("account") {
+            Some(Answer::Choice { probabilities, .. }) => probabilities
+                .iter()
+                .filter(|(name, _)| sources.contains_key(*name))
+                .map(|(name, p)| (name.as_str(), *p))
+                .collect(),
+            _ => Vec::new(),
+        };
+        ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+        std::iter::once(chosen)
+            .chain(ranked.into_iter().map(|(name, _)| name))
+            .find(|name| money.currency.as_deref().is_none_or(|c| accepts(name, c)))
+            .ok_or_else(|| {
+                rejected(format!(
+                    "No likely account accepts {}.",
+                    money.currency.as_deref().unwrap_or("this currency")
+                ))
+            })?
+            .to_owned()
     };
+    let currency = money.currency.clone().unwrap_or_else(|| {
+        let account = find(&source).cloned().unwrap_or_default();
+        match (&account.declared[..], &account.posted[..]) {
+            ([only], _) | ([], [only]) => only.clone(),
+            _ => default_currency.to_owned(),
+        }
+    });
+    if !accepts(&source, &currency) {
+        return Err(rejected(format!("{source} does not accept {currency}.")));
+    }
 
     // Ask for the category separately: in the same call the model tends to
     // pick the source account the email names, which crowds out categories.
     counters.remove(&source);
+    counters.retain(|name, _| accepts(name, &currency));
     let instructions = if outgoing {
         "Money left the user's account in `email`. Which account best describes what it was spent on, or which of the user's own accounts received it?"
     } else {
@@ -671,9 +715,9 @@ pub async fn extract(
             } else {
                 "Income:Uncategorized"
             };
-            if is_closed(fallback) {
+            if is_closed(fallback) || !accepts(fallback, &currency) {
                 Err(rejected(format!(
-                    "No category fits and the fallback {fallback} is closed."
+                    "No category fits and the fallback {fallback} cannot take {currency}."
                 )))
             } else {
                 Ok(fallback.to_owned())
@@ -682,12 +726,6 @@ pub async fn extract(
         Ok,
     )?;
 
-    let currency = money.currency.clone().unwrap_or_else(|| {
-        match accounts.iter().find(|(name, _)| *name == source) {
-            Some((_, currencies)) if currencies.len() == 1 => currencies[0].clone(),
-            _ => default_currency.to_owned(),
-        }
-    });
     let description = payee
         .or_else(|| (!email.subject.is_empty()).then(|| email.subject.clone()))
         .unwrap_or_else(|| "Email transaction".into());
@@ -774,6 +812,14 @@ Available balance: SGD 1,204.33.\r\n";
         }
     }
 
+    fn account(name: &str, declared: &[&str], posted: &[&str]) -> OpenAccount {
+        OpenAccount {
+            name: name.into(),
+            declared: declared.iter().map(|c| c.to_string()).collect(),
+            posted: posted.iter().map(|c| c.to_string()).collect(),
+        }
+    }
+
     fn date(text: &str) -> NaiveDate {
         text.parse().unwrap()
     }
@@ -828,6 +874,8 @@ Available balance: SGD 1,204.33.\r\n";
     #[test]
     fn rejects_partial_and_non_ascii_numbers() {
         assert!(amounts("€12,34 and 1.234,56 EUR and S$12.505").is_empty());
+        assert!(amounts("EUR 1 234.56 and 1\u{202f}234 USD and CHF 1'234.50").is_empty());
+        assert_eq!(amounts("SGD 12 on 3 Nov").len(), 1);
         // Arabic-Indic digits are not dates and must not panic.
         assert!(dates("٢٣/١١/٢٠٢٦ ٢٠٢٦-١١-٢٣ ٢٣ Nov", date("2026-11-24")).is_empty());
     }
@@ -879,9 +927,9 @@ Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain
     async fn builds_a_signed_row_from_model_choices() {
         let email = parse(ALERT.as_bytes()).unwrap();
         let accounts = vec![
-            ("Assets:DBS-Savings".to_string(), vec!["SGD".to_string()]),
-            ("Liabilities:DBS-Card-1234".to_string(), vec![]),
-            ("Expenses:Coffee".to_string(), vec![]),
+            account("Assets:DBS-Savings", &["SGD"], &[]),
+            account("Liabilities:DBS-Card-1234", &[], &[]),
+            account("Expenses:Coffee", &[], &[]),
         ];
         let answers = Answers::from([
             ("transaction".into(), Answer::Noul { noul: 0.97 }),
@@ -969,6 +1017,43 @@ Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain
             !options.contains_key("Expenses:Dining") && options.contains_key("Expenses:Groceries")
         );
 
+        // A source that cannot hold the currency yields to the next likely one,
+        // and categories restricted to other currencies are not offered.
+        let restricted = vec![
+            account("Assets:USD-Wallet", &["USD"], &[]),
+            account("Liabilities:DBS-Card-1234", &[], &[]),
+            account("Expenses:Dining", &["USD"], &[]),
+        ];
+        let mut prefers_usd = answers.clone();
+        prefers_usd.insert(
+            "account".into(),
+            choice(
+                "Assets:USD-Wallet",
+                &[
+                    ("Assets:USD-Wallet", 0.7),
+                    ("Liabilities:DBS-Card-1234", 0.3),
+                ],
+            ),
+        );
+        prefers_usd.insert(
+            "category".into(),
+            choice("Expenses:Groceries", &[("Expenses:Groceries", 0.9)]),
+        );
+        let model = fixed(prefers_usd);
+        let statement = extract(&email, &restricted, &[], "USD", &model)
+            .await
+            .unwrap();
+        assert_eq!(
+            (statement.source.as_str(), statement.currency.as_str()),
+            ("Liabilities:DBS-Card-1234", "SGD")
+        );
+        let calls = model.calls.into_inner().unwrap();
+        assert!(
+            calls[1]["category"]["criteria"]
+                .get("Expenses:Dining")
+                .is_none()
+        );
+
         let mut promo = answers;
         promo.insert("transaction".into(), Answer::Noul { noul: 0.1 });
         assert!(matches!(
@@ -992,7 +1077,7 @@ Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain
                 choice("Expenses:Transport", &[("Expenses:Transport", 0.9)]),
             ),
         ]);
-        let only = vec![("Assets:Wallet".to_string(), vec!["SGD".to_string()])];
+        let only = vec![account("Assets:Wallet", &[], &["SGD"])];
         let statement = extract(&email, &only, &[], "USD", &fixed(answers.clone()))
             .await
             .unwrap();

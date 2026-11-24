@@ -98,8 +98,16 @@ impl Decide for Jev {
                 bail!("decision model answers exceed {MAX_REPLY_BYTES} bytes");
             }
         }
-        Ok(serde_json::from_slice::<Reply>(&body)
-            .context("decode decision model answers")?
-            .answers)
+        // A serde_json error can quote a value from the reply, which may echo the
+        // email, so report only where decoding failed.
+        let reply = serde_json::from_slice::<Reply>(&body).map_err(|error| {
+            anyhow::anyhow!(
+                "decision model answers are not valid ({:?} error at line {} column {})",
+                error.classify(),
+                error.line(),
+                error.column()
+            )
+        })?;
+        Ok(reply.answers)
     }
 }

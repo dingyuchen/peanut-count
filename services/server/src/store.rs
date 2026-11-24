@@ -24,6 +24,18 @@ const SCHEMA: &str = "
 
 pub struct Store(Connection);
 
+/// The ledger has conflicting pending entries, so imports wait until they are resolved.
+#[derive(Debug)]
+pub struct LedgerBlocked;
+
+impl std::fmt::Display for LedgerBlocked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ledger has pending conflicts")
+    }
+}
+
+impl std::error::Error for LedgerBlocked {}
+
 pub struct Pending {
     pub record: Record,
     pub conflict: Option<String>,
@@ -133,7 +145,9 @@ impl Store {
 
         let mut records = confirmed(&tx)?;
         for item in snapshot(&tx)?.pending {
-            ensure!(item.conflict.is_none(), "ledger has pending conflicts");
+            if item.conflict.is_some() {
+                return Err(LedgerBlocked.into());
+            }
             records.push(item.record);
         }
         let mut accounts: HashSet<String> = records
