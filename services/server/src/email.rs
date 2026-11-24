@@ -371,10 +371,22 @@ pub fn amounts(text: &str) -> Vec<(Money, String)> {
             whole.as_str(),
             context(text, whole.start(), whole.end())
         );
-        // The label is the text on the same line just before the amount.
-        let line = &text[..whole.start()];
-        let line = &line[line.rfind('\n').map_or(0, |at| at + 1)..];
-        let tier = payment_tier(line);
+        // The label is the text on the same line just before the amount, or
+        // the previous non-blank line when the amount starts its line, as in
+        // "Total paid" above "$143.27".
+        let before_amount = &text[..whole.start()];
+        let line = &before_amount[before_amount.rfind('\n').map_or(0, |at| at + 1)..];
+        let label_line = if line.trim().is_empty() {
+            before_amount
+                .lines()
+                .rev()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .unwrap_or_default()
+        } else {
+            line
+        };
+        let tier = payment_tier(label_line);
         match found.iter_mut().position(|(seen, _, _)| *seen == money) {
             // Keep the strongest label for a repeated amount.
             Some(at) if tier < found[at].2 => found[at] = (money, label, tier),
@@ -466,8 +478,10 @@ static DATES: LazyLock<[Regex; 4]> = LazyLock::new(|| {
             r"\b{MONTH} (?P<day>[0-9]{{1,2}})(?:st|nd|rd|th)?(?:,? (?P<year>[0-9]{{4}}))?\b"
         ))
         .unwrap(),
-        Regex::new(r"\b(?P<a>[0-9]{1,2})[/.](?P<b>[0-9]{1,2})[/.](?P<year>[0-9]{4}|[0-9]{2})\b")
-            .unwrap(),
+        Regex::new(
+            r"\b(?P<a>[0-9]{1,2})(?P<s1>[/.-])(?P<b>[0-9]{1,2})(?P<s2>[/.-])(?P<year>[0-9]{4}|[0-9]{2})\b",
+        )
+        .unwrap(),
     ]
 });
 
@@ -518,6 +532,10 @@ pub fn dates(text: &str, anchor: NaiveDate) -> Vec<(NaiveDate, String)> {
                     let (Some(a), Some(b)) = (number("a"), number("b")) else {
                         continue;
                     };
+                    // "11-23/2026" is not a date.
+                    if caps["s1"] != caps["s2"] {
+                        continue;
+                    }
                     vec![(year, b, a), (year, a, b)]
                 }
             };
@@ -1019,11 +1037,18 @@ fn limit(
     if options.len() <= MAX_CHOICES {
         return options;
     }
+    let cited: Vec<&str> = CARD_DIGITS
+        .captures_iter(text)
+        .map(|caps| caps.get(1).unwrap().as_str())
+        .collect();
     let text = text.to_lowercase();
+    // A name part in the email, or a numeric part ending in a cited card number.
     let mentioned = |name: &str| {
-        name.split([':', '-'])
-            .skip(1)
-            .any(|part| part.len() >= 3 && text.contains(&part.to_lowercase()))
+        name.split([':', '-']).skip(1).any(|part| {
+            (part.len() >= 3 && text.contains(&part.to_lowercase()))
+                || (part.bytes().all(|b| b.is_ascii_digit())
+                    && cited.iter().any(|number| part.ends_with(number)))
+        })
     };
     let mut ordered: Vec<_> = options.into_iter().collect();
     ordered.sort_by_key(|(name, _)| {
@@ -1154,6 +1179,15 @@ Available balance: SGD 1,204.33.\r\n";
                 "2026-05-11"
             ]
         );
+        // Hyphenated dates with matching separators count, in both readings.
+        let found: Vec<_> = dates(
+            "Transaction date: 11-23-2026, ref 11-23/2026",
+            date("2026-11-25"),
+        )
+        .into_iter()
+        .map(|(date, _)| date.to_string())
+        .collect();
+        assert_eq!(found, ["2026-11-23"]);
         // Year-first slash dates count, even when forwarded in a later month.
         assert_eq!(
             dates("Receipt date: 2026/11/23", date("2026-12-01"))[0].0,
@@ -1194,6 +1228,13 @@ Available balance: SGD 1,204.33.\r\n";
             + "Total paid: USD 143.27";
         let found = amounts(&receipt);
         assert_eq!(found.len(), MAX_CANDIDATES);
+        assert!(found.iter().any(|(money, _)| money.number == "143.27"));
+        // A payment label on the line above its amount counts.
+        let receipt: String = (1..=14)
+            .map(|i| format!("Item {i}\n${i}.00\n"))
+            .collect::<String>()
+            + "Total paid\n\n$143.27";
+        let found = amounts(&receipt);
         assert!(found.iter().any(|(money, _)| money.number == "143.27"));
         // Line totals rank below the grand total.
         let receipt: String = (1..=14)
@@ -1503,6 +1544,16 @@ Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain
             ),
             ("CAD", "-34.50")
         );
+    }
+
+    #[test]
+    fn limit_keeps_the_account_matching_a_cited_card_number() {
+        let options: BTreeMap<String, String> = (0..80)
+            .map(|i| (format!("Assets:Bank{i:02}"), String::new()))
+            .chain([("Liabilities:Visa-91234".into(), String::new())])
+            .collect();
+        let kept = limit(options, "Paid with card ending 1234", |_| 1);
+        assert!(kept.contains_key("Liabilities:Visa-91234"));
     }
 
     #[test]
