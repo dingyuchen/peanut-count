@@ -101,7 +101,12 @@ static BLOCK_TAG: LazyLock<Regex> = LazyLock::new(|| {
 fn body_text(message: &Message) -> String {
     match message.text_part(0) {
         Some(part) if part.is_text_html() => {
-            html_to_text(&BLOCK_TAG.replace_all(part.text_contents().unwrap_or_default(), "\n<$1"))
+            // html_to_text collapses newlines, so mark the breaks with a
+            // private-use character and turn them into newlines afterwards.
+            html_to_text(
+                &BLOCK_TAG.replace_all(part.text_contents().unwrap_or_default(), "\u{e000}<$1"),
+            )
+            .replace('\u{e000}', "\n")
         }
         _ => message.body_text(0).unwrap_or_default().into_owned(),
     }
@@ -196,6 +201,9 @@ pub struct Money {
 const CODES: &str = "USD|SGD|EUR|GBP|JPY|AUD|CAD|HKD|NZD|CHF|CNY|RMB|MYR|INR|IDR|THB|PHP|KRW|TWD|VND|SEK|NOK|DKK|MXN|BRL|ZAR|AED";
 const NUMBER: &str = r"[0-9]{1,3}(?:,[0-9]{3})+(?:\.[0-9]{1,2})?|[0-9]+(?:\.[0-9]{1,2})?";
 
+static CODE_BEFORE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(&format!(r"\b({CODES})\s?$")).unwrap());
+
 static CODE_AFTER: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(&format!(r"^\s?({CODES})\b")).unwrap());
 
@@ -206,32 +214,48 @@ static AMOUNT: LazyLock<Regex> = LazyLock::new(|| {
     .unwrap()
 });
 
+/// Whether `number` is only part of a longer or differently formatted number,
+/// such as "12.505", "€12,34", "€12.٣٤", the "56" in "1.234,56 EUR", or the
+/// "1" in "EUR 1 234.56". A space before an unrelated number, as in
+/// "SGD 12.50 23 Nov", does not count.
+fn partial_number(before: &str, number: &str, after: &str) -> bool {
+    // Any Unicode digit next to the match continues the number.
+    let digit = |c: Option<char>| c.is_some_and(char::is_numeric);
+    let decimal_mark = |c: Option<char>| matches!(c, Some(',' | '.'));
+    let group_space = |c: Option<char>| {
+        matches!(
+            c,
+            Some(' ' | '\'' | '’' | '\u{a0}' | '\u{202f}' | '\u{2009}')
+        )
+    };
+    // Exactly three digits, not followed by another digit.
+    let group = |s: &str| {
+        let mut chars = s.chars();
+        chars.by_ref().take(3).filter(char::is_ascii_digit).count() == 3 && !digit(chars.next())
+    };
+    let (next, next2) = (after.chars().next(), after.chars().nth(1));
+    let (prev, prev2) = (before.chars().next_back(), before.chars().rev().nth(1));
+    let whole = number.split('.').next().unwrap_or_default();
+    digit(next)
+        || digit(prev)
+        || (decimal_mark(next) && digit(next2))
+        || (decimal_mark(prev) && digit(prev2))
+        || (group_space(next)
+            && !number.contains(['.', ','])
+            && number.len() <= 3
+            && group(&after[next.map_or(0, char::len_utf8)..]))
+        || (group_space(prev) && digit(prev2) && whole.len() == 3 && !whole.contains(','))
+}
+
 /// Every distinct amount written with a currency symbol or ISO code.
 pub fn amounts(text: &str) -> Vec<(Money, String)> {
     let mut found: Vec<(Money, String)> = Vec::new();
     for caps in AMOUNT.captures_iter(text) {
         let whole = caps.get(0).unwrap();
         let span = caps.name("number").or(caps.name("number2")).unwrap();
-        // Skip part of a longer or differently formatted number, such as
-        // "12.505", "€12,34", or the "56" in "1.234,56 EUR".
         let after = &text[span.end()..];
         let before = &text[..span.start()];
-        let digit = |c: Option<char>| c.is_some_and(|c| c.is_ascii_digit());
-        let mut ahead = after.chars();
-        let mut behind = before.chars().rev();
-        let (next, prev) = (ahead.next(), behind.next());
-        // Separators include spaces, apostrophes, and thin spaces used for grouping.
-        let separator = |c: Option<char>| {
-            matches!(
-                c,
-                Some(',' | '.' | ' ' | '\'' | '’' | '\u{a0}' | '\u{202f}' | '\u{2009}')
-            )
-        };
-        if digit(next)
-            || digit(prev)
-            || (separator(next) && digit(ahead.next()))
-            || (separator(prev) && digit(behind.next()))
-        {
+        if partial_number(before, span.as_str(), after) {
             continue;
         }
         let number = span.as_str().replace(',', "");
@@ -242,19 +266,28 @@ pub fn amounts(text: &str) -> Vec<(Money, String)> {
         if number.len() > 18 || !number.bytes().any(|b| matches!(b, b'1'..=b'9')) {
             continue;
         }
-        // A symbol glued to letters, such as the "$" in "R$" or "NT$", names
-        // a currency this parser does not know.
+        // An ISO code next to a "$" or "¥" amount, as in "CAD $25.00" or
+        // "$25.00 CAD", decides the currency.
+        let leading_code = caps.name("symbol").and_then(|symbol| {
+            CODE_BEFORE
+                .captures(&text[..symbol.start()])
+                .map(|caps| caps.get(1).unwrap().as_str())
+        });
+        let code = leading_code.or_else(|| {
+            CODE_AFTER
+                .captures(after)
+                .map(|caps| caps.get(1).unwrap().as_str())
+        });
+        // Otherwise a symbol glued to letters, such as the "$" in "R$" or
+        // "NT$", names a currency this parser does not know.
         if let Some(symbol) = caps.name("symbol")
+            && leading_code.is_none()
             && text[..symbol.start()].ends_with(|c: char| c.is_alphabetic())
         {
             continue;
         }
-        // An ISO code right after a "$" or "¥" amount, as in "$25.00 CAD", decides the currency.
-        let trailing_code = CODE_AFTER
-            .captures(after)
-            .map(|caps| caps.get(1).unwrap().as_str());
         let currency = match caps.name("symbol").map(|m| m.as_str()) {
-            Some("$" | "¥") if trailing_code.is_some() => trailing_code,
+            Some("$" | "¥") if code.is_some() => code,
             Some("US$") => Some("USD"),
             Some("CA$") => Some("CAD"),
             Some("AU$") => Some("AUD"),
@@ -638,7 +671,7 @@ pub async fn extract(
         }
     }
     let outgoing = choice(&answers, "direction", &["out", "in"])? == "out";
-    let amount_order = ranked(&answers, "amount", amounts.len())?;
+    let chosen_amount = index(&answers, "amount", amounts.len())?;
     let (date, _) = dates[index(&answers, "date", dates.len())?];
     let payee = if payees.is_empty() {
         None
@@ -663,22 +696,57 @@ pub async fn extract(
         choice(&answers, "account", &keys)?.to_owned()
     };
     // Keep the account the email identifies. If the chosen amount is in a
-    // currency it cannot hold, such as a foreign purchase price next to the
-    // settled amount, take the most likely amount it can hold.
-    let (money, _) = amount_order
-        .iter()
-        .map(|&i| &amounts[i])
-        .find(|(money, _)| {
-            money
-                .currency
-                .as_deref()
-                .is_none_or(|c| accepts(&source, c))
-        })
-        .ok_or_else(|| {
+    // currency it cannot hold, such as a foreign purchase price, ask which
+    // amount was settled in a currency the account holds.
+    let fits = |money: &Money| {
+        money
+            .currency
+            .as_deref()
+            .is_none_or(|c| accepts(&source, c))
+    };
+    let (chosen, label) = &amounts[chosen_amount];
+    let money = if fits(chosen) {
+        chosen.clone()
+    } else {
+        let compatible: Vec<&(Money, String)> =
+            amounts.iter().filter(|(money, _)| fits(money)).collect();
+        let held = find(&source)
+            .map(|a| a.declared.join(", "))
+            .unwrap_or_default();
+        let unsettled = || {
             rejected(format!(
-                "{source} does not accept the currency of any amount in the email."
+                "{source} holds only {held}, and the email has no settled amount in that currency."
             ))
-        })?;
+        };
+        if compatible.is_empty() {
+            return Err(unsettled());
+        }
+        let mut criteria = indexed(compatible.iter().map(|(_, label)| label.clone()).collect());
+        criteria.insert(
+            "none".into(),
+            "None of these is the amount charged or credited to the account.".into(),
+        );
+        let question = json!({ "settled": {
+            "type": "choice",
+            "instructions": format!(
+                "The transaction in `email` is for {label}, but the user's account holds only {held}. Which amount is what was actually charged or credited to the account in {held}? An account balance or credit limit is never the answer."
+            ),
+            "criteria": criteria,
+        }});
+        let settled = model
+            .decide(state.clone(), question)
+            .await
+            .map_err(Failure::Unavailable)?;
+        let keys: Vec<String> = (1..=compatible.len())
+            .map(|i| i.to_string())
+            .chain(["none".into()])
+            .collect();
+        let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
+        match choice(&settled, "settled", &keys)?.parse::<usize>() {
+            Ok(i) => compatible[i - 1].0.clone(),
+            Err(_) => return Err(unsettled()),
+        }
+    };
     let currency = money.currency.clone().unwrap_or_else(|| {
         let account = find(&source).cloned().unwrap_or_default();
         match (&account.declared[..], &account.posted[..]) {
@@ -809,24 +877,6 @@ fn choice<'a>(answers: &'a Answers, name: &str, keys: &[&str]) -> Result<&'a str
     }
 }
 
-/// Zero-based indexes for a question offered with keys "1"..="len", most
-/// likely first, starting with the model's choice. `[0]` when it was not asked.
-fn ranked(answers: &Answers, name: &str, len: usize) -> Result<Vec<usize>, Failure> {
-    let first = index(answers, name, len)?;
-    let mut rest: Vec<(usize, f64)> = match answers.get(name) {
-        Some(Answer::Choice { probabilities, .. }) => probabilities
-            .iter()
-            .filter_map(|(key, p)| Some((key.parse::<usize>().ok()?.checked_sub(1)?, *p)))
-            .filter(|&(i, _)| i < len && i != first)
-            .collect(),
-        _ => Vec::new(),
-    };
-    rest.sort_by(|a, b| b.1.total_cmp(&a.1));
-    Ok(std::iter::once(first)
-        .chain(rest.into_iter().map(|(i, _)| i))
-        .collect())
-}
-
 /// Zero-based index for a question offered with keys "1"..="len", or 0 when it was not asked.
 fn index(answers: &Answers, name: &str, len: usize) -> Result<usize, Failure> {
     if len == 1 {
@@ -944,12 +994,15 @@ Available balance: SGD 1,204.33.\r\n";
         assert!(amounts("€12,34 and 1.234,56 EUR and S$12.505").is_empty());
         assert!(amounts("EUR 1 234.56 and 1\u{202f}234 USD and CHF 1'234.50").is_empty());
         assert_eq!(amounts("SGD 12 on 3 Nov").len(), 1);
-        assert!(amounts("€1’234.56 and R$10 and NT$300").is_empty());
-        let currencies: Vec<_> = amounts("CA$25.00, $26.00 CAD, ¥300 RMB, AU$4")
+        assert!(amounts("€1’234.56 and R$10 and NT$300 and €12.٣٤").is_empty());
+        let found = amounts("Paid SGD 12.50 23 Nov 2026, then 1 234.56 EUR");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0.number, "12.50");
+        let currencies: Vec<_> = amounts("CA$25.00, $26.00 CAD, ¥300 RMB, AU$4, CAD $27, HKD$28")
             .into_iter()
             .map(|(money, _)| money.currency.unwrap())
             .collect();
-        assert_eq!(currencies, ["CAD", "CAD", "CNY", "AUD"]);
+        assert_eq!(currencies, ["CAD", "CAD", "CNY", "AUD", "CAD", "HKD"]);
         // Arabic-Indic digits are not dates and must not panic.
         assert!(dates("٢٣/١١/٢٠٢٦ ٢٠٢٦-١١-٢٣ ٢٣ Nov", date("2026-11-24")).is_empty());
     }
@@ -995,6 +1048,12 @@ Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain
             "re-forwarding the same alert deduplicates"
         );
         assert!(inner.body.contains("STARBUCKS VIVOCITY"));
+
+        // Table cells stay on separate lines, so "SGD 12.50" keeps its amount.
+        let html = "Message-ID: <h1@bank.example>\r\nSubject: Alert\r\nContent-Type: text/html\r\n\r\n\
+<table><tr><td>Amount</td><td>SGD 12.50</td><td>23 Nov 2026</td></tr></table>\r\n";
+        let email = parse(html.as_bytes()).unwrap();
+        assert_eq!(amounts(&email.body).len(), 1, "{:?}", email.body);
     }
 
     #[tokio::test]
@@ -1151,7 +1210,21 @@ Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain
                 "category".into(),
                 choice("Expenses:Groceries", &[("Expenses:Groceries", 0.6)]),
             ),
+            ("settled".into(), choice("1", &[])),
         ]);
+        // Without a settled amount, a balance in the card's currency is not used instead.
+        let mut balance_only = answers.clone();
+        balance_only.insert("settled".into(), choice("none", &[]));
+        let mut balance_email = parse(ALERT.as_bytes()).unwrap();
+        balance_email.body =
+            "Charged EUR 50.00 to card ending 1234 on 23 Nov 2026. Available balance: SGD 1,204.33."
+                .into();
+        let model = fixed(balance_only);
+        let result = extract(&balance_email, &accounts, &[], "USD", &model).await;
+        assert!(matches!(result, Err(Failure::Rejected(_))));
+        let calls = model.calls.into_inner().unwrap();
+        assert!(calls[1]["settled"]["criteria"].get("none").is_some());
+
         let model = fixed(answers);
         let statement = extract(&email, &accounts, &[], "USD", &model)
             .await
@@ -1166,8 +1239,9 @@ Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain
         );
         // Categories restricted to another currency are not offered.
         let calls = model.calls.into_inner().unwrap();
+        assert_eq!(calls.len(), 3, "transaction, settled amount, then category");
         assert!(
-            calls[1]["category"]["criteria"]
+            calls[2]["category"]["criteria"]
                 .get("Expenses:Dining")
                 .is_none()
         );
