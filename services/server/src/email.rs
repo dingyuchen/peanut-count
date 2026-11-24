@@ -93,20 +93,25 @@ pub fn parse(raw: &[u8]) -> Result<Email> {
 }
 
 static BLOCK_TAG: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)<(/?(?:td|th|tr|p|div|br|li|h[1-6]|table|section|header|footer)\b)").unwrap()
+    Regex::new(r"(?i)<(/?(?:tr|p|div|br|li|h[1-6]|table|section|header|footer)\b)").unwrap()
 });
 
-/// The first text body. HTML gets a line break at each cell and block tag so
-/// that table cells such as "Total" and "S$17.10" do not run together.
+static CELL_TAG: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)<(/?t[dh]\b)").unwrap());
+
+/// The first text body. HTML gets a line break at each row and block tag and
+/// a space between table cells, so "Total" and "S$17.10" do not run together
+/// while "SGD" and "12.50" in one row stay on one line.
 fn body_text(message: &Message) -> String {
     match message.text_part(0) {
         Some(part) if part.is_text_html() => {
-            // html_to_text collapses newlines, so mark the breaks with a
-            // private-use character and turn them into newlines afterwards.
-            html_to_text(
-                &BLOCK_TAG.replace_all(part.text_contents().unwrap_or_default(), "\u{e000}<$1"),
-            )
-            .replace('\u{e000}', "\n")
+            // html_to_text collapses whitespace, so mark the breaks with
+            // private-use characters and restore them afterwards.
+            let html = part.text_contents().unwrap_or_default();
+            let html = BLOCK_TAG.replace_all(html, "\u{e000}<$1");
+            let html = CELL_TAG.replace_all(&html, "\u{e001}<$1");
+            html_to_text(&html)
+                .replace('\u{e000}', "\n")
+                .replace('\u{e001}', " ")
         }
         _ => message.body_text(0).unwrap_or_default().into_owned(),
     }
@@ -202,14 +207,14 @@ const CODES: &str = "USD|SGD|EUR|GBP|JPY|AUD|CAD|HKD|NZD|CHF|CNY|RMB|MYR|INR|IDR
 const NUMBER: &str = r"[0-9]{1,3}(?:,[0-9]{3})+(?:\.[0-9]{1,2})?|[0-9]+(?:\.[0-9]{1,2})?";
 
 static CODE_BEFORE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(&format!(r"\b({CODES})\s?$")).unwrap());
+    LazyLock::new(|| Regex::new(&format!(r"\b({CODES}) ?$")).unwrap());
 
 static CODE_AFTER: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(&format!(r"^\s?({CODES})\b")).unwrap());
+    LazyLock::new(|| Regex::new(&format!(r"^ ?({CODES})\b")).unwrap());
 
 static AMOUNT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(
-        r"(?:(?P<symbol>US\$|CA\$|AU\$|S\$|A\$|C\$|HK\$|NZ\$|\$|€|£|¥|₹)|\b(?P<code>{CODES}))\s?-?(?P<number>{NUMBER})|\b(?P<number2>{NUMBER})\s?(?P<code2>{CODES})\b"
+        r"(?:(?P<symbol>US\$|CA\$|AU\$|S\$|A\$|C\$|HK\$|NZ\$|\$|€|£|¥|₹)|\b(?P<code>{CODES})) ?-?(?P<number>{NUMBER})|\b(?P<number2>{NUMBER}) ?(?P<code2>{CODES})\b"
     ))
     .unwrap()
 });
@@ -273,11 +278,18 @@ pub fn amounts(text: &str) -> Vec<(Money, String)> {
                 .captures(&text[..symbol.start()])
                 .map(|caps| caps.get(1).unwrap().as_str())
         });
-        let code = leading_code.or_else(|| {
+        let trailing_code = caps.name("symbol").and(
             CODE_AFTER
                 .captures(after)
-                .map(|caps| caps.get(1).unwrap().as_str())
-        });
+                .map(|caps| caps.get(1).unwrap().as_str()),
+        );
+        // Codes on both sides that disagree, as in "CAD $25.00 USD", are ambiguous.
+        if let (Some(a), Some(b)) = (leading_code, trailing_code)
+            && a != b
+        {
+            continue;
+        }
+        let code = leading_code.or(trailing_code);
         // Otherwise a symbol glued to letters, such as the "$" in "R$" or
         // "NT$", names a currency this parser does not know.
         if let Some(symbol) = caps.name("symbol")
@@ -995,6 +1007,13 @@ Available balance: SGD 1,204.33.\r\n";
         assert!(amounts("EUR 1 234.56 and 1\u{202f}234 USD and CHF 1'234.50").is_empty());
         assert_eq!(amounts("SGD 12 on 3 Nov").len(), 1);
         assert!(amounts("€1’234.56 and R$10 and NT$300 and €12.٣٤").is_empty());
+        // Codes pair with amounts on the same line only.
+        let found = amounts("Card currency: CAD\n$25.00 USD and CAD $26 USD");
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            (found[0].0.number.as_str(), found[0].0.currency.as_deref()),
+            ("25.00", Some("USD"))
+        );
         let found = amounts("Paid SGD 12.50 23 Nov 2026, then 1 234.56 EUR");
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].0.number, "12.50");
@@ -1051,9 +1070,20 @@ Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain
 
         // Table cells stay on separate lines, so "SGD 12.50" keeps its amount.
         let html = "Message-ID: <h1@bank.example>\r\nSubject: Alert\r\nContent-Type: text/html\r\n\r\n\
-<table><tr><td>Amount</td><td>SGD 12.50</td><td>23 Nov 2026</td></tr></table>\r\n";
+<table><tr><td>Amount</td><td>SGD 12.50</td><td>23 Nov 2026</td></tr>\
+<tr><td>Charged</td><td>SGD</td><td>7.25</td></tr><tr><td>Total</td><td>S$9.90</td></tr></table>\r\n";
         let email = parse(html.as_bytes()).unwrap();
-        assert_eq!(amounts(&email.body).len(), 1, "{:?}", email.body);
+        let found: Vec<_> = amounts(&email.body)
+            .into_iter()
+            .map(|(money, _)| money.number)
+            .collect();
+        assert_eq!(found, ["12.50", "7.25", "9.90"], "{:?}", email.body);
+        assert_eq!(
+            email.body.lines().filter(|line| !line.is_empty()).count(),
+            3,
+            "{:?}",
+            email.body
+        );
     }
 
     #[tokio::test]
