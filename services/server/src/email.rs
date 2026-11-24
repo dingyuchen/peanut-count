@@ -277,6 +277,38 @@ static NEXT_AMOUNT: LazyLock<Regex> = LazyLock::new(|| {
     .unwrap()
 });
 
+const MONTHS: [&str; 12] = [
+    "january",
+    "february",
+    "march",
+    "april",
+    "may",
+    "june",
+    "july",
+    "august",
+    "september",
+    "october",
+    "november",
+    "december",
+];
+
+/// Whether `after` starts with a month name or abbreviation, as the " Nov"
+/// of "23 Nov", so a day number before it is not read as an amount.
+fn starts_with_month(after: &str) -> bool {
+    let word: String = after
+        .trim_start_matches(' ')
+        .chars()
+        .take_while(char::is_ascii_alphabetic)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    word.len() >= 3 && MONTHS.iter().any(|month| month.starts_with(&word))
+}
+
+/// Whether a number of at most two digits is the day of a "23 Nov" date.
+fn is_day_of_month(number: &str, after: &str) -> bool {
+    number.len() <= 2 && starts_with_month(after)
+}
+
 /// Whether text right after a number continues it as part of a date, time,
 /// or longer number, as in the "/23/2026" of "11/23/2026", the ".2026" of
 /// "23.11.2026", or the ":15" of "10:15".
@@ -356,15 +388,30 @@ fn partial_number(before: &str, number: &str, after: &str) -> bool {
     let whole = number.split('.').next().unwrap_or_default();
     digit(next)
         || digit(prev)
-        // Part of a date or time, as the "11" of "CAD 11/23/2026".
+        // Part of a date or time, as the "11" of "CAD 11/23/2026" or the
+        // "23" of "CAD 23 Nov".
         || continues_number(after)
+        || is_day_of_month(number, after)
         || (decimal_mark(next) && digit(next2))
         || (decimal_mark(prev) && digit(prev2))
         || (group_space(next)
             && !number.contains(['.', ','])
             && number.len() <= 3
             && group(&after[next.map_or(0, char::len_utf8)..]))
-        || (group_space(prev) && digit(prev2) && whole.len() == 3 && !whole.contains(','))
+        // A digit group before a space-grouped thousand must itself be a plain
+        // group of one to three digits, not the end of a date such as the
+        // "2026-11-23" of "2026-11-23 250.00 SGD".
+        || (group_space(prev)
+            && digit(prev2)
+            && whole.len() == 3
+            && !whole.contains(',')
+            && {
+                let token = before[..before.len() - prev.map_or(0, char::len_utf8)]
+                    .rsplit(char::is_whitespace)
+                    .next()
+                    .unwrap_or_default();
+                (1..=3).contains(&token.len()) && token.bytes().all(|b| b.is_ascii_digit())
+            })
 }
 
 /// Every distinct amount written with a currency symbol or ISO code.
@@ -414,9 +461,13 @@ pub fn amounts(text: &str) -> Vec<(Money, String)> {
                 // annotating this one. A date such as "CAD 11/23/2026" does not.
                 let rest = &after[code.get(0).unwrap().end()..];
                 if code.get(2).is_some()
-                    && NEXT_AMOUNT
-                        .find(rest)
-                        .is_some_and(|next| !continues_number(&rest[next.end()..]))
+                    && NEXT_AMOUNT.find(rest).is_some_and(|next| {
+                        let tail = &rest[next.end()..];
+                        let digits = next
+                            .as_str()
+                            .trim_start_matches(|c: char| !c.is_ascii_digit());
+                        !continues_number(tail) && !is_day_of_month(digits, tail)
+                    })
                 {
                     return None;
                 }
@@ -569,7 +620,7 @@ static CARD_DIGITS: LazyLock<Regex> = LazyLock::new(|| {
         // A number may follow its label on the same line, or, after an
         // explicit identifier label such as "Card number" or "Account:", on
         // one of the next two lines, as separate HTML blocks render it.
-        r"(?i)(?:\bending(?: in| with)?\s*|\bends (?:in|with)\s*|[x*•]{2,}[ -]?)(?P<tail>[0-9]{3,4})\b|\b(?:account|acct|a/c|card)(?: (?:no\.?|num\.?|number))?[ \t]*[:#.]?[ \t]*(?:[x*•]+[ -]?)?(?P<number>[0-9]{3,19}(?:-[0-9]{1,19}| [0-9]{3,19}){0,4})\b|\b(?:account|acct|a/c|card)(?: (?:no\.?|num\.?|number)[ \t]*[:#.]?|[ \t]*[:#])[ \t]*(?:\r?\n[ \t]*){1,2}(?:[x*•]+[ -]?)?(?P<below>[0-9]{3,19}(?:-[0-9]{1,19}| [0-9]{3,19}){0,4})\b",
+        r"(?i)(?:\bending(?: in| with)?\s*|\bends (?:in|with)\s*|[x*•]{2,}[ -]?)(?P<tail>[0-9]{3,4})\b|\b(?:account|acct|a/c|card)(?: (?:no\.?|num\.?|number))?[ \t]*[:#.]?[ \t]*\(?(?:[x*•]+[ -]?)?(?P<number>[0-9]{3,19}(?:-[0-9]{1,19}| [0-9]{3,19}){0,4})\b|\b(?:account|acct|a/c|card)(?: (?:no\.?|num\.?|number)[ \t]*[:#.]?|[ \t]*[:#])[ \t]*(?:\r?\n[ \t]*){1,2}(?:[x*•]+[ -]?)?(?P<below>[0-9]{3,19}(?:-[0-9]{1,19}| [0-9]{3,19}){0,4})\b",
     )
     .unwrap()
 });
@@ -655,20 +706,6 @@ static DATES: LazyLock<[Regex; 5]> = LazyLock::new(|| {
 /// Every distinct plausible date written in the text, within about a year
 /// before `anchor`. Slash dates yield both day-first and month-first readings.
 pub fn dates(text: &str, anchor: NaiveDate) -> Vec<(NaiveDate, String)> {
-    const MONTHS: [&str; 12] = [
-        "january",
-        "february",
-        "march",
-        "april",
-        "may",
-        "june",
-        "july",
-        "august",
-        "september",
-        "october",
-        "november",
-        "december",
-    ];
     let earliest = anchor - Days::new(400);
     let first = NaiveDate::from_ymd_opt(1900, 1, 1).unwrap();
     let latest = anchor + Days::new(1);
@@ -689,7 +726,7 @@ pub fn dates(text: &str, anchor: NaiveDate) -> Vec<(NaiveDate, String)> {
                     })
                 })
                 .map(|year| if year < 100 { year + 2000 } else { year });
-            let readings: Vec<(Option<u32>, u32, u32)> = match kind {
+            let mut readings: Vec<(Option<u32>, u32, u32)> = match kind {
                 0 => {
                     let (Some(month), Some(day)) = (number("m"), number("day")) else {
                         continue;
@@ -724,6 +761,15 @@ pub fn dates(text: &str, anchor: NaiveDate) -> Vec<(NaiveDate, String)> {
                     vec![(year, b, a), (year, a, b)]
                 }
             };
+            // In "23 Nov 25 SGD" the 25 may be the year or the amount, so offer
+            // the yearless reading too.
+            if caps
+                .name("year")
+                .is_some_and(|year| year.len() <= 2 && CODE_AFTER.is_match(&text[year.end()..]))
+            {
+                let yearless: Vec<_> = readings.iter().map(|&(_, m, d)| (None, m, d)).collect();
+                readings.extend(yearless);
+            }
             for (year, month, day) in readings {
                 let date = match year {
                     Some(year) => NaiveDate::from_ymd_opt(year as i32, month, day),
@@ -752,7 +798,7 @@ pub fn dates(text: &str, anchor: NaiveDate) -> Vec<(NaiveDate, String)> {
 
 static PAYEE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?m)\b(?i:at|to|from|merchant(?: name)?:|payee:|paid to|recipient:|description:|transaction details:)\s+(?P<payee>[A-Z0-9][A-Za-z0-9&'*./ -]{1,60}?)(?:\s+(?i:on|for|via|using|with|ending|at|from|is|has|was|of)\b|[,;:!()\n]|\.\s|\.?$)",
+        r"(?m)\b(?i:at|to|from|merchant(?: name)?:|payee:|paid to|recipient:|description:|transaction details:)\s+(?P<payee>[\p{Lu}0-9][\p{L}\p{M}0-9&'’*./ -]{1,60}?)(?:\s+(?i:on|for|via|using|with|ending|at|from|is|has|was|of)\b|[,;:!()\n]|\.\s|\.?$)",
     )
     .unwrap()
 });
@@ -763,7 +809,7 @@ pub fn payees(text: &str) -> Vec<String> {
     for caps in PAYEE.captures_iter(text) {
         let payee = caps["payee"].trim().trim_end_matches(['.', '-', '/', ' ']);
         if payee.len() >= 2
-            && payee.bytes().any(|b| b.is_ascii_alphabetic())
+            && payee.chars().any(char::is_alphabetic)
             && found.len() < MAX_CANDIDATES
             && !found.iter().any(|seen| seen.eq_ignore_ascii_case(payee))
         {
@@ -1405,6 +1451,15 @@ Available balance: SGD 1,204.33.\r\n";
         assert_eq!(dates("on 23 Nov 10:15", anchor)[0].0, date("2026-11-23"));
         assert_eq!(dates("23 Nov 25.00 SGD", anchor)[0].0, date("2026-11-23"));
         assert_eq!(dates("23 Nov 1250.00 SGD", anchor)[0].0, date("2026-11-23"));
+        // A two-digit "year" that is also an amount keeps both readings.
+        let both: Vec<_> = dates("23 Nov 25 SGD", anchor)
+            .into_iter()
+            .map(|(d, _)| d)
+            .collect();
+        assert!(
+            both.contains(&date("2025-11-23")) && both.contains(&date("2026-11-23")),
+            "{both:?}"
+        );
         // A yearless date after the anchor belongs to the previous year.
         assert_eq!(dates("on 30 Dec", anchor)[0].0, date("2025-12-30"));
     }
@@ -1458,6 +1513,16 @@ Available balance: SGD 1,204.33.\r\n";
                 ("33.50".into(), "SGD".into())
             ]
         );
+        // A day-and-month date after the code is not the next amount.
+        let found: Vec<_> = amounts("Total $25.00 CAD 23 Nov")
+            .into_iter()
+            .map(|(m, _)| (m.number, m.currency.unwrap()))
+            .collect();
+        assert_eq!(found, [("25.00".into(), "CAD".into())]);
+        // The end of an ISO date is not a thousands group.
+        let found = amounts("Paid on 2026-11-23 250.00 SGD");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0.number, "250.00");
         // A code that starts the next cell's amount is not a trailing code.
         let found: Vec<_> = amounts("USD $25.00 SGD 33.50")
             .into_iter()
@@ -1775,6 +1840,10 @@ Content-Transfer-Encoding: base64\r\n\r\n{}",
         // A loose "card" or "account" does not reach the next line, and an
         // amount's integer part is never a card number.
         assert!(cited_numbers("Credit to your card\n\n100.00 USD").is_empty());
+        assert_eq!(
+            cited_numbers("Credit card (5678) was charged USD 25.00"),
+            ["5678"]
+        );
         assert!(cited_numbers("Card: 100.00 USD").is_empty());
         assert_eq!(cited_numbers("Card: 5678 1000.00 USD"), ["5678"]);
         assert_eq!(cited_numbers("Card:\n5678"), ["5678"]);
@@ -1784,6 +1853,11 @@ Content-Transfer-Encoding: base64\r\n\r\n{}",
         assert!(names_number(grouped, "123456789012"));
         assert!(names_number(grouped, "9012"));
         assert!(names_number("Liabilities:Citi-1234", "4111111111111234"));
+    }
+
+    #[test]
+    fn finds_unicode_payees() {
+        assert_eq!(payees("Merchant: Café de Flore\n"), ["Café de Flore"]);
     }
 
     #[test]
