@@ -239,7 +239,7 @@ const NUMBER: &str = r"[0-9]{1,3}(?:,[0-9]{3})+(?:\.[0-9]{1,3})?|[0-9]+(?:\.[0-9
 const THREE_DECIMALS: [&str; 7] = ["BHD", "IQD", "JOD", "KWD", "LYD", "OMR", "TND"];
 
 static CODE_BEFORE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(&format!(r"\b({CODES}) ?(?:[-−] ?)?$")).unwrap());
+    LazyLock::new(|| Regex::new(&format!(r"\b({CODES}) ?(?:[-−+] ?)?$")).unwrap());
 
 /// A code right after an amount, bare or alone in parentheses as in "(USD)".
 /// "(USD 18.50)" is a second amount, not an annotation.
@@ -253,7 +253,7 @@ const SYMBOLS: &str = r"\b(?:US|CA|AU|HK|NZ|SG) ?\$|S\$|A\$|C\$|\$|€|£|¥|₹
 /// A currency symbol or code followed by a number, as in "S$12.50" or "SGD 12.50".
 static PREFIX_AMOUNT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(
-        r"(?:(?P<symbol>{SYMBOLS})|\b(?P<code>{CODES})) ?(?:[-−] ?)?(?P<number>{NUMBER})"
+        r"(?:(?P<symbol>{SYMBOLS})|\b(?P<code>{CODES})) ?(?:[-−+] ?)?(?P<number>{NUMBER})"
     ))
     .unwrap()
 });
@@ -519,15 +519,26 @@ fn cited_numbers(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// Whether an account name has a numeric part that matches a cited number,
-/// where either may be the other's ending: "Citi-1234" matches "ending 1234"
-/// and "Account number: 99881234", but "Visa-91234567" does not match "1234".
+/// Whether an account name carries a number that matches a cited number,
+/// where either may be the other's ending. Consecutive numeric parts of the
+/// name form one number, so "Checking-123-45678-9012" is 123456789012: it
+/// matches "ending 9012" and "123-45678-9012", but not "987-65432-9012".
+/// "Citi-1234" matches "ending 1234" and "4111 1111 1111 1234", and
+/// "Visa-91234567" does not match "1234".
 fn names_number(name: &str, number: &str) -> bool {
-    name.split([':', '-']).any(|part| {
-        part.len() >= 3
-            && part.bytes().all(|b| b.is_ascii_digit())
-            && (part.ends_with(number) || number.ends_with(part))
-    })
+    let mut numbers = Vec::new();
+    let mut run = String::new();
+    for part in name.split([':', '-']) {
+        if !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()) {
+            run.push_str(part);
+        } else if !run.is_empty() {
+            numbers.push(std::mem::take(&mut run));
+        }
+    }
+    numbers.push(run);
+    numbers
+        .iter()
+        .any(|own| own.len() >= 3 && (own.ends_with(number) || number.ends_with(own.as_str())))
 }
 
 const MONTH: &str = r"(?P<month>(?i:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-zA-Z]*)\.?";
@@ -1299,6 +1310,13 @@ Available balance: SGD 1,204.33.\r\n";
         assert!(amounts("EUR 1 234.56 and 1\u{202f}234 USD and CHF 1'234.50").is_empty());
         assert_eq!(amounts("SGD 12 on 3 Nov").len(), 1);
         assert!(amounts("€1’234.56 and R$10 and NT$300 and €12.٣٤").is_empty());
+        // An explicit plus sign, as in a credit alert with a balance.
+        let found: Vec<_> =
+            amounts("Amount credited: USD +100.00. Available balance: USD 1,400.00")
+                .into_iter()
+                .map(|(money, _)| money.number)
+                .collect();
+        assert_eq!(found, ["100.00", "1400.00"]);
         // An unknown symbol does not hide a code after the amount.
         let found = amounts("Total R$ 10.00 BRL");
         assert_eq!(found.len(), 1);
@@ -1586,6 +1604,12 @@ Content-Transfer-Encoding: base64\r\n\r\n{}",
         assert!(names_number("Liabilities:Citi-1234", "1234"));
         assert!(!names_number("Liabilities:Visa-91234567", "1234"));
         assert!(!names_number("Assets:Checking", "1234"));
+        // Grouped account names compare as one number.
+        let grouped = "Assets:Checking-123-45678-9012";
+        assert!(!names_number(grouped, "987654329012"));
+        assert!(names_number(grouped, "123456789012"));
+        assert!(names_number(grouped, "9012"));
+        assert!(names_number("Liabilities:Citi-1234", "4111111111111234"));
     }
 
     #[test]
