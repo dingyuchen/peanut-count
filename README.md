@@ -187,6 +187,102 @@ statement imports through the mobile API.
 
 See the [iOS setup guide](apps/ios/README.md) for the share and import flow.
 
+## Forwarded transaction emails
+
+Each mobile account can have a secret forwarding address. Forward a bank
+alert, card notification, or receipt to it, and the server records the
+transaction in that account's ledger. The entry is stored as a one-row
+statement, so it reaches the iOS app on the next sync like a PDF import.
+
+The server finds every amount written with a currency symbol or code, every
+date, and the phrases that name the other party. A decision model then
+answers multiple-choice questions about the email. It decides whether the
+email reports a completed transaction and whether money went out or came in.
+It chooses which amount, date, and payee apply, which of your asset or
+liability accounts was used, and the category. The model only chooses among
+values that appear in the email and among your accounts, so it cannot make
+up an amount. Name accounts after the card or account number when you can,
+for example `Liabilities:Citi-Rewards-1234`, so that "card ending 1234"
+matches. Missing accounts and categories are opened automatically. A
+category the model is unsure about goes to `Expenses:Uncategorized` or
+`Income:Uncategorized`. Correct a wrong entry with a reversal.
+
+The decision model is any server that speaks TypeSafe Jev's `/v1/systemone`
+format. This includes hosted Jev and local servers such as LM Studio and
+llama.cpp. A hosted model receives the text of every forwarded email.
+
+| Variable | Purpose |
+| --- | --- |
+| `PEANUT_INBOUND_DOMAIN` | Domain of the forwarding addresses. Email import is off unless it is set. |
+| `PEANUT_JEV_URL` | Full decision endpoint URL. Empty by default, and mail is deferred until it is set. |
+| `PEANUT_JEV_MODEL` | Decision model ID. |
+| `PEANUT_JEV_TOKEN` | Bearer token for a hosted decision API. |
+| `PEANUT_INBOUND_TOKEN` | Shared secret for the mail relay webhook. The webhook is off unless it is set. |
+| `PEANUT_EMAIL_CURRENCY` | Currency for a bare `$` when the account has no single currency. Defaults to USD. |
+
+Each variable also has a command-line flag. Run `peanut-count mobile-serve --help`.
+Create or replace an account's address with its session token. Replacing an
+address disables the old one immediately.
+
+```sh
+curl -X POST https://ledger.example.com/v1/inbound-address \
+  -H "Authorization: Bearer $SESSION_TOKEN"
+# {"address":"0628907df4434180adff5bd10164b173@in.example.com"}
+```
+
+Deliver mail in either of two ways.
+
+**Relay webhook.** Use a mail service that can POST the raw message, such as
+an email-routing worker or a provider's raw MIME webhook. Point it at
+`POST /v1/inbound-email` with the message as the body. Send
+`Authorization: Bearer $PEANUT_INBOUND_TOKEN`, and put the envelope recipient
+in `X-Peanut-Recipient`. Messages may be up to 4 MiB.
+
+| Status | Meaning | Relay action |
+| --- | --- | --- |
+| 201 | Imported | Accept |
+| 200 | Already imported | Accept |
+| 404 | Unknown address | Reject |
+| 422 | Not a transaction, or the ledger rejected it. The body has the reason. | Reject |
+| 503 | Decision model unset or unreachable | Retry later |
+
+**Local MTA pipe.** `peanut-count ingest-email` reads one message from
+standard input. It exits with 0 for an import or duplicate, 67 for an unknown
+recipient, 65 for a rejected message, and 75 to defer a retry. For Postfix,
+route the domain to a `pipe` transport that runs a wrapper. The wrapper exports
+the variables above and executes:
+
+```sh
+exec peanut-count ingest-email --data /srv/peanut/mobile-data --recipient "$1"
+```
+
+Pass `${recipient}` as the argument in `master.cf`. The command needs write
+access to the data directory.
+
+Duplicates are detected by the original message's Message-ID. A relay retry
+or a re-forward of the same email as an attachment is recorded once.
+Forwarding it inline twice creates a new message, which is recorded twice.
+Amounts need a currency symbol or ISO code and a dot decimal separator. An
+email that reports several transactions is recorded as one of them.
+
+### Local decision model with LM Studio
+
+LM Studio serves `/v1/systemone` for models it lists as decision models.
+
+```sh
+lms get https://huggingface.co/ggml-org/lev-GGUF@Q4_K_M
+lms load lev --identifier lev
+lms server start
+export PEANUT_JEV_URL=http://127.0.0.1:1234/v1/systemone PEANUT_JEV_MODEL=lev
+```
+
+`ggml-org/lev-GGUF` is about 3 GB at Q4_K_M. Each email takes two model
+calls, about 5 to 8 seconds on an Apple M1 Pro. The `feder-cr/jev` GGUF
+(jevos-v4) loads in LM Studio as an ordinary language model, not a decision
+model, so its `/v1/systemone` endpoint does not serve it. Run jevos with its
+own `jev serve` binary on port 8017 instead. `ggml-org/OpenJev-GGUF` needs
+about 20 GB.
+
 ## Verification
 
 ```sh

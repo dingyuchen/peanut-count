@@ -62,7 +62,7 @@ struct Cursor {
 }
 
 #[derive(Debug)]
-struct ApiError(StatusCode, &'static str);
+pub(crate) struct ApiError(pub StatusCode, pub &'static str);
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
@@ -70,42 +70,60 @@ impl IntoResponse for ApiError {
     }
 }
 
-const INTERNAL: ApiError = ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Server storage error.");
-const UNAUTHORIZED: ApiError = ApiError(
+pub(crate) const INTERNAL: ApiError =
+    ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Server storage error.");
+pub(crate) const UNAUTHORIZED: ApiError = ApiError(
     StatusCode::UNAUTHORIZED,
     "Invalid credentials or expired session.",
 );
 static AUTH_SLOTS: Semaphore = Semaphore::const_new(4);
-type ApiResult<T> = std::result::Result<T, ApiError>;
+pub(crate) type ApiResult<T> = std::result::Result<T, ApiError>;
 
-pub async fn serve(listen: SocketAddr, data: PathBuf) -> Result<()> {
+pub async fn serve(
+    listen: SocketAddr,
+    data: PathBuf,
+    inbound: Option<crate::inbound::Inbound>,
+    relay_token: Option<String>,
+) -> Result<()> {
     ensure!(
         listen.ip().is_loopback(),
         "mobile API must bind to loopback behind an HTTPS proxy"
     );
-    std::fs::create_dir_all(&data)?;
-    registry(&data)?.execute_batch("
-        CREATE TABLE IF NOT EXISTS users (
-            id TEXT PRIMARY KEY, username TEXT NOT NULL UNIQUE, password TEXT NOT NULL
-        ) STRICT;
-        CREATE TABLE IF NOT EXISTS sessions (
-            token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), expires INTEGER NOT NULL
-        ) STRICT;
-    ")?;
-    let routes = Router::new()
+    init_registry(&data)?;
+    let data = Arc::new(data);
+    let mut routes = Router::new()
         .route("/v1/signup", post(signup))
         .route("/v1/login", post(login))
         .route("/v1/statements", post(upload).get(download))
         .route("/v1/health", get(|| async { StatusCode::NO_CONTENT }))
         .layer(DefaultBodyLimit::max(1024 * 1024))
-        .with_state(Arc::new(data));
+        .with_state(data.clone());
+    if let Some(inbound) = inbound {
+        routes = routes.merge(crate::inbound::routes(data, Arc::new(inbound), relay_token));
+    }
     let listener = tokio::net::TcpListener::bind(listen).await?;
     eprintln!("Mobile API listening on http://{}", listener.local_addr()?);
     axum::serve(listener, routes).await?;
     Ok(())
 }
 
-fn registry(data: &Path) -> rusqlite::Result<Connection> {
+pub(crate) fn init_registry(data: &Path) -> Result<()> {
+    std::fs::create_dir_all(data)?;
+    registry(data)?.execute_batch("
+        CREATE TABLE IF NOT EXISTS users (
+            id TEXT PRIMARY KEY, username TEXT NOT NULL UNIQUE, password TEXT NOT NULL
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS sessions (
+            token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), expires INTEGER NOT NULL
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS inbound_addresses (
+            user_id TEXT PRIMARY KEY REFERENCES users(id), address_hash TEXT NOT NULL UNIQUE
+        ) STRICT;
+    ")?;
+    Ok(())
+}
+
+pub(crate) fn registry(data: &Path) -> rusqlite::Result<Connection> {
     let conn = Connection::open(data.join("accounts.sqlite3"))?;
     conn.busy_timeout(Duration::from_secs(5))?;
     conn.pragma_update(None, "foreign_keys", true)?;
@@ -204,11 +222,12 @@ async fn authenticate(
     .await
 }
 
-fn digest(value: &str) -> String {
+pub(crate) fn digest(value: &str) -> String {
     format!("{:x}", Sha256::digest(value.as_bytes()))
 }
 
-fn ledger(data: &Path, headers: &HeaderMap) -> ApiResult<Store> {
+/// The account ID for a valid session bearer token.
+pub(crate) fn session_user(data: &Path, headers: &HeaderMap) -> ApiResult<String> {
     let token = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -225,7 +244,16 @@ fn ledger(data: &Path, headers: &HeaderMap) -> ApiResult<Store> {
         .optional()
         .map_err(|_| INTERNAL)?
         .ok_or(UNAUTHORIZED)?;
-    Store::open(&data.join(format!("{id}.db"))).map_err(|_| INTERNAL)
+    Ok(id)
+}
+
+pub(crate) fn ledger_path(data: &Path, id: &str) -> PathBuf {
+    data.join(format!("{id}.db"))
+}
+
+fn ledger(data: &Path, headers: &HeaderMap) -> ApiResult<Store> {
+    let id = session_user(data, headers)?;
+    Store::open(&ledger_path(data, &id)).map_err(|_| INTERNAL)
 }
 
 async fn upload(
@@ -263,7 +291,7 @@ async fn download(
     .await
 }
 
-async fn blocking<T: Send + 'static>(
+pub(crate) async fn blocking<T: Send + 'static>(
     work: impl FnOnce() -> ApiResult<T> + Send + 'static,
 ) -> ApiResult<T> {
     tokio::task::spawn_blocking(work)

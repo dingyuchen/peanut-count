@@ -187,6 +187,19 @@ impl Store {
         Ok(())
     }
 
+    pub fn has_statement(&self, id: &str) -> Result<bool> {
+        let initialized: bool = self.0.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'mobile_statements')",
+            [], |row| row.get(0),
+        )?;
+        Ok(initialized
+            && self.0.query_row(
+                "SELECT EXISTS(SELECT 1 FROM mobile_statements WHERE id = ?)",
+                [id],
+                |row| row.get(0),
+            )?)
+    }
+
     pub fn statement_page(&self, after: i64) -> Result<Vec<(i64, crate::mobile::Statement)>> {
         let initialized: bool = self.0.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'mobile_statements')",

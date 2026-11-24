@@ -194,6 +194,30 @@ impl Ledger {
         Ok(ledger)
     }
 
+    /// Open accounts sorted by name, each with its declared currencies or,
+    /// for an unconstrained account, the currencies it has been posted in.
+    pub fn open_accounts(&self) -> Vec<(String, Vec<String>)> {
+        let mut open: Vec<_> = self
+            .accounts
+            .iter()
+            .filter(|(_, account)| !account.closed)
+            .map(|(name, account)| {
+                let currencies = if account.currencies.is_empty() {
+                    self.balances
+                        .keys()
+                        .filter(|(held, _)| held == name)
+                        .map(|(_, currency)| currency.clone())
+                        .collect()
+                } else {
+                    account.currencies.clone()
+                };
+                (name.clone(), currencies)
+            })
+            .collect();
+        open.sort();
+        open
+    }
+
     pub fn canonical_entry(&self, id: &str) -> Result<&Entry> {
         self.records
             .iter()
