@@ -203,8 +203,8 @@ liability accounts was used, and the category. The model only chooses among
 values that appear in the email and among your accounts, so it cannot make
 up an amount. Name accounts after the card or account number when you can,
 for example `Liabilities:Citi-Rewards-1234`, so that "card ending 1234"
-matches. If your numbered accounts don't include the number an email cites,
-the email can be rejected with a request to open that account first. Missing
+matches. If an email cites a card or account number that no account name
+ends with, it can be rejected with a request to open that account first. Missing
 categories, and `Assets:Checking` or `Liabilities:CreditCard` when the ledger
 has no account of that kind, are opened automatically. A category the model
 is unsure about goes to `Expenses:Uncategorized` or `Income:Uncategorized`.

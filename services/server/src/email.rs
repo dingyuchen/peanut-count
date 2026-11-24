@@ -9,7 +9,7 @@ use std::{collections::BTreeMap, sync::LazyLock};
 
 use anyhow::{Context, Result};
 use chrono::{Datelike, Days, NaiveDate};
-use mail_parser::{Message, MessageParser, PartType, decoders::html::html_to_text};
+use mail_parser::{Message, MessageParser, MimeHeaders, PartType, decoders::html::html_to_text};
 use regex::Regex;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -53,50 +53,108 @@ fn rejected(reason: impl Into<String>) -> Failure {
 }
 
 pub fn parse(raw: &[u8]) -> Result<Email> {
-    anyhow::ensure!(
-        nesting_markers(raw, 3) <= MAX_NESTED,
-        "the email nests too many messages"
-    );
-    let outer = MessageParser::default()
-        .parse(raw)
-        .context("input is not an email message")?;
-    let email = read(&outer, raw);
-    drop_iteratively(outer);
-    Ok(email)
+    parse_within(raw, 2)
 }
 
-/// Most nested-message markers accepted. mail-parser converts a decoded
-/// message/rfc822 attachment to owned data recursively, so a deep tree
-/// hidden in a base64 attachment would overflow the stack while parsing.
-/// Nesting is never deeper than the number of markers, and real forwards
-/// nest once or twice.
-const MAX_NESTED: usize = 32;
-
-/// A Content-Type whose value names a nested message or a digest, whose
-/// untyped parts are messages. Folding and comments may separate the words.
-static NESTED_TYPE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
-    regex::bytes::Regex::new(r"(?i)content-type[ \t]*:[^:]{0,200}?(?:message|digest)").unwrap()
-});
-
-/// Two or more consecutive lines of base64, as in an encoded MIME part.
-static BASE64_RUN: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
-    regex::bytes::Regex::new(r"(?m)(?:^[A-Za-z0-9+/]{4,}={0,2}\r?\n){2,}").unwrap()
-});
-
-/// Counts nested-message markers in `bytes`, after undoing quoted-printable,
-/// and inside base64 runs down to `depth` levels of encoding, the most
-/// mail-parser decodes. Stops early once the count exceeds [`MAX_NESTED`].
-fn nesting_markers(bytes: &[u8], depth: u8) -> usize {
-    let mut count = NESTED_TYPE.find_iter(&quoted_printable(bytes, 3)).count();
-    if depth > 0 {
-        for run in BASE64_RUN.find_iter(bytes) {
-            if count > MAX_NESTED {
-                break;
+/// mail-parser decodes a base64 or quoted-printable nested message and then
+/// converts its whole tree to owned data recursively, copying the remaining
+/// bytes at every level, so a deep tree in an encoded part exhausts the
+/// stack or memory before parsing returns. Only text parts are therefore
+/// decoded. A first pass hides every Content-Transfer-Encoding header behind
+/// a same-length name, so nothing is decoded and part offsets stay valid,
+/// and finds the text parts. The second pass hides the header everywhere
+/// else. An encoded forwarded message, which RFC 2046 does not allow but
+/// some clients send, is decoded here instead, at most `depth` levels deep.
+fn parse_within(raw: &[u8], depth: u8) -> Result<Email> {
+    let parser = MessageParser::default();
+    let undecoded = hide_encodings(raw, &[]);
+    let probe = parser
+        .parse(&undecoded)
+        .context("input is not an email message")?;
+    let mut text_parts = Vec::new();
+    let mut pending = vec![&probe];
+    while let Some(message) = pending.pop() {
+        for part in &message.parts {
+            if part
+                .content_type()
+                .is_some_and(|kind| kind.ctype().eq_ignore_ascii_case("text"))
+            {
+                text_parts.push(part.offset_header as usize..part.offset_body as usize);
             }
-            count += nesting_markers(&base64(run.as_bytes()), depth - 1);
+            if let PartType::Message(nested) = &part.body {
+                pending.push(nested);
+            }
         }
     }
-    count
+    drop_iteratively(probe);
+    text_parts.sort_by_key(|range| range.start);
+
+    let safe = hide_encodings(raw, &text_parts);
+    let outer = parser
+        .parse(&safe)
+        .context("input is not an email message")?;
+    let forwarded = (depth > 0)
+        .then(|| encoded_forward(&outer, &safe))
+        .flatten();
+    let email = match forwarded {
+        Some(decoded) => parse_within(&decoded, depth - 1),
+        None => Ok(read(&outer, raw)),
+    };
+    drop_iteratively(outer);
+    email
+}
+
+static ENCODING_HEADER: LazyLock<regex::bytes::Regex> =
+    LazyLock::new(|| regex::bytes::Regex::new(r"(?i)content-transfer-encoding").unwrap());
+/// Same length as "Content-Transfer-Encoding", so offsets do not move.
+const HIDDEN_ENCODING: &[u8; 25] = b"X-Peanut-Hidden-Encodings";
+
+/// Renames every Content-Transfer-Encoding header outside the `keep` header
+/// ranges, which are sorted by start.
+fn hide_encodings(raw: &[u8], keep: &[std::ops::Range<usize>]) -> Vec<u8> {
+    let mut out = raw.to_vec();
+    for found in ENCODING_HEADER.find_iter(raw) {
+        let at = found.start();
+        let kept = keep
+            .partition_point(|range| range.start <= at)
+            .checked_sub(1)
+            .is_some_and(|i| keep[i].contains(&at));
+        if !kept {
+            out[found.range()].copy_from_slice(HIDDEN_ENCODING);
+        }
+    }
+    out
+}
+
+/// The decoded bytes of the first forwarded message/rfc822 part whose
+/// base64 or quoted-printable encoding was hidden.
+fn encoded_forward(message: &Message, raw: &[u8]) -> Option<Vec<u8>> {
+    message.parts.iter().find_map(|part| {
+        let kind = part.content_type()?;
+        if !kind.ctype().eq_ignore_ascii_case("message") {
+            return None;
+        }
+        let encoding = part
+            .headers
+            .iter()
+            .find(|header| {
+                header
+                    .name
+                    .as_str()
+                    .as_bytes()
+                    .eq_ignore_ascii_case(HIDDEN_ENCODING)
+            })?
+            .value
+            .as_text()?
+            .trim()
+            .to_ascii_lowercase();
+        let body = raw.get(part.offset_body as usize..part.offset_end as usize)?;
+        match encoding.as_str() {
+            "base64" => Some(base64(body)),
+            "quoted-printable" => Some(quoted_printable(body, 1)),
+            _ => None,
+        }
+    })
 }
 
 /// Undoes quoted-printable soft breaks and escapes, up to `rounds` times.
@@ -858,24 +916,17 @@ pub async fn extract(
         .filter(|name| name.starts_with("Assets:") || name.starts_with("Liabilities:"))
         .map(|name| (name.clone(), describe_account(name, false)))
         .collect();
-    // The ledger may lack the card or account the email names. Only when the
-    // email cites a number, such as "ending 5678", that none of the numbered
-    // accounts carries can the model answer "none".
+    // The ledger may lack the card or account the email names. When the
+    // email cites a number, such as "ending 5678", that no account name ends
+    // with, the model may answer "none". Unnumbered accounts stay on offer,
+    // so "Liabilities:Amex" can still match an Amex alert by name.
     let cited: Vec<&str> = CARD_DIGITS
         .captures_iter(&text)
         .map(|caps| caps.get(1).unwrap().as_str())
         .collect();
-    let numbered: Vec<&String> = sources
-        .keys()
-        .filter(|name| {
-            name.split([':', '-'])
-                .any(|part| part.len() >= 3 && part.bytes().all(|b| b.is_ascii_digit()))
-        })
-        .collect();
     let offer_none = !cited.is_empty()
-        && !numbered.is_empty()
         && !cited.iter().any(|number| {
-            numbered.iter().any(|name| {
+            sources.keys().any(|name| {
                 name.split([':', '-'])
                     .any(|part| part.bytes().all(|b| b.is_ascii_digit()) && part.ends_with(number))
             })
@@ -1519,21 +1570,31 @@ Content-Type: multipart/alternative; boundary=b\r\n\r\n--b\r\nContent-Type: text
     }
 
     #[test]
-    fn deeply_nested_messages_are_rejected_without_overflowing_the_stack() {
+    fn deeply_nested_messages_do_not_overflow_the_stack() {
         // Test threads have 2 MiB stacks, so recursion this deep would abort.
+        // Each message must parse or fail cleanly, not crash the process.
         let nested = "Content-Type: message/rfc822\r\n\r\n".repeat(75_000)
             + "Subject: x\r\n\r\nSGD 1.00\r\n";
-        assert!(parse(nested.as_bytes()).is_err());
+        let _ = parse(nested.as_bytes());
         let encoded = format!(
             "Subject: outer\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=b\r\n\r\n\
 --b\r\nContent-Type: message/rfc822\r\nContent-Transfer-Encoding: base64\r\n\r\n{}--b--\r\n",
             encode_base64(nested.as_bytes())
         );
         assert!(encoded.len() < crate::inbound::MAX_EMAIL_BYTES);
-        assert!(parse(encoded.as_bytes()).is_err());
-        // A quoted-printable wrapper does not hide the markers either.
-        let qp = nested.replace("message/rfc822", "messa=\r\nge/rfc822");
-        assert!(nesting_markers(qp.as_bytes(), 3) > MAX_NESTED);
+        // The encoded forward is decoded at most twice, then read as is.
+        let _ = parse(encoded.as_bytes());
+        // Base64 with spaces inside lines, which mail-parser also decodes.
+        let spaced = encoded
+            .replace("\r\n", " \r\n")
+            .replacen("AAAA", "AA AA", 1000);
+        let _ = parse(spaced.as_bytes());
+        // A deep tree inside an encoded part that is not message/rfc822.
+        let other = encoded.replace(
+            "Content-Type: message/rfc822\r\nContent-Transfer-Encoding",
+            "Content-Type: application/octet-stream\r\nContent-Transfer-Encoding",
+        );
+        let _ = parse(other.as_bytes());
 
         // An ordinary forward with an encoded attachment still parses.
         let attached = format!(
@@ -1958,6 +2019,15 @@ Please view this email in an HTML-capable client.\r\n--b\r\nContent-Type: text/h
                 ],
                 vec![],
                 "Visa ending 1234: you paid $8.00 to Grab on 2026-11-23.",
+            ),
+            // No account names carry numbers at all.
+            (
+                vec![
+                    account("Assets:Checking", &[], &[]),
+                    account("Liabilities:Amex", &[], &[]),
+                ],
+                vec![],
+                "Citi card ending 5678: you paid $8.00 to Grab on 2026-11-23.",
             ),
         ];
         for (accounts, closed, body) in cases {
