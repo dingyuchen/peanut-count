@@ -53,12 +53,108 @@ fn rejected(reason: impl Into<String>) -> Failure {
 }
 
 pub fn parse(raw: &[u8]) -> Result<Email> {
+    anyhow::ensure!(
+        nesting_markers(raw, 3) <= MAX_NESTED,
+        "the email nests too many messages"
+    );
     let outer = MessageParser::default()
         .parse(raw)
         .context("input is not an email message")?;
     let email = read(&outer, raw);
     drop_iteratively(outer);
     Ok(email)
+}
+
+/// Most nested-message markers accepted. mail-parser converts a decoded
+/// message/rfc822 attachment to owned data recursively, so a deep tree
+/// hidden in a base64 attachment would overflow the stack while parsing.
+/// Nesting is never deeper than the number of markers, and real forwards
+/// nest once or twice.
+const MAX_NESTED: usize = 32;
+
+/// A Content-Type whose value names a nested message or a digest, whose
+/// untyped parts are messages. Folding and comments may separate the words.
+static NESTED_TYPE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
+    regex::bytes::Regex::new(r"(?i)content-type[ \t]*:[^:]{0,200}?(?:message|digest)").unwrap()
+});
+
+/// Two or more consecutive lines of base64, as in an encoded MIME part.
+static BASE64_RUN: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
+    regex::bytes::Regex::new(r"(?m)(?:^[A-Za-z0-9+/]{4,}={0,2}\r?\n){2,}").unwrap()
+});
+
+/// Counts nested-message markers in `bytes`, after undoing quoted-printable,
+/// and inside base64 runs down to `depth` levels of encoding, the most
+/// mail-parser decodes. Stops early once the count exceeds [`MAX_NESTED`].
+fn nesting_markers(bytes: &[u8], depth: u8) -> usize {
+    let mut count = NESTED_TYPE.find_iter(&quoted_printable(bytes, 3)).count();
+    if depth > 0 {
+        for run in BASE64_RUN.find_iter(bytes) {
+            if count > MAX_NESTED {
+                break;
+            }
+            count += nesting_markers(&base64(run.as_bytes()), depth - 1);
+        }
+    }
+    count
+}
+
+/// Undoes quoted-printable soft breaks and escapes, up to `rounds` times.
+fn quoted_printable(bytes: &[u8], rounds: u8) -> Vec<u8> {
+    let hex = |b: u8| (b as char).to_digit(16).map(|d| d as u8);
+    let mut text = bytes.to_vec();
+    for _ in 0..rounds {
+        let mut out = Vec::with_capacity(text.len());
+        let mut i = 0;
+        while i < text.len() {
+            match &text[i..] {
+                [b'=', b'\r', b'\n', ..] => i += 3,
+                [b'=', b'\n', ..] => i += 2,
+                [b'=', a, b, ..] if hex(*a).is_some() && hex(*b).is_some() => {
+                    out.push(hex(*a).unwrap() << 4 | hex(*b).unwrap());
+                    i += 3;
+                }
+                [byte, ..] => {
+                    out.push(*byte);
+                    i += 1;
+                }
+                [] => break,
+            }
+        }
+        if out == text {
+            break;
+        }
+        text = out;
+    }
+    text
+}
+
+/// Decodes base64, skipping line breaks and stopping at padding.
+fn base64(bytes: &[u8]) -> Vec<u8> {
+    let value = |b: u8| match b {
+        b'A'..=b'Z' => Some(b - b'A'),
+        b'a'..=b'z' => Some(b - b'a' + 26),
+        b'0'..=b'9' => Some(b - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    };
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+    let (mut buffer, mut bits) = (0u32, 0);
+    for &b in bytes {
+        if b == b'=' {
+            break;
+        }
+        let Some(v) = value(b) else { continue };
+        buffer = buffer << 6 | u32::from(v);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buffer >> bits) as u8);
+            buffer &= (1 << bits) - 1;
+        }
+    }
+    out
 }
 
 /// Drops a parsed message without recursion. mail-parser parses nested
@@ -1396,13 +1492,62 @@ Content-Type: multipart/alternative; boundary=b\r\n\r\n--b\r\nContent-Type: text
         );
     }
 
+    /// Base64 with 76-character lines, as mail clients write it.
+    fn encode_base64(data: &[u8]) -> String {
+        const TABLE: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for chunk in data.chunks(3) {
+            let b = [
+                chunk[0],
+                *chunk.get(1).unwrap_or(&0),
+                *chunk.get(2).unwrap_or(&0),
+            ];
+            let n = u32::from(b[0]) << 16 | u32::from(b[1]) << 8 | u32::from(b[2]);
+            for i in 0..4 {
+                out.push(if i <= chunk.len() {
+                    TABLE[(n >> (18 - 6 * i) & 63) as usize] as char
+                } else {
+                    '='
+                });
+            }
+        }
+        out.as_bytes()
+            .chunks(76)
+            .map(|line| format!("{}\r\n", std::str::from_utf8(line).unwrap()))
+            .collect()
+    }
+
     #[test]
-    fn deeply_nested_messages_do_not_overflow_the_stack() {
-        // Test threads have 2 MiB stacks; a recursive drop aborts here.
-        let mut raw = "Content-Type: message/rfc822\r\n\r\n".repeat(120_000);
-        raw.push_str("Message-ID: <deep@x.example>\r\nSubject: x\r\n\r\nSGD 1.00\r\n");
-        assert!(raw.len() < crate::inbound::MAX_EMAIL_BYTES);
-        parse(raw.as_bytes()).unwrap();
+    fn deeply_nested_messages_are_rejected_without_overflowing_the_stack() {
+        // Test threads have 2 MiB stacks, so recursion this deep would abort.
+        let nested = "Content-Type: message/rfc822\r\n\r\n".repeat(75_000)
+            + "Subject: x\r\n\r\nSGD 1.00\r\n";
+        assert!(parse(nested.as_bytes()).is_err());
+        let encoded = format!(
+            "Subject: outer\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=b\r\n\r\n\
+--b\r\nContent-Type: message/rfc822\r\nContent-Transfer-Encoding: base64\r\n\r\n{}--b--\r\n",
+            encode_base64(nested.as_bytes())
+        );
+        assert!(encoded.len() < crate::inbound::MAX_EMAIL_BYTES);
+        assert!(parse(encoded.as_bytes()).is_err());
+        // A quoted-printable wrapper does not hide the markers either.
+        let qp = nested.replace("message/rfc822", "messa=\r\nge/rfc822");
+        assert!(nesting_markers(qp.as_bytes(), 3) > MAX_NESTED);
+
+        // An ordinary forward with an encoded attachment still parses.
+        let attached = format!(
+            "Message-ID: <fwd@x.example>\r\nSubject: Fwd\r\nMIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Type: message/rfc822\r\n\
+Content-Transfer-Encoding: base64\r\n\r\n{}--b--\r\n",
+            encode_base64(ALERT.as_bytes())
+        );
+        let email = parse(attached.as_bytes()).unwrap();
+        assert!(
+            email.body.contains("STARBUCKS VIVOCITY"),
+            "{:?}",
+            email.body
+        );
     }
 
     #[test]
