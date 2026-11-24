@@ -9,7 +9,10 @@ use std::{collections::BTreeMap, sync::LazyLock};
 
 use anyhow::{Context, Result};
 use chrono::{Datelike, Days, NaiveDate};
-use mail_parser::{Message, MessageParser, MimeHeaders, PartType, decoders::html::html_to_text};
+use mail_parser::{
+    HeaderName, Message, MessageParser, MessagePart, MimeHeaders, PartType,
+    decoders::html::html_to_text,
+};
 use regex::Regex;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -56,46 +59,44 @@ pub fn parse(raw: &[u8]) -> Result<Email> {
     parse_within(raw, 2)
 }
 
-/// mail-parser decodes a base64 or quoted-printable nested message and then
-/// converts its whole tree to owned data recursively, copying the remaining
-/// bytes at every level, so a deep tree in an encoded part exhausts the
-/// stack or memory before parsing returns. Only text parts are therefore
-/// decoded. A first pass hides every Content-Transfer-Encoding header behind
-/// a same-length name, so nothing is decoded and part offsets stay valid,
-/// and finds the text parts. The second pass hides the header everywhere
-/// else. An encoded forwarded message, which RFC 2046 does not allow but
-/// some clients send, is decoded here instead, at most `depth` levels deep.
-fn parse_within(raw: &[u8], depth: u8) -> Result<Email> {
-    let parser = MessageParser::default();
-    let undecoded = hide_encodings(raw, &[]);
-    let probe = parser
-        .parse(&undecoded)
-        .context("input is not an email message")?;
-    let mut text_parts = Vec::new();
-    let mut pending = vec![&probe];
-    while let Some(message) = pending.pop() {
-        for part in &message.parts {
-            if part
-                .content_type()
-                .is_some_and(|kind| kind.ctype().eq_ignore_ascii_case("text"))
-            {
-                text_parts.push(part.offset_header as usize..part.offset_body as usize);
-            }
-            if let PartType::Message(nested) = &part.body {
-                pending.push(nested);
-            }
-        }
-    }
-    drop_iteratively(probe);
-    text_parts.sort_by_key(|range| range.start);
+/// Most `boundary` parameters accepted. mail-parser rescans the rest of the
+/// message for each multipart part whose boundary never appears, so parsing
+/// time grows with this count times the message size.
+const MAX_BOUNDARIES: usize = 256;
 
-    let safe = hide_encodings(raw, &text_parts);
-    let outer = parser
-        .parse(&safe)
+static BOUNDARY: LazyLock<regex::bytes::Regex> =
+    LazyLock::new(|| regex::bytes::Regex::new(r"(?i)boundary").unwrap());
+
+/// mail-parser's usual header handling, except that it ignores
+/// Content-Transfer-Encoding and so decodes no part. Decoding a base64 or
+/// quoted-printable nested message makes it convert the whole tree to owned
+/// data recursively, copying the remaining bytes at every level, which a
+/// crafted 4 MiB email could use to exhaust the stack or memory. Without
+/// decoding, nested messages are parsed iteratively and dropped with
+/// [`drop_iteratively`]. The ignored header is matched after the parser's
+/// own name normalisation, so every spelling it accepts is covered.
+fn parser() -> MessageParser {
+    MessageParser::new()
+        .with_mime_headers()
+        .with_date_headers()
+        .with_address_headers()
+        .with_message_ids()
+        .header_text(HeaderName::Subject)
+        .ignore_header(HeaderName::ContentTransferEncoding)
+}
+
+/// Parses `raw`. An encoded forwarded message, which RFC 2046 does not allow
+/// but some clients send, is decoded here and parsed the same way, at most
+/// `depth` levels deep.
+fn parse_within(raw: &[u8], depth: u8) -> Result<Email> {
+    anyhow::ensure!(
+        BOUNDARY.find_iter(raw).take(MAX_BOUNDARIES + 1).count() <= MAX_BOUNDARIES,
+        "the email has too many MIME parts"
+    );
+    let outer = parser()
+        .parse(raw)
         .context("input is not an email message")?;
-    let forwarded = (depth > 0)
-        .then(|| encoded_forward(&outer, &safe))
-        .flatten();
+    let forwarded = (depth > 0).then(|| encoded_forward(&outer, raw)).flatten();
     let email = match forwarded {
         Some(decoded) => parse_within(&decoded, depth - 1),
         None => Ok(read(&outer, raw)),
@@ -104,57 +105,71 @@ fn parse_within(raw: &[u8], depth: u8) -> Result<Email> {
     email
 }
 
-static ENCODING_HEADER: LazyLock<regex::bytes::Regex> =
-    LazyLock::new(|| regex::bytes::Regex::new(r"(?i)content-transfer-encoding").unwrap());
-/// Same length as "Content-Transfer-Encoding", so offsets do not move.
-const HIDDEN_ENCODING: &[u8; 25] = b"X-Peanut-Hidden-Encodings";
-
-/// Renames every Content-Transfer-Encoding header outside the `keep` header
-/// ranges, which are sorted by start.
-fn hide_encodings(raw: &[u8], keep: &[std::ops::Range<usize>]) -> Vec<u8> {
-    let mut out = raw.to_vec();
-    for found in ENCODING_HEADER.find_iter(raw) {
-        let at = found.start();
-        let kept = keep
-            .partition_point(|range| range.start <= at)
-            .checked_sub(1)
-            .is_some_and(|i| keep[i].contains(&at));
-        if !kept {
-            out[found.range()].copy_from_slice(HIDDEN_ENCODING);
-        }
-    }
-    out
+/// The raw value of a part's header. Offsets index `raw`, since no part is
+/// decoded.
+fn header_raw<'a>(part: &MessagePart, raw: &'a [u8], name: &HeaderName) -> Option<&'a [u8]> {
+    let header = part.headers.iter().find(|header| header.name == *name)?;
+    raw.get(header.offset_start as usize..header.offset_end as usize)
 }
 
-/// The decoded bytes of the first forwarded message/rfc822 part whose
-/// base64 or quoted-printable encoding was hidden.
+/// A part's transfer encoding, such as "base64", in lower case.
+fn transfer_encoding(part: &MessagePart, raw: &[u8]) -> Option<String> {
+    let value = header_raw(part, raw, &HeaderName::ContentTransferEncoding)?;
+    let value = String::from_utf8_lossy(value);
+    Some(value.split_whitespace().next()?.to_ascii_lowercase())
+}
+
+/// The decoded bytes of the first forwarded message part sent with a base64
+/// or quoted-printable encoding.
 fn encoded_forward(message: &Message, raw: &[u8]) -> Option<Vec<u8>> {
     message.parts.iter().find_map(|part| {
-        let kind = part.content_type()?;
-        if !kind.ctype().eq_ignore_ascii_case("message") {
+        if !part.content_type()?.ctype().eq_ignore_ascii_case("message") {
             return None;
         }
-        let encoding = part
-            .headers
-            .iter()
-            .find(|header| {
-                header
-                    .name
-                    .as_str()
-                    .as_bytes()
-                    .eq_ignore_ascii_case(HIDDEN_ENCODING)
-            })?
-            .value
-            .as_text()?
-            .trim()
-            .to_ascii_lowercase();
         let body = raw.get(part.offset_body as usize..part.offset_end as usize)?;
-        match encoding.as_str() {
+        match transfer_encoding(part, raw)?.as_str() {
             "base64" => Some(base64(body)),
             "quoted-printable" => Some(quoted_printable(body, 1)),
             _ => None,
         }
     })
+}
+
+/// A text part's body as text. A base64 or quoted-printable body is decoded
+/// by parsing it alone as a one-part message whose text Content-Type is
+/// built here, so mail-parser still handles the charset but cannot find
+/// any nested structure.
+fn decoded(part: &MessagePart, raw: &[u8]) -> String {
+    let Some(encoding) = transfer_encoding(part, raw)
+        .filter(|encoding| matches!(encoding.as_str(), "base64" | "quoted-printable"))
+    else {
+        return part.text_contents().unwrap_or_default().to_owned();
+    };
+    let body = raw
+        .get(part.offset_body as usize..part.offset_end as usize)
+        .unwrap_or_default();
+    let charset: String = part
+        .content_type()
+        .and_then(|kind| kind.attribute("charset"))
+        .unwrap_or("utf-8")
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
+        .collect();
+    let subtype = if part.is_text_html() { "html" } else { "plain" };
+    let mut single = format!(
+        "Content-Type: text/{subtype}; charset=\"{charset}\"\r\nContent-Transfer-Encoding: {encoding}\r\n\r\n"
+    )
+    .into_bytes();
+    single.extend_from_slice(body);
+    MessageParser::default()
+        .parse(&single)
+        .and_then(|message| {
+            message
+                .text_part(0)
+                .and_then(|part| part.text_contents())
+                .map(str::to_owned)
+        })
+        .unwrap_or_default()
 }
 
 /// Undoes quoted-printable soft breaks and escapes, up to `rounds` times.
@@ -265,7 +280,11 @@ fn read(outer: &Message, raw: &[u8]) -> Email {
         )))
         .to_owned(),
         sent,
-        body: truncate(&join_split_amounts(&clean(&body_text(message))), MAX_TEXT).to_owned(),
+        body: truncate(
+            &join_split_amounts(&clean(&body_text(message, raw))),
+            MAX_TEXT,
+        )
+        .to_owned(),
     }
 }
 
@@ -278,33 +297,44 @@ static CELL_TAG: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)<(/?t[dh]\b
 /// The first text body. HTML gets a line break at each row and block tag and
 /// a space between table cells, so "Total" and "S$17.10" do not run together
 /// while "SGD" and "12.50" in one row stay on one line.
-fn body_text(message: &Message) -> String {
-    let html = |part: &mail_parser::MessagePart| {
+fn body_text(message: &Message, raw: &[u8]) -> String {
+    // A forwarded message part that could not be parsed is not body text.
+    let readable = |part: &&MessagePart| {
+        !part
+            .content_type()
+            .is_some_and(|kind| kind.ctype().eq_ignore_ascii_case("message"))
+    };
+    let as_text = |part: &MessagePart| {
+        let body = decoded(part, raw);
+        if !part.is_text_html() {
+            return body;
+        }
         // html_to_text collapses whitespace, so mark the breaks with
         // private-use characters and restore them afterwards.
-        let html = part.text_contents().unwrap_or_default();
-        let html = BLOCK_TAG.replace_all(html, "\u{e000}<$1");
+        let html = BLOCK_TAG.replace_all(&body, "\u{e000}<$1");
         let html = CELL_TAG.replace_all(&html, "\u{e001}<$1");
         html_to_text(&html)
             .replace('\u{e000}', "\n")
             .replace('\u{e001}', " ")
     };
-    match message.text_part(0) {
-        Some(part) if part.is_text_html() => html(part),
-        _ => {
-            let text = message.body_text(0).unwrap_or_default().into_owned();
+    let html_part = message
+        .html_bodies()
+        .filter(readable)
+        .find(|part| part.is_text_html());
+    match message.text_bodies().find(readable) {
+        Some(part) if part.is_text_html() => as_text(part),
+        Some(part) => {
+            let text = as_text(part);
             // A plain-text alternative such as "View this email in HTML"
             // carries no amount; read the HTML alternative instead.
-            match message.html_part(0) {
-                Some(part)
-                    if part.is_text_html()
-                        && amounts(truncate(&clean(&text), MAX_TEXT)).is_empty() =>
-                {
-                    html(part)
+            match html_part {
+                Some(html) if amounts(truncate(&clean(&text), MAX_TEXT)).is_empty() => {
+                    as_text(html)
                 }
                 _ => text,
             }
         }
+        None => html_part.map(as_text).unwrap_or_default(),
     }
 }
 
@@ -1589,12 +1619,28 @@ Content-Type: multipart/alternative; boundary=b\r\n\r\n--b\r\nContent-Type: text
             .replace("\r\n", " \r\n")
             .replacen("AAAA", "AA AA", 1000);
         let _ = parse(spaced.as_bytes());
+        // A spelling with whitespace inside the header name, which
+        // mail-parser still recognises.
+        let misspelled = encoded.replace(
+            "Content-Transfer-Encoding: base64",
+            "Content-Transfer -Encoding: base64",
+        );
+        let _ = parse(misspelled.as_bytes());
         // A deep tree inside an encoded part that is not message/rfc822.
         let other = encoded.replace(
             "Content-Type: message/rfc822\r\nContent-Transfer-Encoding",
             "Content-Type: application/octet-stream\r\nContent-Transfer-Encoding",
         );
         let _ = parse(other.as_bytes());
+
+        // Many multipart parts whose boundaries never appear are refused
+        // instead of rescanning the message for each.
+        let siblings =
+            "--a\r\nContent-Type: multipart/mixed; boundary=zz\r\n\r\nx\r\n".repeat(40_000);
+        let slow = format!("Content-Type: multipart/mixed; boundary=a\r\n\r\n{siblings}--a--\r\n");
+        let started = std::time::Instant::now();
+        assert!(parse(slow.as_bytes()).is_err());
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
 
         // An ordinary forward with an encoded attachment still parses.
         let attached = format!(
@@ -1609,6 +1655,30 @@ Content-Transfer-Encoding: base64\r\n\r\n{}--b--\r\n",
             "{:?}",
             email.body
         );
+
+        // A quoted-printable forward whose alert has a base64 text body.
+        let inner = format!(
+            "Message-ID: <inner@bank.example>\r\nSubject: Alert\r\nContent-Type: text/plain\r\n\
+Content-Transfer-Encoding: base64\r\n\r\n{}",
+            encode_base64(b"You spent SGD 12.50 at KOPITIAM.")
+        );
+        let qp_forward = format!(
+            "Message-ID: <fwd2@x.example>\r\nSubject: Fwd\r\nMIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Type: message/rfc822\r\n\
+Content-Transfer-Encoding: quoted-printable\r\n\r\n{}\r\n--b--\r\n",
+            inner.replace('=', "=3D")
+        );
+        let email = parse(qp_forward.as_bytes()).unwrap();
+        assert!(email.body.contains("SGD 12.50"), "{:?}", email.body);
+
+        // A legacy alert without Content-Type is text/plain, base64 or not.
+        let legacy = format!(
+            "Message-ID: <legacy@bank.example>\r\nSubject: Alert\r\n\
+Content-Transfer-Encoding: base64\r\n\r\n{}",
+            encode_base64(b"You spent SGD 7.20 at KOPITIAM.")
+        );
+        let email = parse(legacy.as_bytes()).unwrap();
+        assert!(email.body.contains("SGD 7.20"), "{:?}", email.body);
     }
 
     #[test]
