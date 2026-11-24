@@ -17,7 +17,7 @@ The root Cargo workspace keeps builds and tests available from the repo root.
 
 ## Build and start a ledger
 
-Build with Rust 1.89 or newer and a C compiler for the bundled SQLite library.
+Build with Rust 1.98 or newer and a C compiler for the bundled SQLite library.
 
 ```sh
 cargo build --release --locked

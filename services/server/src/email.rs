@@ -9,10 +9,7 @@ use std::{collections::BTreeMap, sync::LazyLock};
 
 use anyhow::{Context, Result};
 use chrono::{Datelike, Days, NaiveDate};
-use mail_parser::{
-    HeaderName, Message, MessageParser, MessagePart, MimeHeaders, PartType,
-    decoders::html::html_to_text,
-};
+use mail_parser::{MessageParser, MessagePart, MessageRef, PartKind, html_to_text};
 use regex::Regex;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -55,266 +52,21 @@ fn rejected(reason: impl Into<String>) -> Failure {
     Failure::Rejected(reason.into())
 }
 
+/// Parses a raw message. mail-parser 1.x bounds nesting depth, the number
+/// of parts, and the levels of transfer-encoded nested messages it decodes,
+/// finds boundaries in linear time, and decodes bodies only when read.
 pub fn parse(raw: &[u8]) -> Result<Email> {
-    parse_within(raw, 2)
-}
-
-/// Most `boundary` parameters accepted. mail-parser rescans the rest of the
-/// message for each multipart part whose boundary never appears, so parsing
-/// time grows with this count times the message size.
-const MAX_BOUNDARIES: usize = 256;
-
-/// Longest boundary value accepted, in raw bytes. RFC 2046 allows 70
-/// characters; this leaves room for quotes and folding. mail-parser compares
-/// the boundary at every "--" in the body, so a long one costs its length
-/// times the message size.
-const MAX_BOUNDARY_LEN: usize = 200;
-
-/// Most RFC 2231 parameter continuations, such as `name*1=`, accepted.
-/// mail-parser copies the value assembled so far for each one. Only numbered
-/// segments count, so CSS selectors such as `[style*="x"]` do not.
-const MAX_CONTINUATIONS: usize = 32;
-
-static CONTINUATION: LazyLock<regex::bytes::Regex> =
-    LazyLock::new(|| regex::bytes::Regex::new(r"\*[ \t]*[0-9]+[ \t]*\*?[ \t]*=").unwrap());
-
-/// The raw length of the value after a `boundary` match, reading past an
-/// optional continuation marker and "=", to the closing quote of a quoted
-/// value or the end of an unquoted token. An unterminated value counts in
-/// full, up to one byte past the limit.
-fn boundary_value_len(rest: &[u8]) -> usize {
-    let limit = MAX_BOUNDARY_LEN + 1;
-    let mut i = 0;
-    while i < rest.len() && i < 16 && rest[i] != b'=' {
-        i += 1;
-    }
-    if rest.get(i) != Some(&b'=') {
-        return 0;
-    }
-    let value = &rest[i + 1..];
-    let start = value
-        .iter()
-        .position(|b| !b.is_ascii_whitespace())
-        .unwrap_or(value.len());
-    let value = &value[start..];
-    let len = if value.first() == Some(&b'"') {
-        value[1..]
-            .iter()
-            .take(limit)
-            .position(|&b| b == b'"')
-            .unwrap_or(limit)
-    } else {
-        value
-            .iter()
-            .take(limit)
-            .position(|&b| b == b';' || b.is_ascii_whitespace())
-            .unwrap_or(limit.min(value.len()))
-    };
-    len.min(limit)
-}
-
-static BOUNDARY: LazyLock<regex::bytes::Regex> =
-    LazyLock::new(|| regex::bytes::Regex::new(r"(?i)boundary").unwrap());
-
-/// mail-parser's usual header handling, except that it ignores
-/// Content-Transfer-Encoding and so decodes no part. Decoding a base64 or
-/// quoted-printable nested message makes it convert the whole tree to owned
-/// data recursively, copying the remaining bytes at every level, which a
-/// crafted 4 MiB email could use to exhaust the stack or memory. Without
-/// decoding, nested messages are parsed iteratively and dropped with
-/// [`drop_iteratively`]. The ignored header is matched after the parser's
-/// own name normalisation, so every spelling it accepts is covered.
-fn parser() -> MessageParser {
-    MessageParser::new()
-        .with_mime_headers()
-        .with_date_headers()
-        .with_address_headers()
-        .with_message_ids()
-        .header_text(HeaderName::Subject)
-        .ignore_header(HeaderName::ContentTransferEncoding)
-}
-
-/// Parses `raw`. An encoded forwarded message, which RFC 2046 does not allow
-/// but some clients send, is decoded here and parsed the same way, at most
-/// `depth` levels deep.
-fn parse_within(raw: &[u8], depth: u8) -> Result<Email> {
-    anyhow::ensure!(
-        BOUNDARY.find_iter(raw).take(MAX_BOUNDARIES + 1).count() <= MAX_BOUNDARIES,
-        "the email has too many MIME parts"
-    );
-    anyhow::ensure!(
-        BOUNDARY
-            .find_iter(raw)
-            .all(|found| boundary_value_len(&raw[found.end()..]) <= MAX_BOUNDARY_LEN),
-        "the email has an overlong MIME boundary"
-    );
-    anyhow::ensure!(
-        CONTINUATION
-            .find_iter(raw)
-            .take(MAX_CONTINUATIONS + 1)
-            .count()
-            <= MAX_CONTINUATIONS,
-        "the email splits MIME parameters too many times"
-    );
-    let outer = parser()
+    let message = MessageParser::default()
         .parse(raw)
         .context("input is not an email message")?;
-    let forwarded = (depth > 0).then(|| encoded_forward(&outer, raw)).flatten();
-    let email = match forwarded {
-        Some(decoded) => parse_within(&decoded, depth - 1),
-        None => Ok(read(&outer, raw)),
-    };
-    drop_iteratively(outer);
-    email
+    Ok(read(message.root(), raw))
 }
 
-/// The raw value of a part's header. Offsets index `raw`, since no part is
-/// decoded.
-fn header_raw<'a>(part: &MessagePart, raw: &'a [u8], name: &HeaderName) -> Option<&'a [u8]> {
-    let header = part.headers.iter().find(|header| header.name == *name)?;
-    raw.get(header.offset_start as usize..header.offset_end as usize)
-}
-
-/// A part's transfer encoding, such as "base64", in lower case.
-fn transfer_encoding(part: &MessagePart, raw: &[u8]) -> Option<String> {
-    let value = header_raw(part, raw, &HeaderName::ContentTransferEncoding)?;
-    let value = String::from_utf8_lossy(value);
-    Some(value.split_whitespace().next()?.to_ascii_lowercase())
-}
-
-/// The decoded bytes of the first forwarded message part sent with a base64
-/// or quoted-printable encoding.
-fn encoded_forward(message: &Message, raw: &[u8]) -> Option<Vec<u8>> {
-    message.parts.iter().find_map(|part| {
-        if !part.content_type()?.ctype().eq_ignore_ascii_case("message") {
-            return None;
-        }
-        let body = raw.get(part.offset_body as usize..part.offset_end as usize)?;
-        match transfer_encoding(part, raw)?.as_str() {
-            "base64" => Some(base64(body)),
-            "quoted-printable" => Some(quoted_printable(body, 1)),
-            _ => None,
-        }
-    })
-}
-
-/// A text part's body as text. A base64 or quoted-printable body is decoded
-/// by parsing it alone as a one-part message whose text Content-Type is
-/// built here, so mail-parser still handles the charset but cannot find
-/// any nested structure.
-fn decoded(part: &MessagePart, raw: &[u8]) -> String {
-    let Some(encoding) = transfer_encoding(part, raw)
-        .filter(|encoding| matches!(encoding.as_str(), "base64" | "quoted-printable"))
-    else {
-        return part.text_contents().unwrap_or_default().to_owned();
-    };
-    let body = raw
-        .get(part.offset_body as usize..part.offset_end as usize)
-        .unwrap_or_default();
-    let charset: String = part
-        .content_type()
-        .and_then(|kind| kind.attribute("charset"))
-        .unwrap_or("utf-8")
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
-        .collect();
-    let subtype = if part.is_text_html() { "html" } else { "plain" };
-    let mut single = format!(
-        "Content-Type: text/{subtype}; charset=\"{charset}\"\r\nContent-Transfer-Encoding: {encoding}\r\n\r\n"
-    )
-    .into_bytes();
-    single.extend_from_slice(body);
-    MessageParser::default()
-        .parse(&single)
-        .and_then(|message| {
-            message
-                .text_part(0)
-                .and_then(|part| part.text_contents())
-                .map(str::to_owned)
-        })
-        .unwrap_or_default()
-}
-
-/// Undoes quoted-printable soft breaks and escapes, up to `rounds` times.
-fn quoted_printable(bytes: &[u8], rounds: u8) -> Vec<u8> {
-    let hex = |b: u8| (b as char).to_digit(16).map(|d| d as u8);
-    let mut text = bytes.to_vec();
-    for _ in 0..rounds {
-        let mut out = Vec::with_capacity(text.len());
-        let mut i = 0;
-        while i < text.len() {
-            match &text[i..] {
-                [b'=', b'\r', b'\n', ..] => i += 3,
-                [b'=', b'\n', ..] => i += 2,
-                [b'=', a, b, ..] if hex(*a).is_some() && hex(*b).is_some() => {
-                    out.push(hex(*a).unwrap() << 4 | hex(*b).unwrap());
-                    i += 3;
-                }
-                [byte, ..] => {
-                    out.push(*byte);
-                    i += 1;
-                }
-                [] => break,
-            }
-        }
-        if out == text {
-            break;
-        }
-        text = out;
-    }
-    text
-}
-
-/// Decodes base64, skipping line breaks and stopping at padding.
-fn base64(bytes: &[u8]) -> Vec<u8> {
-    let value = |b: u8| match b {
-        b'A'..=b'Z' => Some(b - b'A'),
-        b'a'..=b'z' => Some(b - b'a' + 26),
-        b'0'..=b'9' => Some(b - b'0' + 52),
-        b'+' => Some(62),
-        b'/' => Some(63),
-        _ => None,
-    };
-    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
-    let (mut buffer, mut bits) = (0u32, 0);
-    for &b in bytes {
-        if b == b'=' {
-            break;
-        }
-        let Some(v) = value(b) else { continue };
-        buffer = buffer << 6 | u32::from(v);
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((buffer >> bits) as u8);
-            buffer &= (1 << bits) - 1;
-        }
-    }
-    out
-}
-
-/// Drops a parsed message without recursion. mail-parser parses nested
-/// message/rfc822 parts iteratively but owns them as a tree, so dropping a
-/// few hundred thousand levels, which fit in 4 MiB, would overflow the stack.
-fn drop_iteratively(message: Message) {
-    let mut pending = vec![message];
-    while let Some(mut message) = pending.pop() {
-        for part in &mut message.parts {
-            if let PartType::Message(_) = part.body {
-                let body = std::mem::replace(&mut part.body, PartType::Multipart(Vec::new()));
-                if let PartType::Message(nested) = body {
-                    pending.push(nested);
-                }
-            }
-        }
-    }
-}
-
-fn read(outer: &Message, raw: &[u8]) -> Email {
+fn read(outer: MessageRef, raw: &[u8]) -> Email {
     // A forward "as attachment" carries the original alert as message/rfc822.
     let message = outer
         .attachments()
-        .find_map(|part| part.message())
+        .find_map(|part| part.nested())
         .unwrap_or(outer);
     let id = match message.message_id().or(outer.message_id()) {
         Some(message_id) => fingerprint(&["peanut-email", message_id.trim()]),
@@ -323,9 +75,9 @@ fn read(outer: &Message, raw: &[u8]) -> Email {
     let from = message
         .from()
         .and_then(|address| address.first())
-        .map(|addr| {
-            let address = addr.address().unwrap_or_default();
-            match addr.name() {
+        .map(|mailbox| {
+            let address = mailbox.address().unwrap_or_default();
+            match mailbox.name() {
                 Some(name) => format!("{name} <{address}>"),
                 None => address.to_owned(),
             }
@@ -343,11 +95,7 @@ fn read(outer: &Message, raw: &[u8]) -> Email {
         )))
         .to_owned(),
         sent,
-        body: truncate(
-            &join_split_amounts(&clean(&body_text(message, raw))),
-            MAX_TEXT,
-        )
-        .to_owned(),
+        body: truncate(&join_split_amounts(&clean(&body_text(message))), MAX_TEXT).to_owned(),
     }
 }
 
@@ -360,17 +108,12 @@ static CELL_TAG: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)<(/?t[dh]\b
 /// The first text body. HTML gets a line break at each row and block tag and
 /// a space between table cells, so "Total" and "S$17.10" do not run together
 /// while "SGD" and "12.50" in one row stay on one line.
-fn body_text(message: &Message, raw: &[u8]) -> String {
-    // A forwarded message part that could not be parsed is not body text.
-    let readable = |part: &&MessagePart| {
-        !part
-            .content_type()
-            .is_some_and(|kind| kind.ctype().eq_ignore_ascii_case("message"))
-    };
-    let as_text = |part: &MessagePart| {
-        let body = decoded(part, raw);
-        if !part.is_text_html() {
-            return body;
+fn body_text(message: MessageRef) -> String {
+    let is_html = |part: &MessagePart| matches!(part.kind(), PartKind::Html);
+    let as_text = |part: MessagePart| {
+        let body = part.text().unwrap_or_default();
+        if !is_html(&part) {
+            return body.into_owned();
         }
         // html_to_text collapses whitespace, so mark the breaks with
         // private-use characters and restore them afterwards.
@@ -380,12 +123,9 @@ fn body_text(message: &Message, raw: &[u8]) -> String {
             .replace('\u{e000}', "\n")
             .replace('\u{e001}', " ")
     };
-    let html_part = message
-        .html_bodies()
-        .filter(readable)
-        .find(|part| part.is_text_html());
-    match message.text_bodies().find(readable) {
-        Some(part) if part.is_text_html() => as_text(part),
+    let html_part = message.html_body().find(is_html);
+    match message.text_body().find(MessagePart::is_text) {
+        Some(part) if is_html(&part) => as_text(part),
         Some(part) => {
             let text = as_text(part);
             // A plain-text alternative such as "View this email in HTML"
@@ -759,14 +499,35 @@ fn payment_tier(label: &str) -> u8 {
 /// "ending in 1234", or "XXXX1234".
 static CARD_DIGITS: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?i)(?:\bending(?: in| with)?\s*|\bends (?:in|with)\s*|[x*•]{2,}[ -]?)([0-9]{3,4})\b",
+        r"(?i)(?:\bending(?: in| with)?\s*|\bends (?:in|with)\s*|[x*•]{2,}[ -]?)(?P<tail>[0-9]{3,4})\b|\b(?:account|acct|a/c|card)(?: (?:no\.?|num\.?|number))?[ \t]*[:#.]?[ \t]*(?:[x*•]+[ -]?)?(?P<number>[0-9]{3,19})\b",
     )
     .unwrap()
 });
 
+/// The card and account numbers `text` cites, as in "ending 1234",
+/// "XXXX1234", "Account number: 123456789", or "Card: 1234".
+fn cited_numbers(text: &str) -> Vec<&str> {
+    CARD_DIGITS
+        .captures_iter(text)
+        .filter_map(|caps| caps.name("tail").or(caps.name("number")))
+        .map(|number| number.as_str())
+        .collect()
+}
+
+/// Whether an account name has a numeric part that matches a cited number,
+/// where either may be the other's ending: "Citi-1234" matches "ending 1234"
+/// and "Account number: 99881234", but "Visa-91234567" does not match "1234".
+fn names_number(name: &str, number: &str) -> bool {
+    name.split([':', '-']).any(|part| {
+        part.len() >= 3
+            && part.bytes().all(|b| b.is_ascii_digit())
+            && (part.ends_with(number) || number.ends_with(part))
+    })
+}
+
 const MONTH: &str = r"(?P<month>(?i:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-zA-Z]*)\.?";
 
-static DATES: LazyLock<[Regex; 4]> = LazyLock::new(|| {
+static DATES: LazyLock<[Regex; 5]> = LazyLock::new(|| {
     [
         // Also the date of an ISO timestamp such as 2026-11-23T23:58:00+08:00.
         // Year first, as in 2026-11-23, 2026/11/23, or 2026-11-23T23:58.
@@ -782,6 +543,12 @@ static DATES: LazyLock<[Regex; 4]> = LazyLock::new(|| {
         .unwrap(),
         Regex::new(
             r"\b(?P<a>[0-9]{1,2})(?P<s1>[/.-])(?P<b>[0-9]{1,2})(?P<s2>[/.-])(?P<year>[0-9]{4}|[0-9]{2})\b",
+        )
+        .unwrap(),
+        // A yearless "11/24" right after a date label, so fractions and
+        // ratios elsewhere are not read as dates.
+        Regex::new(
+            r"(?i)\b(?:date|dated|on)\b[ \t]*:?[ \t]*(?P<a>[0-9]{1,2})/(?P<b>[0-9]{1,2})\b",
         )
         .unwrap(),
     ]
@@ -836,7 +603,13 @@ pub fn dates(text: &str, anchor: NaiveDate) -> Vec<(NaiveDate, String)> {
                         continue;
                     };
                     // "11-23/2026" is not a date.
-                    if caps["s1"] != caps["s2"] {
+                    if let (Some(s1), Some(s2)) = (caps.name("s1"), caps.name("s2"))
+                        && s1.as_str() != s2.as_str()
+                    {
+                        continue;
+                    }
+                    // The yearless form must not be the start of a full date.
+                    if caps.name("s1").is_none() && text[whole.end()..].starts_with('/') {
                         continue;
                     }
                     vec![(year, b, a), (year, a, b)]
@@ -1013,17 +786,11 @@ pub async fn extract(
     // email cites a number, such as "ending 5678", that no account name ends
     // with, the model may answer "none". Unnumbered accounts stay on offer,
     // so "Liabilities:Amex" can still match an Amex alert by name.
-    let cited: Vec<&str> = CARD_DIGITS
-        .captures_iter(&text)
-        .map(|caps| caps.get(1).unwrap().as_str())
-        .collect();
+    let cited = cited_numbers(&text);
     // Any unmatched number counts: a transfer can cite both accounts.
-    let offer_none = cited.iter().any(|number| {
-        !sources.keys().any(|name| {
-            name.split([':', '-'])
-                .any(|part| part.bytes().all(|b| b.is_ascii_digit()) && part.ends_with(number))
-        })
-    });
+    let offer_none = cited
+        .iter()
+        .any(|number| !sources.keys().any(|name| names_number(name, number)));
     // Offer each kind the ledger lacks, so the first alert for a new credit
     // card is not booked to the only bank account.
     for (name, text) in DEFAULT_SOURCES {
@@ -1336,19 +1103,11 @@ fn limit(
     if options.len() <= MAX_CHOICES {
         return options;
     }
-    let cited: Vec<&str> = CARD_DIGITS
-        .captures_iter(text)
-        .map(|caps| caps.get(1).unwrap().as_str())
-        .collect();
+    let cited = cited_numbers(text);
     let text = text.to_lowercase();
     // A numeric part ending in a cited card number is the strongest match,
     // then any name part that appears in the email.
-    let card = |name: &str| {
-        name.split([':', '-']).any(|part| {
-            part.bytes().all(|b| b.is_ascii_digit())
-                && cited.iter().any(|number| part.ends_with(number))
-        })
-    };
+    let card = |name: &str| cited.iter().any(|number| names_number(name, number));
     let mentioned = |name: &str| {
         name.split([':', '-'])
             .skip(1)
@@ -1493,6 +1252,16 @@ Available balance: SGD 1,204.33.\r\n";
         .map(|(date, _)| date.to_string())
         .collect();
         assert_eq!(found, ["2026-11-23"]);
+        // A yearless numeric date after a label, but not a bare fraction.
+        let anchor_25 = date("2026-11-25");
+        let found: Vec<_> = dates("Transaction date: 11/24", anchor_25)
+            .into_iter()
+            .map(|(date, _)| date.to_string())
+            .collect();
+        assert!(found.contains(&"2026-11-24".to_string()), "{found:?}");
+        assert!(dates("Add 1/2 cup and 3/4 spoon", anchor_25).is_empty());
+        // One full date; the yearless pattern does not add a second reading.
+        assert_eq!(dates("Paid on 11/24/2026", anchor_25).len(), 1);
         // Year-first slash dates count, even when forwarded in a later month.
         assert_eq!(
             dates("Receipt date: 2026/11/23", date("2026-12-01"))[0].0,
@@ -1665,7 +1434,7 @@ Content-Type: multipart/alternative; boundary=b\r\n\r\n--b\r\nContent-Type: text
     #[test]
     fn deeply_nested_messages_do_not_overflow_the_stack() {
         // Test threads have 2 MiB stacks, so recursion this deep would abort.
-        // Each message must parse or fail cleanly, not crash the process.
+        // Each malformed message must parse or fail quickly and cleanly.
         let nested = "Content-Type: message/rfc822\r\n\r\n".repeat(75_000)
             + "Subject: x\r\n\r\nSGD 1.00\r\n";
         let _ = parse(nested.as_bytes());
@@ -1696,32 +1465,32 @@ Content-Type: multipart/alternative; boundary=b\r\n\r\n--b\r\nContent-Type: text
         );
         let _ = parse(other.as_bytes());
 
-        // Many multipart parts whose boundaries never appear are refused
-        // instead of rescanning the message for each.
+        // Many multipart parts whose boundaries never appear.
         let siblings =
             "--a\r\nContent-Type: multipart/mixed; boundary=zz\r\n\r\nx\r\n".repeat(40_000);
         let slow = format!("Content-Type: multipart/mixed; boundary=a\r\n\r\n{siblings}--a--\r\n");
         let started = std::time::Instant::now();
-        assert!(parse(slow.as_bytes()).is_err());
+        let _ = parse(slow.as_bytes());
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
 
-        // Overlong or unterminated boundaries and long continuation chains
-        // are refused before the parser's quadratic paths can run.
+        // Overlong or unterminated boundaries and long continuation chains.
         let long = "-".repeat(100_000);
         let dashes = "-".repeat(2_000_000);
         let overlong =
             format!("Content-Type: multipart/mixed; boundary=\"{long}\"\r\n\r\n{dashes}\r\n");
         let started = std::time::Instant::now();
-        assert!(parse(overlong.as_bytes()).is_err());
+        let _ = parse(overlong.as_bytes());
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
         let unterminated = format!(
             "Content-Type: multipart/mixed; boundary=\"{}\r\n\r\nx\r\n",
             "a".repeat(300)
         );
-        assert!(parse(unterminated.as_bytes()).is_err());
+        let started = std::time::Instant::now();
+        let _ = parse(unterminated.as_bytes());
         let segments: String = (0..1000).map(|i| format!("; name*{i}=\"x\"")).collect();
         let continued = format!("Content-Type: text/plain{segments}\r\n\r\nSGD 1.00\r\n");
-        assert!(parse(continued.as_bytes()).is_err());
+        let _ = parse(continued.as_bytes());
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
         // CSS attribute selectors in an HTML body are not continuations.
         let css = "td[style*=\"x\"]{color:red}".repeat(100);
         let styled = format!(
@@ -1776,6 +1545,20 @@ Content-Transfer-Encoding: base64\r\n\r\n{}",
         assert_eq!(strip_forward_prefix(&subject), "");
         let cjk = "交".repeat(180);
         assert_eq!(truncate_bytes(&cjk, 512).len(), 510);
+    }
+
+    #[test]
+    fn reads_cited_card_and_account_numbers() {
+        assert_eq!(
+            cited_numbers(
+                "Account number: 123456789. Card: 1234. A/C xxxx5678. Card ending 9999. Balance SGD 5."
+            ),
+            ["123456789", "1234", "5678", "9999"]
+        );
+        assert!(names_number("Assets:Checking-6789", "123456789"));
+        assert!(names_number("Liabilities:Citi-1234", "1234"));
+        assert!(!names_number("Liabilities:Visa-91234567", "1234"));
+        assert!(!names_number("Assets:Checking", "1234"));
     }
 
     #[test]
