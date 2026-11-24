@@ -119,7 +119,10 @@ fn body_text(message: &Message) -> String {
             // A plain-text alternative such as "View this email in HTML"
             // carries no amount; read the HTML alternative instead.
             match message.html_part(0) {
-                Some(part) if part.is_text_html() && amounts(&clean(&text)).is_empty() => {
+                Some(part)
+                    if part.is_text_html()
+                        && amounts(truncate(&clean(&text), MAX_TEXT)).is_empty() =>
+                {
                     html(part)
                 }
                 _ => text,
@@ -220,8 +223,10 @@ const NUMBER: &str = r"[0-9]{1,3}(?:,[0-9]{3})+(?:\.[0-9]{1,2})?|[0-9]+(?:\.[0-9
 static CODE_BEFORE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(&format!(r"\b({CODES}) ?$")).unwrap());
 
+/// A code right after an amount, bare or alone in parentheses as in "(USD)".
+/// "(USD 18.50)" is a second amount, not an annotation.
 static CODE_AFTER: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(&format!(r"^ ?\(?({CODES})\b")).unwrap());
+    LazyLock::new(|| Regex::new(&format!(r"^ ?(?:\(({CODES})\)|({CODES})\b)")).unwrap());
 
 const SYMBOLS: &str = r"US\$|CA\$|AU\$|S\$|A\$|C\$|HK\$|NZ\$|\$|€|£|¥|₹";
 
@@ -332,7 +337,7 @@ pub fn amounts(text: &str) -> Vec<(Money, String)> {
         let trailing_code = caps.name("symbol").and(
             CODE_AFTER
                 .captures(after)
-                .map(|caps| caps.get(1).unwrap().as_str()),
+                .map(|caps| caps.get(1).or(caps.get(2)).unwrap().as_str()),
         );
         // Codes on both sides that disagree, as in "CAD $25.00 USD", are ambiguous.
         if let (Some(a), Some(b)) = (leading_code, trailing_code)
@@ -1276,8 +1281,39 @@ Available balance: SGD 1,204.33.\r\n";
         assert_eq!(currencies, ["CAD", "CAD", "CNY", "AUD", "CAD", "HKD"]);
         let found = amounts("Purchase amount: $25.00 (USD). Settled amount: SGD 33.50");
         assert_eq!(found[0].0.currency.as_deref(), Some("USD"));
+        // A parenthesised second amount is not an annotation of the first.
+        let found: Vec<_> = amounts("Charged: SGD $25.00 (USD 18.50)")
+            .into_iter()
+            .map(|(money, _)| (money.number, money.currency.unwrap()))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                ("25.00".into(), "SGD".into()),
+                ("18.50".into(), "USD".into())
+            ]
+        );
         // Arabic-Indic digits are not dates and must not panic.
         assert!(dates("٢٣/١١/٢٠٢٦ ٢٠٢٦-١١-٢٣ ٢٣ Nov", date("2026-11-24")).is_empty());
+    }
+
+    #[test]
+    fn bounds_work_on_a_huge_plain_text_alternative() {
+        // Hundreds of thousands of distinct amounts must not be scanned in full.
+        let lines: String = (0..300_000).map(|i| format!("${i}.00\r\n")).collect();
+        let raw = format!(
+            "Message-ID: <big@x.example>\r\nMIME-Version: 1.0\r\n\
+Content-Type: multipart/alternative; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain\r\n\r\n\
+{lines}--b\r\nContent-Type: text/html\r\n\r\n<p>SGD 1.00</p>\r\n--b--\r\n"
+        );
+        let started = std::time::Instant::now();
+        let email = parse(raw.as_bytes()).unwrap();
+        assert!(email.body.chars().count() <= MAX_TEXT);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
