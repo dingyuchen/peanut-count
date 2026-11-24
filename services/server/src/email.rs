@@ -196,9 +196,12 @@ pub struct Money {
 const CODES: &str = "USD|SGD|EUR|GBP|JPY|AUD|CAD|HKD|NZD|CHF|CNY|RMB|MYR|INR|IDR|THB|PHP|KRW|TWD|VND|SEK|NOK|DKK|MXN|BRL|ZAR|AED";
 const NUMBER: &str = r"[0-9]{1,3}(?:,[0-9]{3})+(?:\.[0-9]{1,2})?|[0-9]+(?:\.[0-9]{1,2})?";
 
+static CODE_AFTER: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(&format!(r"^\s?({CODES})\b")).unwrap());
+
 static AMOUNT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(
-        r"(?:(?P<symbol>US\$|S\$|A\$|C\$|HK\$|NZ\$|\$|€|£|¥|₹)|\b(?P<code>{CODES}))\s?-?(?P<number>{NUMBER})|\b(?P<number2>{NUMBER})\s?(?P<code2>{CODES})\b"
+        r"(?:(?P<symbol>US\$|CA\$|AU\$|S\$|A\$|C\$|HK\$|NZ\$|\$|€|£|¥|₹)|\b(?P<code>{CODES}))\s?-?(?P<number>{NUMBER})|\b(?P<number2>{NUMBER})\s?(?P<code2>{CODES})\b"
     ))
     .unwrap()
 });
@@ -221,7 +224,7 @@ pub fn amounts(text: &str) -> Vec<(Money, String)> {
         let separator = |c: Option<char>| {
             matches!(
                 c,
-                Some(',' | '.' | ' ' | '\'' | '\u{a0}' | '\u{202f}' | '\u{2009}')
+                Some(',' | '.' | ' ' | '\'' | '’' | '\u{a0}' | '\u{202f}' | '\u{2009}')
             )
         };
         if digit(next)
@@ -239,8 +242,22 @@ pub fn amounts(text: &str) -> Vec<(Money, String)> {
         if number.len() > 18 || !number.bytes().any(|b| matches!(b, b'1'..=b'9')) {
             continue;
         }
+        // A symbol glued to letters, such as the "$" in "R$" or "NT$", names
+        // a currency this parser does not know.
+        if let Some(symbol) = caps.name("symbol")
+            && text[..symbol.start()].ends_with(|c: char| c.is_alphabetic())
+        {
+            continue;
+        }
+        // An ISO code right after a "$" or "¥" amount, as in "$25.00 CAD", decides the currency.
+        let trailing_code = CODE_AFTER
+            .captures(after)
+            .map(|caps| caps.get(1).unwrap().as_str());
         let currency = match caps.name("symbol").map(|m| m.as_str()) {
+            Some("$" | "¥") if trailing_code.is_some() => trailing_code,
             Some("US$") => Some("USD"),
+            Some("CA$") => Some("CAD"),
+            Some("AU$") => Some("AUD"),
             Some("S$") => Some("SGD"),
             Some("A$") => Some("AUD"),
             Some("C$") => Some("CAD"),
@@ -258,7 +275,8 @@ pub fn amounts(text: &str) -> Vec<(Money, String)> {
                     "RMB" => "CNY",
                     code => code,
                 }),
-        };
+        }
+        .map(|code| if code == "RMB" { "CNY" } else { code });
         let money = Money {
             number,
             currency: currency.map(str::to_owned),
@@ -536,9 +554,7 @@ pub async fn extract(
                 .or_insert_with(|| text.to_owned());
         }
     }
-    // Decision APIs accept at most 255 options per question.
-    counters = counters.into_iter().take(250).collect();
-    sources = sources.into_iter().take(250).collect();
+    let sources = limit(sources, &text, |_| 1);
 
     let indexed = |items: Vec<String>| -> Map<String, Value> {
         items
@@ -622,7 +638,7 @@ pub async fn extract(
         }
     }
     let outgoing = choice(&answers, "direction", &["out", "in"])? == "out";
-    let (money, _) = &amounts[index(&answers, "amount", amounts.len())?];
+    let amount_order = ranked(&answers, "amount", amounts.len())?;
     let (date, _) = dates[index(&answers, "date", dates.len())?];
     let payee = if payees.is_empty() {
         None
@@ -640,32 +656,29 @@ pub async fn extract(
     let find = |name: &str| accounts.iter().find(|account| account.name == name);
     // Accounts created on import accept any currency.
     let accepts = |name: &str, currency: &str| find(name).is_none_or(|a| a.accepts(currency));
-    // Take the most likely source that accepts the amount's currency.
     let source = if sources.len() == 1 {
         sources.keys().next().unwrap().clone()
     } else {
         let keys: Vec<&str> = sources.keys().map(String::as_str).collect();
-        let chosen = choice(&answers, "account", &keys)?;
-        let mut ranked: Vec<(&str, f64)> = match answers.get("account") {
-            Some(Answer::Choice { probabilities, .. }) => probabilities
-                .iter()
-                .filter(|(name, _)| sources.contains_key(*name))
-                .map(|(name, p)| (name.as_str(), *p))
-                .collect(),
-            _ => Vec::new(),
-        };
-        ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
-        std::iter::once(chosen)
-            .chain(ranked.into_iter().map(|(name, _)| name))
-            .find(|name| money.currency.as_deref().is_none_or(|c| accepts(name, c)))
-            .ok_or_else(|| {
-                rejected(format!(
-                    "No likely account accepts {}.",
-                    money.currency.as_deref().unwrap_or("this currency")
-                ))
-            })?
-            .to_owned()
+        choice(&answers, "account", &keys)?.to_owned()
     };
+    // Keep the account the email identifies. If the chosen amount is in a
+    // currency it cannot hold, such as a foreign purchase price next to the
+    // settled amount, take the most likely amount it can hold.
+    let (money, _) = amount_order
+        .iter()
+        .map(|&i| &amounts[i])
+        .find(|(money, _)| {
+            money
+                .currency
+                .as_deref()
+                .is_none_or(|c| accepts(&source, c))
+        })
+        .ok_or_else(|| {
+            rejected(format!(
+                "{source} does not accept the currency of any amount in the email."
+            ))
+        })?;
     let currency = money.currency.clone().unwrap_or_else(|| {
         let account = find(&source).cloned().unwrap_or_default();
         match (&account.declared[..], &account.posted[..]) {
@@ -681,6 +694,15 @@ pub async fn extract(
     // pick the source account the email names, which crowds out categories.
     counters.remove(&source);
     counters.retain(|name, _| accepts(name, &currency));
+    let counters = limit(counters, &text, |name| {
+        let root = name.split(':').next().unwrap_or_default();
+        match (root, outgoing) {
+            ("Expenses", true) | ("Income", false) => 1,
+            ("Expenses", false) => 2,
+            ("Income", true) => 4,
+            _ => 3,
+        }
+    });
     let instructions = if outgoing {
         "Money left the user's account in `email`. Which account best describes what it was spent on, or which of the user's own accounts received it?"
     } else {
@@ -747,6 +769,34 @@ pub async fn extract(
     })
 }
 
+/// Options some decision backends accept per question; llama.cpp allows 52 for OpenJev.
+const MAX_CHOICES: usize = 50;
+
+/// Keeps at most [`MAX_CHOICES`] options: the Uncategorized fallbacks, then
+/// accounts whose name parts appear in `text`, then by `rank`, then by name.
+fn limit(
+    options: BTreeMap<String, String>,
+    text: &str,
+    rank: impl Fn(&str) -> u8,
+) -> BTreeMap<String, String> {
+    if options.len() <= MAX_CHOICES {
+        return options;
+    }
+    let text = text.to_lowercase();
+    let mentioned = |name: &str| {
+        name.split([':', '-'])
+            .skip(1)
+            .any(|part| part.len() >= 3 && text.contains(&part.to_lowercase()))
+    };
+    let mut ordered: Vec<_> = options.into_iter().collect();
+    ordered.sort_by_key(|(name, _)| {
+        let fallback = name.ends_with(":Uncategorized");
+        (!fallback, !mentioned(name), rank(name))
+    });
+    ordered.truncate(MAX_CHOICES);
+    ordered.into_iter().collect()
+}
+
 fn choice<'a>(answers: &'a Answers, name: &str, keys: &[&str]) -> Result<&'a str, Failure> {
     match answers.get(name) {
         Some(Answer::Choice { choice, .. }) if keys.contains(&choice.as_str()) => Ok(choice),
@@ -757,6 +807,24 @@ fn choice<'a>(answers: &'a Answers, name: &str, keys: &[&str]) -> Result<&'a str
             "decision model gave no valid `{name}` answer"
         ))),
     }
+}
+
+/// Zero-based indexes for a question offered with keys "1"..="len", most
+/// likely first, starting with the model's choice. `[0]` when it was not asked.
+fn ranked(answers: &Answers, name: &str, len: usize) -> Result<Vec<usize>, Failure> {
+    let first = index(answers, name, len)?;
+    let mut rest: Vec<(usize, f64)> = match answers.get(name) {
+        Some(Answer::Choice { probabilities, .. }) => probabilities
+            .iter()
+            .filter_map(|(key, p)| Some((key.parse::<usize>().ok()?.checked_sub(1)?, *p)))
+            .filter(|&(i, _)| i < len && i != first)
+            .collect(),
+        _ => Vec::new(),
+    };
+    rest.sort_by(|a, b| b.1.total_cmp(&a.1));
+    Ok(std::iter::once(first)
+        .chain(rest.into_iter().map(|(i, _)| i))
+        .collect())
 }
 
 /// Zero-based index for a question offered with keys "1"..="len", or 0 when it was not asked.
@@ -876,6 +944,12 @@ Available balance: SGD 1,204.33.\r\n";
         assert!(amounts("€12,34 and 1.234,56 EUR and S$12.505").is_empty());
         assert!(amounts("EUR 1 234.56 and 1\u{202f}234 USD and CHF 1'234.50").is_empty());
         assert_eq!(amounts("SGD 12 on 3 Nov").len(), 1);
+        assert!(amounts("€1’234.56 and R$10 and NT$300").is_empty());
+        let currencies: Vec<_> = amounts("CA$25.00, $26.00 CAD, ¥300 RMB, AU$4")
+            .into_iter()
+            .map(|(money, _)| money.currency.unwrap())
+            .collect();
+        assert_eq!(currencies, ["CAD", "CAD", "CNY", "AUD"]);
         // Arabic-Indic digits are not dates and must not panic.
         assert!(dates("٢٣/١١/٢٠٢٦ ٢٠٢٦-١١-٢٣ ٢٣ Nov", date("2026-11-24")).is_empty());
     }
@@ -1017,12 +1091,11 @@ Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain
             !options.contains_key("Expenses:Dining") && options.contains_key("Expenses:Groceries")
         );
 
-        // A source that cannot hold the currency yields to the next likely one,
-        // and categories restricted to other currencies are not offered.
+        // The identified account is kept: when no amount fits its currency,
+        // the email is rejected rather than posted to some other account.
         let restricted = vec![
             account("Assets:USD-Wallet", &["USD"], &[]),
             account("Liabilities:DBS-Card-1234", &[], &[]),
-            account("Expenses:Dining", &["USD"], &[]),
         ];
         let mut prefers_usd = answers.clone();
         prefers_usd.insert(
@@ -1035,24 +1108,8 @@ Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain
                 ],
             ),
         );
-        prefers_usd.insert(
-            "category".into(),
-            choice("Expenses:Groceries", &[("Expenses:Groceries", 0.9)]),
-        );
-        let model = fixed(prefers_usd);
-        let statement = extract(&email, &restricted, &[], "USD", &model)
-            .await
-            .unwrap();
-        assert_eq!(
-            (statement.source.as_str(), statement.currency.as_str()),
-            ("Liabilities:DBS-Card-1234", "SGD")
-        );
-        let calls = model.calls.into_inner().unwrap();
-        assert!(
-            calls[1]["category"]["criteria"]
-                .get("Expenses:Dining")
-                .is_none()
-        );
+        let result = extract(&email, &restricted, &[], "USD", &fixed(prefers_usd)).await;
+        assert!(matches!(result, Err(Failure::Rejected(_))));
 
         let mut promo = answers;
         promo.insert("transaction".into(), Answer::Noul { noul: 0.1 });
@@ -1060,6 +1117,81 @@ Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain
             extract(&email, &accounts, &[], "USD", &fixed(promo)).await,
             Err(Failure::Rejected(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn foreign_purchase_posts_the_settled_amount_to_the_named_card() {
+        let mut email = parse(ALERT.as_bytes()).unwrap();
+        email.body =
+            "Your card ending 1234 was charged EUR 50.00 (SGD 75.30) at CAFE DE FLORE on 23 Nov 2026."
+                .into();
+        let accounts = vec![
+            account("Liabilities:DBS-Card-1234", &["SGD"], &[]),
+            account("Assets:Euro-Wallet", &["EUR"], &[]),
+            account("Expenses:Dining", &["USD"], &[]),
+        ];
+        let answers = Answers::from([
+            ("transaction".into(), Answer::Noul { noul: 0.95 }),
+            ("direction".into(), choice("out", &[])),
+            // The model picks the purchase price, which the SGD card cannot hold.
+            ("amount".into(), choice("1", &[("1", 0.6), ("2", 0.4)])),
+            ("date".into(), choice("1", &[])),
+            ("payee".into(), choice("1", &[])),
+            (
+                "account".into(),
+                choice(
+                    "Liabilities:DBS-Card-1234",
+                    &[
+                        ("Liabilities:DBS-Card-1234", 0.8),
+                        ("Assets:Euro-Wallet", 0.2),
+                    ],
+                ),
+            ),
+            (
+                "category".into(),
+                choice("Expenses:Groceries", &[("Expenses:Groceries", 0.6)]),
+            ),
+        ]);
+        let model = fixed(answers);
+        let statement = extract(&email, &accounts, &[], "USD", &model)
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                statement.source.as_str(),
+                statement.currency.as_str(),
+                statement.rows[0].amount.as_str()
+            ),
+            ("Liabilities:DBS-Card-1234", "SGD", "-75.30")
+        );
+        // Categories restricted to another currency are not offered.
+        let calls = model.calls.into_inner().unwrap();
+        assert!(
+            calls[1]["category"]["criteria"]
+                .get("Expenses:Dining")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn limits_options_and_keeps_fallbacks_and_mentions() {
+        let options: BTreeMap<String, String> = (0..80)
+            .map(|i| (format!("Expenses:Shop{i:02}"), String::new()))
+            .chain([
+                ("Expenses:Uncategorized".into(), String::new()),
+                ("Income:Salary".into(), String::new()),
+                ("Expenses:Zeta-Bakery".into(), String::new()),
+            ])
+            .collect();
+        let kept = limit(options, "Paid at BAKERY", |name| {
+            if name.starts_with("Income:") { 4 } else { 1 }
+        });
+        assert_eq!(kept.len(), MAX_CHOICES);
+        assert!(
+            kept.contains_key("Expenses:Uncategorized")
+                && kept.contains_key("Expenses:Zeta-Bakery")
+        );
+        assert!(!kept.contains_key("Income:Salary"));
     }
 
     #[tokio::test]

@@ -267,16 +267,19 @@ in.example.com  peanut:
 Also add the domain to `relay_domains` so that Postfix accepts its mail, and
 run `postmap /etc/postfix/transport`.
 
-The wrapper exports the variables above, defers anything but one recipient,
-and runs the import. The `peanut` user needs write access to the data directory.
+The wrapper exports the variables above and runs the import. It defers
+delivery, with exit 75, when it gets anything but one recipient or cannot read
+its settings, so Postfix keeps the message. The `peanut` user needs read access
+to the settings file and write access to the data directory.
 
 ```sh
 #!/bin/sh
-[ "$#" -eq 1 ] || exit 75
+env=/etc/peanut/inbound.env
+[ "$#" -eq 1 ] && [ -r "$env" ] || exit 75
 set -a
-. /etc/peanut/inbound.env
+. "$env" || exit 75
 set +a
-exec peanut-count ingest-email --data /srv/peanut/mobile-data --recipient "$1"
+exec /usr/local/bin/peanut-count ingest-email --data /srv/peanut/mobile-data --recipient "$1"
 ```
 
 Duplicates are detected by the original message's Message-ID. A relay retry
@@ -284,7 +287,8 @@ or a re-forward of the same email as an attachment is recorded once.
 Forwarding it inline twice creates a new message, which is recorded twice.
 Amounts need a currency symbol or ISO code and a dot decimal separator.
 Amounts grouped with spaces or apostrophes, or written with a decimal comma,
-are skipped. An
+are skipped. Each question offers the model at most 50 options. In a larger
+ledger, accounts named in the email and accounts of the expected kind come first. An
 email that reports several transactions is recorded as one of them.
 
 ### Local decision model with LM Studio

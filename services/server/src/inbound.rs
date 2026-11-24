@@ -134,7 +134,13 @@ pub async fn ingest(
         if store.has_statement(&email.id).map_err(Unavailable)? {
             return Ok((user, email, None));
         }
-        let ledger = store.snapshot().map_err(Unavailable)?.ledger;
+        let snapshot = store.snapshot().map_err(Unavailable)?;
+        // Conflicting entries are left out of the snapshot, so accounts they
+        // open would be missing. Wait until the operator resolves them.
+        if snapshot.pending.iter().any(|item| item.conflict.is_some()) {
+            return Err(Unavailable(crate::store::LedgerBlocked.into()));
+        }
+        let ledger = snapshot.ledger;
         Ok((
             user,
             email,
