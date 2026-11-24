@@ -275,7 +275,7 @@ static SPLIT_PREFIX: LazyLock<Regex> = LazyLock::new(|| {
 });
 static SPLIT_SUFFIX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(
-        r"(?m)^((?:(?:{SYMBOLS}) ?)?(?:[-−+] ?)?[0-9][0-9,.]*)\n+((?:{CODES})$)"
+        r"(?m)^((?:[-−+] ?)?(?:(?:{SYMBOLS}) ?)?(?:[-−+] ?)?[0-9][0-9,.]*)\n+((?:{CODES})$)"
     ))
     .unwrap()
 });
@@ -526,14 +526,19 @@ fn cited_numbers(text: &str) -> Vec<String> {
                 .or(caps.name("number"))
                 .or(caps.name("below"))
         })
-        // The integer part of an amount, such as the "100" of "100.00 USD",
-        // is not an account number.
-        .filter(|number| {
+        .filter_map(|number| {
+            // The integer part of an amount, such as the "100" of "100.00 USD"
+            // or the "1000" of "Card: 5678 1000.00", is not part of the number.
             let after = text[number.end()..].as_bytes();
-            !(matches!(after.first(), Some(b'.' | b','))
-                && after.get(1).is_some_and(u8::is_ascii_digit))
+            let into_amount = matches!(after.first(), Some(b'.' | b','))
+                && after.get(1).is_some_and(u8::is_ascii_digit);
+            let digits = if into_amount {
+                &number.as_str()[..number.as_str().rfind([' ', '-'])?]
+            } else {
+                number.as_str()
+            };
+            Some(digits.replace([' ', '-'], ""))
         })
-        .map(|number| number.as_str().replace([' ', '-'], ""))
         .collect()
 }
 
@@ -582,7 +587,7 @@ static DATES: LazyLock<[Regex; 5]> = LazyLock::new(|| {
         // A yearless "11/24" right after a date label, or on the next line,
         // so fractions and ratios elsewhere are not read as dates.
         Regex::new(
-            r"(?i)(?:\b(?:date|dated)\b[ \t]*:?[ \t]*(?:\r?\n[ \t]*){0,2}|\bon[ \t]+)(?P<a>[0-9]{1,2})/(?P<b>[0-9]{1,2})\b",
+            r"(?i)(?:\b(?:date|dated)\b[ \t]*:?[ \t]*(?:\r?\n[ \t]*){0,2}|\bon\b[ \t]*:?[ \t]*)(?P<a>[0-9]{1,2})/(?P<b>[0-9]{1,2})\b",
         )
         .unwrap(),
     ]
@@ -1296,6 +1301,12 @@ Available balance: SGD 1,204.33.\r\n";
             .collect();
         assert!(found.contains(&"2026-11-24".to_string()), "{found:?}");
         assert!(dates("Add 1/2 cup and 3/4 spoon", anchor_25).is_empty());
+        let labelled: Vec<_> = dates("Purchased on: 11/24", anchor_25)
+            .into_iter()
+            .map(|(date, _)| date.to_string())
+            .collect();
+        assert!(labelled.contains(&"2026-11-24".to_string()), "{labelled:?}");
+        assert!(dates("Paid on\n1/2", anchor_25).is_empty());
         let next_line: Vec<_> = dates("Transaction date:\n11/24", anchor_25)
             .into_iter()
             .map(|(date, _)| date.to_string())
@@ -1344,7 +1355,7 @@ Available balance: SGD 1,204.33.\r\n";
             .collect();
         assert_eq!(found, ["100.00", "1400.00"], "{split:?}");
         // A code split from a symbol amount keeps its currency.
-        for split in ["USD\n\n+$100.00", "USD\n$100.00"] {
+        for split in ["USD\n\n+$100.00", "USD\n$100.00", "+$100.00\nUSD"] {
             let found = amounts(&join_split_amounts(split));
             assert_eq!(found.len(), 1, "{split:?}");
             assert_eq!(found[0].0.currency.as_deref(), Some("USD"), "{split:?}");
@@ -1645,6 +1656,7 @@ Content-Transfer-Encoding: base64\r\n\r\n{}",
         // amount's integer part is never a card number.
         assert!(cited_numbers("Credit to your card\n\n100.00 USD").is_empty());
         assert!(cited_numbers("Card: 100.00 USD").is_empty());
+        assert_eq!(cited_numbers("Card: 5678 1000.00 USD"), ["5678"]);
         assert_eq!(cited_numbers("Card:\n5678"), ["5678"]);
         // Grouped account names compare as one number.
         let grouped = "Assets:Checking-123-45678-9012";
