@@ -278,13 +278,13 @@ static NEXT_AMOUNT: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 /// Whether text right after a number continues it as part of a date, time,
-/// or longer number, as in the "/23/2026" of "11/23/2026" or the ":15" of
-/// "10:15".
+/// or longer number, as in the "/23/2026" of "11/23/2026", the ".2026" of
+/// "23.11.2026", or the ":15" of "10:15".
 fn continues_number(after: &str) -> bool {
     let mut chars = after.chars();
     match chars.next() {
         Some(c) if c.is_ascii_digit() => true,
-        Some('/' | ':' | '-') => chars.next().is_some_and(|c| c.is_ascii_digit()),
+        Some('/' | ':' | '-' | '.' | ',') => chars.next().is_some_and(|c| c.is_ascii_digit()),
         _ => false,
     }
 }
@@ -677,15 +677,15 @@ pub fn dates(text: &str, anchor: NaiveDate) -> Vec<(NaiveDate, String)> {
         for caps in pattern.captures_iter(text) {
             let whole = caps.get(0).unwrap();
             let number = |name| caps.name(name).and_then(|m| m.as_str().parse::<u32>().ok());
-            // A two-digit "year" that runs on is an hour or an amount, as in
-            // "23 Nov 10:15" or "23 Nov 25.00 SGD", so the date stays yearless.
+            // A "year" that runs on is an hour or an amount, as in "23 Nov
+            // 10:15", "23 Nov 25.00 SGD", or "23 Nov 1250.00 SGD", so the date
+            // stays yearless.
             let year = number("year")
                 .filter(|_| {
                     caps.name("year").is_none_or(|year| {
                         let rest = text[year.end()..].as_bytes();
-                        year.len() == 4
-                            || !(matches!(rest.first(), Some(b':' | b'.' | b','))
-                                && rest.get(1).is_some_and(u8::is_ascii_digit))
+                        !(matches!(rest.first(), Some(b':' | b'.' | b','))
+                            && rest.get(1).is_some_and(u8::is_ascii_digit))
                     })
                 })
                 .map(|year| if year < 100 { year + 2000 } else { year });
@@ -1404,6 +1404,7 @@ Available balance: SGD 1,204.33.\r\n";
         assert_eq!(dates("Nov 3, 25", anchor)[0].0, date("2025-11-03"));
         assert_eq!(dates("on 23 Nov 10:15", anchor)[0].0, date("2026-11-23"));
         assert_eq!(dates("23 Nov 25.00 SGD", anchor)[0].0, date("2026-11-23"));
+        assert_eq!(dates("23 Nov 1250.00 SGD", anchor)[0].0, date("2026-11-23"));
         // A yearless date after the anchor belongs to the previous year.
         assert_eq!(dates("on 30 Dec", anchor)[0].0, date("2025-12-30"));
     }
@@ -1436,6 +1437,11 @@ Available balance: SGD 1,204.33.\r\n";
             assert_eq!(found[0].0.currency.as_deref(), Some("USD"), "{split:?}");
         }
         // A code before a date annotates the amount; a date is not an amount.
+        for dotted in ["Total $25.00 CAD 23.11.2026", "Total $25.00 CAD 23-11-2026"] {
+            let found = amounts(dotted);
+            assert_eq!(found.len(), 1, "{dotted}");
+            assert_eq!(found[0].0.currency.as_deref(), Some("CAD"), "{dotted}");
+        }
         let found: Vec<_> = amounts("Total $25.00 CAD 11/23/2026")
             .into_iter()
             .map(|(m, _)| (m.number, m.currency.unwrap()))
