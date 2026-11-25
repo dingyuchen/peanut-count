@@ -218,7 +218,13 @@ fn truncate(text: &str, chars: usize) -> &str {
 /// apostrophes, with an optional decimal fraction, or a bare fraction such as
 /// ".50".
 static WRITTEN_NUMBER: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"[0-9]{1,3}(?:[,'’][0-9]{3})+(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?|\.[0-9]+").unwrap()
+    Regex::new(concat!(
+        r"[0-9]{1,3}(?:[,'’][0-9]{3})+(?:\.[0-9]+)?",
+        // A decimal comma: "1.234,56", or two digits after it, as in "12,50".
+        r"|[0-9]{1,3}(?:\.[0-9]{3})+,[0-9]{1,2}|[0-9]+,[0-9]{2}",
+        r"|[0-9]+(?:\.[0-9]+)?|\.[0-9]+",
+    ))
+    .unwrap()
 });
 
 /// A number without grouping, leading zeros, or trailing fraction zeros, so
@@ -281,7 +287,17 @@ fn written_amounts(text: &str, value: &str) -> Vec<(String, std::ops::Range<usiz
                 || digit(prev)
                 || (separator(next) && digit(after.next()))
                 || (separator(prev) && digit(before.next()));
-            let as_written = found.as_str().replace([',', '\'', '’'], "");
+            let found_text = found.as_str();
+            // One or two digits after the last comma make it a decimal comma.
+            let decimal_comma = found_text.rfind(',').is_some_and(|at| {
+                let fraction = &found_text[at + 1..];
+                (1..=2).contains(&fraction.len()) && fraction.bytes().all(|b| b.is_ascii_digit())
+            });
+            let as_written = if decimal_comma {
+                found_text.replace('.', "").replace(',', ".")
+            } else {
+                found_text.replace([',', '\'', '’'], "")
+            };
             let as_written = if as_written.starts_with('.') {
                 format!("0{as_written}")
             } else {
@@ -555,20 +571,8 @@ fn written_ending(text: &str, value: &str) -> Option<String> {
         .then_some(digits)
 }
 
-/// Whether an account name carries a card or account number, a numeric part
-/// of at least three digits.
-fn has_number(name: &str) -> bool {
-    name.split([':', '-'])
-        .any(|part| part.len() >= 3 && part.bytes().all(|b| b.is_ascii_digit()))
-}
-
-/// Whether an account name carries a number that matches a cited number,
-/// where either may be the other's ending. Consecutive numeric parts of the
-/// name form one number, so "Checking-123-45678-9012" is 123456789012: it
-/// matches "ending 9012" and "123-45678-9012", but not "987-65432-9012".
-/// "Citi-1234" matches "ending 1234" and "4111 1111 1111 1234", and
-/// "Visa-91234567" does not match "1234".
-fn names_number(name: &str, number: &str) -> bool {
+/// The numbers in an account name: consecutive numeric parts form one.
+fn account_numbers(name: &str) -> Vec<String> {
     let mut numbers = Vec::new();
     let mut run = String::new();
     for part in name.split([':', '-']) {
@@ -579,9 +583,25 @@ fn names_number(name: &str, number: &str) -> bool {
         }
     }
     numbers.push(run);
+    numbers.retain(|number| number.len() >= 3);
     numbers
+}
+
+/// Whether an account name carries a card or account number.
+fn has_number(name: &str) -> bool {
+    !account_numbers(name).is_empty()
+}
+
+/// Whether an account name carries a number that matches a cited number,
+/// where either may be the other's ending. Consecutive numeric parts of the
+/// name form one number, so "Checking-123-45678-9012" is 123456789012: it
+/// matches "ending 9012" and "123-45678-9012", but not "987-65432-9012".
+/// "Citi-1234" matches "ending 1234" and "4111 1111 1111 1234", and
+/// "Visa-91234567" does not match "1234".
+fn names_number(name: &str, number: &str) -> bool {
+    account_numbers(name)
         .iter()
-        .any(|own| own.len() >= 3 && (own.ends_with(number) || number.ends_with(own.as_str())))
+        .any(|own| own.ends_with(number) || number.ends_with(own.as_str()))
 }
 
 fn describe_account(name: &str, transfer: bool) -> String {
@@ -1385,6 +1405,24 @@ Available balance: SGD 1,204.33.\r\n";
             Some("0.50")
         );
         assert_eq!(written_amount("Fee USD .50", "50"), None);
+        // A decimal comma, when it cannot be grouping.
+        assert_eq!(
+            written_amount("Betrag: 12,50 EUR", "12.50").as_deref(),
+            Some("12.50")
+        );
+        assert_eq!(
+            written_amount("Betrag: 1.234,56 EUR", "1234.56").as_deref(),
+            Some("1234.56")
+        );
+        assert_eq!(
+            written_amount("Paid 1,250.00", "1250").as_deref(),
+            Some("1250.00")
+        );
+        assert_eq!(
+            written_amount("Paid 1,250", "1250").as_deref(),
+            Some("1250")
+        );
+        assert_eq!(written_amount("Betrag: 12,50 EUR", "1250"), None);
     }
 
     #[test]
@@ -1506,6 +1544,9 @@ Available balance: SGD 1,204.33.\r\n";
     fn account_names_match_cited_numbers() {
         // The first group alone must not match an account ending in it.
         assert!(!names_number("Assets:Checking-123", "123456789"));
+        // Short groups join into one number.
+        assert!(has_number("Assets:Checking-12-34-56-78"));
+        assert!(!has_number("Liabilities:Amex"));
         assert!(names_number("Assets:Checking-6789", "123456789"));
         assert!(names_number("Liabilities:Citi-1234", "1234"));
         assert!(!names_number("Liabilities:Visa-91234567", "1234"));

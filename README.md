@@ -304,8 +304,9 @@ exec /usr/local/bin/peanut-count ingest-email --data /srv/peanut/mobile-data --r
 Duplicates are detected by the original message's Message-ID. A relay retry
 or a re-forward of the same email as an attachment is recorded once.
 Forwarding it inline twice creates a new message, which is recorded twice.
-Amounts use a dot as the decimal separator, with optional comma or
-apostrophe grouping. The account and category questions each offer at most
+Amounts may use a dot as the decimal separator, with optional comma or
+apostrophe grouping, or a decimal comma where it cannot be grouping, as in
+`12,50` or `1.234,56`. `1,250` is read as one thousand two hundred fifty. The account and category questions each offer at most
 50 options. In a larger ledger, accounts named in the email and accounts of the
 expected kind come first. An email that reports several transactions is
 recorded as one of them.
