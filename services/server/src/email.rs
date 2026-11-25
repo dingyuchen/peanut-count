@@ -339,7 +339,9 @@ fn attached_currency(text: &str, span: &std::ops::Range<usize>, code: &str) -> b
         .trim_end()
         .trim_end_matches(['-', '−', '+'])
         .trim_end();
-    let after = text[span.end..].trim_start();
+    // A code after the amount must be on its line, so a footer or the next
+    // line's figure is not read as its currency.
+    let after = text[span.end..].trim_start_matches([' ', '\t', '\u{a0}']);
     // "CODE" ending `before`, as a word.
     let code_before = |before: &str| {
         before.ends_with(code) && !letter(before[..before.len() - 3].chars().next_back())
@@ -383,7 +385,8 @@ fn attached_currency(text: &str, span: &std::ops::Range<usize>, code: &str) -> b
         || after.strip_prefix(code).is_some_and(|rest| {
             // Not "SGD 75.30", the next amount's own code. A following day or
             // count, as in "45.00 CHF 23 Nov 2026", is no amount.
-            !letter(rest.chars().next()) && !MONEY_NEXT.is_match(rest)
+            !letter(rest.chars().next())
+                && !(MONEY_NEXT.is_match(rest) && !DATE_NEXT.is_match(rest))
         });
     let symbol_after = SYMBOLS
         .iter()
@@ -402,7 +405,11 @@ fn attached_currency(text: &str, span: &std::ops::Range<usize>, code: &str) -> b
 
 /// A sum of money with a fraction, such as " 75.30" or " 1,250.00", next.
 static MONEY_NEXT: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\s*[-−+]?\d[\d,' ]*[.,]\d").unwrap());
+    LazyLock::new(|| Regex::new(r"^[ \t]*[-−+]?\d[\d,' ]*[.,]\d").unwrap());
+/// A numeric date with its year, such as " 23.11.2026", next. Without a
+/// year, "23.11" is as likely a sum.
+static DATE_NEXT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[ \t]*\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\b").unwrap());
 
 /// Active ISO 4217 codes. A code that is also an English word, such as "TRY",
 /// is kept: it counts only when written directly against the amount, and then
@@ -1334,6 +1341,15 @@ Available balance: SGD 1,204.33.\r\n";
         assert!(stated("Charged USD $12.50", "12.50", "USD"));
         assert!(!stated("Charged CAD $12.50", "12.50", "USD"));
         assert!(stated("Refund: CAD -$12.50", "-12.50", "CAD"));
+        assert!(stated("45.00 CHF 23 Nov 2026", "45.00", "CHF"));
+        assert!(stated("45.00 CHF 23.11.2026", "45.00", "CHF"));
+        // A code on the next line belongs to something else.
+        assert!(!stated(
+            "Purchase: $45.00\nJPY 5000 available",
+            "45.00",
+            "JPY"
+        ));
+        assert!(!stated("Purchase: $45.00\nTRY OUR NEW APP", "45.00", "TRY"));
         assert!(stated("Refund: CAD $-12.50", "-12.50", "CAD"));
         assert!(stated("Amount\nUSD\n12.50", "12.50", "USD"));
         assert!(stated("消费USD12.50", "12.50", "USD"));
