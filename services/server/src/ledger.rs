@@ -141,6 +141,8 @@ struct Account {
     currencies: Vec<String>,
     booking: Booking,
     closed: bool,
+    /// The date of the account's close entry, if any.
+    closed_on: Option<NaiveDate>,
 }
 
 #[derive(Clone)]
@@ -166,7 +168,7 @@ struct BookedTransaction {
     postings: Vec<BookedPosting>,
 }
 
-/// An open account and the currencies it accepts or has been posted in.
+/// A ledger account and the currencies it accepts or has been posted in.
 #[derive(Clone, Debug, Default)]
 pub struct OpenAccount {
     pub name: String,
@@ -174,6 +176,9 @@ pub struct OpenAccount {
     pub declared: Vec<String>,
     /// Currencies the account has been posted in.
     pub posted: Vec<String>,
+    /// When it was closed. A transaction dated on or before then may still
+    /// post to it, since a close sorts after that day's transactions.
+    pub closed: Option<NaiveDate>,
 }
 
 impl OpenAccount {
@@ -210,13 +215,13 @@ impl Ledger {
         Ok(ledger)
     }
 
-    /// Open accounts sorted by name, each with its declared currencies or,
-    /// for an unconstrained account, the currencies it has been posted in.
-    pub fn open_accounts(&self) -> Vec<OpenAccount> {
-        let mut open: Vec<_> = self
+    /// Every account sorted by name, open or closed, each with its declared
+    /// currencies or, for an unconstrained account, the currencies it has
+    /// been posted in.
+    pub fn accounts(&self) -> Vec<OpenAccount> {
+        let mut all: Vec<_> = self
             .accounts
             .iter()
-            .filter(|(_, account)| !account.closed)
             .map(|(name, account)| OpenAccount {
                 name: name.clone(),
                 declared: account.currencies.clone(),
@@ -226,21 +231,11 @@ impl Ledger {
                     .filter(|(held, _)| held == name)
                     .map(|(_, currency)| currency.clone())
                     .collect(),
+                closed: account.closed_on,
             })
             .collect();
-        open.sort_by(|a, b| a.name.cmp(&b.name));
-        open
-    }
-
-    pub fn closed_accounts(&self) -> Vec<String> {
-        let mut closed: Vec<_> = self
-            .accounts
-            .iter()
-            .filter(|(_, account)| account.closed)
-            .map(|(name, _)| name.clone())
-            .collect();
-        closed.sort();
-        closed
+        all.sort_by(|a, b| a.name.cmp(&b.name));
+        all
     }
 
     pub fn canonical_entry(&self, id: &str) -> Result<&Entry> {
@@ -283,12 +278,15 @@ impl Ledger {
                         currencies: currencies.clone(),
                         booking: *booking,
                         closed: false,
+                        closed_on: None,
                     },
                 );
             }
-            Entry::Close { account, .. } => {
+            Entry::Close { account, date } => {
                 self.account(account, None)?;
-                self.accounts.get_mut(account).unwrap().closed = true;
+                let closing = self.accounts.get_mut(account).unwrap();
+                closing.closed = true;
+                closing.closed_on = Some(*date);
             }
             Entry::Commodity { currency, .. } => {
                 commodity(currency)?;

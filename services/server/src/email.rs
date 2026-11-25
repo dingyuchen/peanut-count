@@ -330,7 +330,7 @@ fn written_amounts(text: &str, value: &str) -> Vec<(String, std::ops::Range<usiz
 }
 
 /// Symbols other than "$" that name exactly one currency.
-const SYMBOLS: [(&str, &str); 8] = [
+const SYMBOLS: &[(&str, &str)] = &[
     ("€", "EUR"),
     ("£", "GBP"),
     ("₹", "INR"),
@@ -339,7 +339,18 @@ const SYMBOLS: [(&str, &str); 8] = [
     ("฿", "THB"),
     ("₫", "VND"),
     ("₪", "ILS"),
+    ("₺", "TRY"),
+    ("₽", "RUB"),
+    ("₴", "UAH"),
+    ("₦", "NGN"),
 ];
+
+/// Local abbreviations written as a word before the amount, as in "RM10.00",
+/// that name exactly one currency.
+const WORD_BEFORE: &[(&str, &str)] = &[("RM", "MYR"), ("Rp", "IDR")];
+
+/// Local abbreviations written as a word after the amount, as in "45,00 zł".
+const WORD_AFTER: &[(&str, &str)] = &[("zł", "PLN"), ("Kč", "CZK"), ("Ft", "HUF")];
 
 /// Letters written directly before "$" that name one dollar currency.
 const DOLLARS: [(&str, &str); 12] = [
@@ -444,7 +455,22 @@ fn attached_currency(text: &str, span: &std::ops::Range<usize>, code: &str) -> b
                 .is_some_and(|line| MONEY_NEXT.is_match(line.trim_start()));
             alone && !figure_next
         });
+    // A local abbreviation as a whole word, as in "RM10.00" or "45,00 zł".
+    let word_before = WORD_BEFORE.iter().any(|(word, named)| {
+        *named == code
+            && before
+                .strip_suffix(word)
+                .is_some_and(|rest| !letter(rest.chars().next_back()))
+    });
+    let word_after = WORD_AFTER.iter().any(|(word, named)| {
+        *named == code
+            && after
+                .strip_prefix(word)
+                .is_some_and(|rest| !rest.starts_with(char::is_alphabetic))
+    });
     code_before(before)
+        || word_before
+        || word_after
         || code_below
         || code_then_symbol
         || labelled
@@ -956,15 +982,13 @@ async fn read_body(email: &Email, body: &str, reader: &impl Extract) -> Result<R
     })
 }
 
-/// Chooses a statement row for `email` against the ledger's open accounts.
+/// Chooses a statement row for `email` against the ledger's accounts.
 pub async fn extract(
     email: &Email,
     accounts: &[OpenAccount],
-    closed: &[String],
     default_currency: &str,
     model: &impl Extract,
 ) -> Result<Statement, Failure> {
-    let is_closed = |name: &str| closed.iter().any(|closed| closed == name);
     // A plain-text alternative can be a stub such as "View this alert online"
     // while the HTML alternative holds the receipt, so try that before
     // rejecting the email.
@@ -988,6 +1012,16 @@ pub async fn extract(
         ending,
         other,
     } = reading;
+    // Only accounts open on the transaction's date may take it: one closed
+    // later, such as a replaced card, still takes an earlier purchase.
+    let usable = |account: &&OpenAccount| account.closed.is_none_or(|closed| date <= closed);
+    let is_closed = |name: &str| {
+        accounts
+            .iter()
+            .any(|account| account.name == name && !usable(&account))
+    };
+    let accounts: Vec<OpenAccount> = accounts.iter().filter(usable).cloned().collect();
+    let accounts = &accounts[..];
     let mut sources: BTreeMap<String, String> = accounts
         .iter()
         .map(|account| &account.name)
@@ -1353,14 +1387,13 @@ Available balance: SGD 1,204.33.\r\n";
         reader: &(impl Extract + Sync),
         decider: &Fixed,
     ) -> Result<Statement, Failure> {
-        super::extract(
-            email,
-            accounts,
-            closed,
-            currency,
-            &Model { reader, decider },
-        )
-        .await
+        let closed_long_ago = closed.iter().map(|name| OpenAccount {
+            name: name.clone(),
+            closed: NaiveDate::from_ymd_opt(1900, 1, 1),
+            ..Default::default()
+        });
+        let accounts: Vec<OpenAccount> = accounts.iter().cloned().chain(closed_long_ago).collect();
+        super::extract(email, &accounts, currency, &Model { reader, decider }).await
     }
 
     fn value(value: Value) -> Answer {
@@ -1414,6 +1447,7 @@ Available balance: SGD 1,204.33.\r\n";
             name: name.into(),
             declared: declared.iter().map(|c| c.to_string()).collect(),
             posted: posted.iter().map(|c| c.to_string()).collect(),
+            closed: None,
         }
     }
 
@@ -1488,6 +1522,12 @@ Available balance: SGD 1,204.33.\r\n";
         };
         assert!(stated("Paid SGD 12.50", "12.50", "SGD"));
         assert!(stated("Paid S$12.50", "12.50", "SGD"));
+        assert!(stated("Pembayaran RM10.00 berjaya", "10.00", "MYR"));
+        assert!(stated("Pembayaran RM 10.00", "10.00", "MYR"));
+        assert!(stated("Zapłacono 45,00 zł", "45.00", "PLN"));
+        assert!(stated("Paid ₺120.00", "120.00", "TRY"));
+        // Only as a whole word.
+        assert!(!stated("FORM10.00", "10.00", "MYR"));
         assert!(stated("Paid €12.50", "12.50", "EUR"));
         assert!(stated("Paid SGD12.50", "12.50", "SGD"));
         assert!(stated("Paid US$12.50", "12.50", "USD"));
@@ -2482,6 +2522,40 @@ Please view this email in an HTML-capable client.\r\n--b\r\nContent-Type: text/h
             ),
             ("EUR", "-1234.56", date("2026-02-25"))
         );
+    }
+
+    #[tokio::test]
+    async fn a_card_closed_after_the_purchase_still_takes_it() {
+        let mut email = parse(ALERT.as_bytes()).unwrap();
+        email.body = "Your Visa ending 1234 was charged SGD 12.50 at GRAB on 23 Nov 2026.".into();
+        let ledger = |closed: &str| {
+            let mut old_card = account("Liabilities:Visa-1234", &["SGD"], &[]);
+            old_card.closed = Some(date(closed));
+            vec![
+                old_card,
+                account("Liabilities:Visa-5678", &["SGD"], &[]),
+                account("Assets:Checking-8890", &["SGD"], &[]),
+            ]
+        };
+        let reads = Reads(json!({
+            "amount": "12.50", "currency": "SGD", "date": "2026-11-23", "from_account": "1234",
+        }));
+        let model = || {
+            fixed(Answers::from([(
+                "category".into(),
+                choice("Expenses:Transport", &[("Expenses:Transport", 0.9)]),
+            )]))
+        };
+        // Closed the day after: the purchase is booked to it.
+        let after = ledger("2026-11-24");
+        let statement = extract(&email, &after, &[], "USD", &reads, &model())
+            .await
+            .unwrap();
+        assert_eq!(statement.source, "Liabilities:Visa-1234");
+        // Closed before: it is not on offer, and the email is refused.
+        let before = ledger("2026-11-20");
+        let result = extract(&email, &before, &[], "USD", &reads, &model()).await;
+        assert!(matches!(result, Err(Failure::Rejected(_))));
     }
 
     #[tokio::test]

@@ -157,21 +157,17 @@ pub async fn ingest(
             return Err(Unavailable(crate::store::LedgerBlocked.into()));
         }
         let ledger = snapshot.ledger;
-        Ok((
-            user,
-            email,
-            Some((ledger.open_accounts(), ledger.closed_accounts())),
-        ))
+        Ok((user, email, Some(ledger.accounts())))
     })
     .await
     .map_err(|error| Unavailable(error.into()))??;
     let (user, email, accounts) = prepared;
-    let Some((accounts, closed)) = accounts else {
+    let Some(accounts) = accounts else {
         return Ok(Outcome::Duplicate(email.id));
     };
 
     let model = inbound.model.as_ref().ok_or(NotConfigured)?;
-    let statement = email::extract(&email, &accounts, &closed, &inbound.default_currency, model)
+    let statement = email::extract(&email, &accounts, &inbound.default_currency, model)
         .await
         .map_err(|failure| match failure {
             Failure::Rejected(reason) => Rejected(reason),
