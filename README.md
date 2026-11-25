@@ -194,36 +194,47 @@ alert, card notification, or receipt to it, and the server records the
 transaction in that account's ledger. The entry is stored as a one-row
 statement, so it reaches the iOS app on the next sync like a PDF import.
 
-The server finds every amount written with a currency symbol or code, every
-date, and the phrases that name the other party. A decision model then
-answers multiple-choice questions about the email. It decides whether the
-email reports a completed transaction and whether money went out or came in.
-It chooses which amount, date, and payee apply, which of your asset or
-liability accounts was used, and the category. The model only chooses among
-values that appear in the email and among your accounts, so it cannot make
-up an amount. Name accounts after the card or account number when you can,
-for example `Liabilities:Citi-Rewards-1234`, so that "card ending 1234"
-matches. If an email cites a card or account number that no account name
-ends with, it can be rejected with a request to open that account first. Missing
-categories, and `Assets:Checking` or `Liabilities:CreditCard` when the ledger
-has no account of that kind, are opened automatically. A category the model
+Two models read each email. An extraction model reads the transaction's
+fields from the email's text: whether it reports a completed transaction,
+whether money went out or came in, the amount and its currency, any amount
+settled in another currency, the date, the payee, and the card or account
+number. The server checks each field against the text before using it.
+The amount must be a number written in the email. A currency must be stated
+by its ISO code or by a symbol that names only that currency, such as `€` or
+`S$`. A bare `$` takes the account's only currency, or the configured
+default. A date must write its day and month, and a payee or card number must
+appear verbatim. A field that fails these checks is dropped, or the email is
+rejected if the amount fails. A decision model then chooses which of your
+asset or liability accounts was used, and the category.
+
+Name accounts after the card or account number when you can, for example
+`Liabilities:Citi-Rewards-1234`, so that "card ending 1234" matches. If an
+email cites a card or account number that no account name ends with, it can
+be rejected with a request to open that account first. Missing categories,
+and `Assets:Checking` or `Liabilities:CreditCard` when the ledger has no
+account of that kind, are opened automatically. A category the decision model
 is unsure about goes to `Expenses:Uncategorized` or `Income:Uncategorized`.
 Correct a wrong entry with a reversal.
 
+The extraction model is any OpenAI-compatible chat completions endpoint that
+supports JSON schema output, such as LM Studio, llama.cpp, or a hosted API.
 The decision model is any server that speaks TypeSafe Jev's `/v1/systemone`
-format. This includes hosted Jev and local servers such as LM Studio and
-llama.cpp. A hosted model receives the text of every forwarded email.
+format, including hosted Jev, LM Studio, and llama.cpp. A hosted model
+receives the text of every forwarded email.
 
 | Variable | Purpose |
 | --- | --- |
 | `PEANUT_INBOUND_DOMAIN` | Domain of the forwarding addresses. Email import is off unless it is set. |
+| `PEANUT_EXTRACT_URL` | Full chat completions URL of the extraction model. Empty by default, and mail is deferred until it is set. |
+| `PEANUT_EXTRACT_MODEL` | Extraction model ID. |
+| `PEANUT_EXTRACT_TOKEN` | Bearer token for a hosted extraction API. |
 | `PEANUT_JEV_URL` | Full decision endpoint URL. Empty by default, and mail is deferred until it is set. |
 | `PEANUT_JEV_MODEL` | Decision model ID. |
 | `PEANUT_JEV_TOKEN` | Bearer token for a hosted decision API. |
 | `PEANUT_INBOUND_TOKEN` | Shared secret for the mail relay webhook. The webhook is off unless it is set. |
 | `PEANUT_EMAIL_CURRENCY` | Currency for a bare `$` when the account has no single currency. Defaults to USD. |
 
-The two tokens are read only from the environment. The other variables also
+The three tokens are read only from the environment. The other variables also
 have command-line flags. Run `peanut-count mobile-serve --help`.
 Create or replace an account's address with its session token. Replacing an
 address disables the old one immediately.
@@ -248,7 +259,7 @@ in `X-Peanut-Recipient`. Messages may be up to 4 MiB.
 | 200 | Already imported | Accept |
 | 404 | Unknown address | Reject |
 | 422 | Not a transaction, or the ledger rejected it. The body has the reason. | Reject |
-| 503 | Decision model unset or unreachable, storage busy, ledger has unresolved sync conflicts, or too many deliveries at once | Retry later |
+| 503 | A model unset or unreachable, storage busy, ledger has unresolved sync conflicts, or too many deliveries at once | Retry later |
 
 **Local MTA pipe.** `peanut-count ingest-email` reads one message from
 standard input. It exits with 0 for an import or duplicate, 67 for an unknown
@@ -288,18 +299,29 @@ exec /usr/local/bin/peanut-count ingest-email --data /srv/peanut/mobile-data --r
 Duplicates are detected by the original message's Message-ID. A relay retry
 or a re-forward of the same email as an attachment is recorded once.
 Forwarding it inline twice creates a new message, which is recorded twice.
-Amounts need a currency symbol or ISO code and a dot decimal separator.
-Three decimals are read only for currencies that use them, such as KWD.
-The codes ALL, BOB, CUP, CVE, GEL, MAD, MOP, PEN, SOS, and TOP are not
-recognized, because they are also common words in capitals.
-Amounts grouped with spaces or apostrophes, or written with a decimal comma,
-are skipped. Each question offers the model at most 50 options. In a larger
-ledger, accounts named in the email and accounts of the expected kind come first. An
-email that reports several transactions is recorded as one of them.
+Amounts use a dot as the decimal separator, with optional comma or
+apostrophe grouping. Each decision question offers the model at most 50
+options. In a larger ledger, accounts named in the email and accounts of the
+expected kind come first. An email that reports several transactions is
+recorded as one of them.
 
-### Local decision model with LM Studio
+### Local models with LM Studio
 
-LM Studio serves `/v1/systemone` for models it lists as decision models.
+LM Studio serves both models. For extraction, load a general instruction
+model. It may be a reasoning model: if LM Studio returns the
+schema-constrained answer as reasoning and leaves the message content empty,
+the server reads the answer from the reasoning.
+
+```sh
+lms load clairic-flash --identifier clairic-flash
+lms server start
+export PEANUT_EXTRACT_URL=http://127.0.0.1:1234/v1/chat/completions
+export PEANUT_EXTRACT_MODEL=clairic-flash
+```
+
+`qwen/qwen3.5-4b` (about 3 GB) also works and reads an alert in about two
+seconds on an Apple M1 Pro. For decisions, LM Studio serves `/v1/systemone`
+for models it lists as decision models.
 
 ```sh
 lms get https://huggingface.co/ggml-org/lev-GGUF@Q4_K_M
@@ -308,8 +330,9 @@ lms server start
 export PEANUT_JEV_URL=http://127.0.0.1:1234/v1/systemone PEANUT_JEV_MODEL=lev
 ```
 
-`ggml-org/lev-GGUF` is about 3 GB at Q4_K_M. Each email takes two model
-calls, about 5 to 8 seconds on an Apple M1 Pro. The `feder-cr/jev` GGUF
+`ggml-org/lev-GGUF` is about 3 GB at Q4_K_M. Each email takes one extraction
+call and one or two decision calls, about 5 to 9 seconds in all on an Apple
+M1 Pro. The `feder-cr/jev` GGUF
 (jevos-v4) loads in LM Studio as an ordinary language model, not a decision
 model, so its `/v1/systemone` endpoint does not serve it. Run jevos with its
 own `jev serve` binary on port 8017 instead. `ggml-org/OpenJev-GGUF` needs

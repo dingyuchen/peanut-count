@@ -2,6 +2,7 @@ mod email;
 mod inbound;
 mod jev;
 mod ledger;
+mod llm;
 mod mcp;
 mod mobile;
 mod store;

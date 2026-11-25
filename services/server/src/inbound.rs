@@ -28,6 +28,7 @@ use uuid::Uuid;
 use crate::{
     email::{self, Failure},
     jev::Jev,
+    llm::Llm,
     mobile::{self, ApiError, ApiResult, INTERNAL},
     store::Store,
 };
@@ -44,6 +45,14 @@ pub struct InboundArgs {
     /// Email import is off unless this is set.
     #[arg(long, env = "PEANUT_INBOUND_DOMAIN")]
     inbound_domain: Option<String>,
+    /// Extraction model endpoint for OpenAI-compatible chat completions with
+    /// JSON schema output, for example http://127.0.0.1:1234/v1/chat/completions.
+    /// Set PEANUT_EXTRACT_TOKEN for hosted APIs.
+    #[arg(long, env = "PEANUT_EXTRACT_URL")]
+    extract_url: Option<String>,
+    /// Extraction model ID, for example clairic-flash.
+    #[arg(long, env = "PEANUT_EXTRACT_MODEL")]
+    extract_model: Option<String>,
     /// Decision model endpoint in Jev's /v1/systemone format, for example
     /// http://127.0.0.1:1234/v1/systemone. Set PEANUT_JEV_TOKEN for hosted APIs.
     #[arg(long, env = "PEANUT_JEV_URL")]
@@ -58,6 +67,7 @@ pub struct InboundArgs {
 
 pub struct Inbound {
     domain: String,
+    reader: Option<Llm>,
     model: Option<Jev>,
     default_currency: String,
 }
@@ -91,8 +101,18 @@ impl InboundArgs {
                 Some(Jev::new(url, model, token)?)
             }
         };
+        let reader = match set(self.extract_url) {
+            None => None,
+            Some(url) => {
+                let model = set(self.extract_model)
+                    .context("set --extract-model or PEANUT_EXTRACT_MODEL")?;
+                let token = set(std::env::var("PEANUT_EXTRACT_TOKEN").ok());
+                Some(Llm::new(url, model, token)?)
+            }
+        };
         Ok(Some(Inbound {
             domain,
+            reader,
             model,
             default_currency: self.email_currency,
         }))
@@ -126,7 +146,7 @@ pub async fn ingest(
     let paths = data.clone();
     let prepared = tokio::task::spawn_blocking(move || -> Result<_, IngestError> {
         let user = recipient_user(&paths, &config.domain, &recipient)?.ok_or(UnknownRecipient)?;
-        if config.model.is_none() {
+        if config.model.is_none() || config.reader.is_none() {
             return Err(NotConfigured);
         }
         let email = email::parse(&raw).map_err(|error| Rejected(format!("{error:#}")))?;
@@ -155,12 +175,20 @@ pub async fn ingest(
     };
 
     let model = inbound.model.as_ref().ok_or(NotConfigured)?;
-    let statement = email::extract(&email, &accounts, &closed, &inbound.default_currency, model)
-        .await
-        .map_err(|failure| match failure {
-            Failure::Rejected(reason) => Rejected(reason),
-            Failure::Unavailable(error) => Unavailable(error),
-        })?;
+    let reader = inbound.reader.as_ref().ok_or(NotConfigured)?;
+    let statement = email::extract(
+        &email,
+        &accounts,
+        &closed,
+        &inbound.default_currency,
+        reader,
+        model,
+    )
+    .await
+    .map_err(|failure| match failure {
+        Failure::Rejected(reason) => Rejected(reason),
+        Failure::Unavailable(error) => Unavailable(error),
+    })?;
 
     tokio::task::spawn_blocking(move || {
         let mut store = Store::open(&mobile::ledger_path(&data, &user)).map_err(Unavailable)?;
@@ -340,7 +368,7 @@ async fn receive(State(state): State<InboundState>, headers: HeaderMap, raw: Byt
             .into_response(),
         Err(IngestError::NotConfigured) => ApiError(
             StatusCode::SERVICE_UNAVAILABLE,
-            "Email import has no decision model configured.",
+            "Email import has no extraction or decision model configured.",
         )
         .into_response(),
         Err(IngestError::Unavailable(error)) => {
@@ -406,7 +434,9 @@ pub async fn ingest_stdin(
                 EX_DATAERR
             }
             Err(IngestError::NotConfigured) => {
-                eprintln!("peanut-count: set PEANUT_JEV_URL and PEANUT_JEV_MODEL to import email");
+                eprintln!(
+                    "peanut-count: set PEANUT_EXTRACT_URL, PEANUT_EXTRACT_MODEL, PEANUT_JEV_URL, and PEANUT_JEV_MODEL to import email"
+                );
                 EX_TEMPFAIL
             }
             Err(IngestError::Unavailable(error)) => {
@@ -430,34 +460,49 @@ A transaction of S$12.50 was made with your credit card on 23 Nov 2026 at STARBU
 Available balance: SGD 1,204.33.\r\n";
 
     /// Serves fixed answers in Jev's wire format and returns the endpoint URL.
+    /// Serves fixed extraction and decision answers and returns the server's base URL.
     async fn fake_model() -> String {
-        let app = Router::new().route(
-            "/v1/systemone",
-            post(|Json(request): Json<serde_json::Value>| async move {
-                let has = |name: &str| request["questions"].get(name).is_some();
-                let first = ["transaction", "direction", "amount", "date", "payee", "account"];
-                assert!(first.iter().all(|q| has(q)) != has("category"));
-                Json(json!({ "model": "fake", "answers": {
-                    "transaction": { "type": "noul", "noul": 0.98 },
-                    "direction": { "type": "choice", "choice": "out", "probabilities": { "out": 0.99, "in": 0.01 } },
-                    "amount": { "type": "choice", "choice": "1", "probabilities": { "1": 0.97, "2": 0.03 } },
-                    "date": { "type": "choice", "choice": "1", "probabilities": { "1": 0.8, "2": 0.2 } },
-                    "payee": { "type": "choice", "choice": "1", "probabilities": { "1": 0.9 } },
-                    "account": { "type": "choice", "choice": "Liabilities:CreditCard" },
-                    "category": { "type": "choice", "choice": "Expenses:Dining", "probabilities": { "Expenses:Dining": 0.93 } },
-                }}))
-            }),
-        );
+        let app = Router::new()
+            .route(
+                "/v1/chat/completions",
+                post(|Json(request): Json<serde_json::Value>| async move {
+                    // The schema constrains the answer, and the email is the user message.
+                    assert_eq!(request["response_format"]["type"], "json_schema");
+                    let email = request["messages"][1]["content"].as_str().unwrap();
+                    assert!(email.contains("STARBUCKS VIVOCITY"));
+                    let content = json!({
+                        "is_transaction": true, "direction": "out", "amount": "12.50",
+                        "currency": "SGD", "settled_amount": null, "settled_currency": null,
+                        "date": "2026-11-23", "payee": "STARBUCKS VIVOCITY", "account_ending": null,
+                    });
+                    Json(json!({ "choices": [{ "message": { "content": content.to_string() } }] }))
+                }),
+            )
+            .route(
+                "/v1/systemone",
+                post(|Json(request): Json<serde_json::Value>| async move {
+                    let has = |name: &str| request["questions"].get(name).is_some();
+                    assert!(has("account") != has("category"));
+                    Json(json!({ "model": "fake", "answers": {
+                        "account": { "type": "choice", "choice": "Liabilities:CreditCard" },
+                        "category": { "type": "choice", "choice": "Expenses:Dining", "probabilities": { "Expenses:Dining": 0.93 } },
+                    }}))
+                }),
+            );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        format!("http://{address}/v1/systemone")
+        format!("http://{address}")
     }
 
-    fn inbound(model: Option<String>) -> Arc<Inbound> {
+    fn inbound(base: Option<String>) -> Arc<Inbound> {
         Arc::new(Inbound {
             domain: "in.example.com".into(),
-            model: model.map(|url| Jev::new(url, "fake".into(), None).unwrap()),
+            reader: base.as_ref().map(|base| {
+                Llm::new(format!("{base}/v1/chat/completions"), "fake".into(), None).unwrap()
+            }),
+            model: base
+                .map(|base| Jev::new(format!("{base}/v1/systemone"), "fake".into(), None).unwrap()),
             default_currency: "USD".into(),
         })
     }
