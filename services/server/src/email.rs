@@ -520,7 +520,13 @@ fn attached_currency(text: &str, span: &std::ops::Range<usize>, code: &str) -> b
         .chain(["$", "¥"])
         .filter_map(|symbol| before.strip_suffix(symbol))
         .any(|rest| code_before(rest.trim_end().trim_end_matches(['-', '−', '+']).trim_end()));
+    // A bare "¥" is yen or yuan, settled by 円 or 元 elsewhere; one with letters
+    // before it, as in "JP¥", is read by `yen_prefix` alone.
+    let lettered_yen = before
+        .strip_suffix('¥')
+        .is_some_and(|rest| rest.ends_with(|c: char| c.is_ascii_alphabetic()));
     let yen = (before.ends_with('¥') || after.starts_with('¥'))
+        && !lettered_yen
         && match code {
             "CNY" => text.contains('元') || text.contains("RMB"),
             "JPY" => text.contains('円'),
@@ -1777,6 +1783,9 @@ Available balance: SGD 1,204.33.\r\n";
         assert!(stated("Card used for JP¥12,500 at LAWSON", "12500", "JPY"));
         assert!(stated("Card used for CN¥88.00", "88.00", "CNY"));
         assert!(!stated("Card used for JP¥12,500", "12500", "CNY"));
+        let mixed = "Purchase: JP¥12,500\nAvailable balance: 3,000.00元";
+        assert!(stated(mixed, "12500", "JPY"));
+        assert!(!stated(mixed, "12500", "CNY"));
         // Only as a whole word.
         assert!(!stated("FORM10.00", "10.00", "MYR"));
         assert!(stated("Paid €12.50", "12.50", "EUR"));

@@ -291,13 +291,15 @@ run `postmap /etc/postfix/transport`.
 
 The wrapper exports the variables above and runs the import. It defers
 delivery, with exit 75, when it gets anything but one recipient or cannot read
-its settings, so Postfix keeps the message. The `peanut` user needs read access
+or parse its settings, so Postfix keeps the message. A syntax error in the
+settings would otherwise end the shell with a status that Postfix bounces. The `peanut` user needs read access
 to the settings file and write access to the data directory.
 
 ```sh
 #!/bin/sh
 env=/etc/peanut/inbound.env
 [ "$#" -eq 1 ] && [ -r "$env" ] || exit 75
+/bin/sh -n "$env" || exit 75
 set -a
 . "$env" || exit 75
 set +a
