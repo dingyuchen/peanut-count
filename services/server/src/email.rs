@@ -932,7 +932,7 @@ const FIELDS: &[Field<'static>] = &[
     Field {
         name: "to_account",
         kind: Kind::Text,
-        instructions: "The digits of the user's card or account number that money arrived in, such as 9012 for 'credited to your account ending 9012'. Null if the email names none. A purchase or payment credits none of the user's accounts, so it is null for one.",
+        instructions: "The digits of the user's card or account number that money arrived in, such as 9012 for 'credited to your account ending 9012'. Null if the email names none. A purchase, or a payment to a merchant or another person, credits none of the user's accounts, so it is null for one; a payment to the user's own credit card or loan credits that card or loan.",
     },
 ];
 
@@ -2925,6 +2925,34 @@ Content-Type: text/html; charset=utf-8\r\n\
         ];
         let result = extract(&email, &multi, &[], "USD", &reads, &model).await;
         assert!(matches!(result, Err(Failure::Rejected(_))));
+    }
+
+    #[tokio::test]
+    async fn a_card_bill_payment_credits_the_card() {
+        let mut email = parse(ALERT.as_bytes()).unwrap();
+        email.body = "You paid SGD 500.00 to your Citi credit card ending 1234 from DBS savings ending 8890 on 18 Nov 2026.".into();
+        let ledger = vec![
+            account("Assets:DBS-Savings-8890", &["SGD"], &[]),
+            account("Liabilities:Citi-1234", &["SGD"], &[]),
+        ];
+        let reads = Reads(json!({
+            "amount": "500.00", "currency": "SGD", "from_account": "8890", "to_account": "1234",
+        }));
+        // The model is unsure, but the verified card number settles it.
+        let model = fixed(Answers::from([(
+            "category".into(),
+            choice("Expenses:Bills", &[("Expenses:Bills", 0.2)]),
+        )]));
+        let statement = extract(&email, &ledger, &[], "USD", &reads, &model)
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                statement.source.as_str(),
+                statement.rows[0].account.as_str()
+            ),
+            ("Assets:DBS-Savings-8890", "Liabilities:Citi-1234")
+        );
     }
 
     #[tokio::test]

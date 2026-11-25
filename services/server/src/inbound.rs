@@ -380,6 +380,12 @@ pub async fn ingest_stdin(
 
     let prepared = (|| -> Result<_> {
         let inbound = inbound?.context("set --inbound-domain or PEANUT_INBOUND_DOMAIN")?;
+        // A mistyped --data must defer mail, not create an empty registry in
+        // which every address is unknown.
+        ensure!(
+            data.join("accounts.sqlite3").is_file(),
+            "no account registry in the data directory"
+        );
         mobile::init_registry(&data)?;
         let mut raw = Vec::new();
         std::io::stdin()
@@ -396,8 +402,19 @@ pub async fn ingest_stdin(
         }
     };
     if raw.len() > MAX_EMAIL_BYTES {
-        eprintln!("peanut-count: message exceeds 4 MiB");
-        return EX_DATAERR;
+        // Look up the recipient first, so oversized mail for an unknown
+        // address is reported as such and can be discarded, not bounced.
+        return match recipient_user(&data, &inbound.domain, &recipient) {
+            Ok(None) => {
+                eprintln!("peanut-count: unknown recipient");
+                EX_NOUSER
+            }
+            Ok(Some(_)) => {
+                eprintln!("peanut-count: message exceeds 4 MiB");
+                EX_DATAERR
+            }
+            Err(_) => EX_TEMPFAIL,
+        };
     }
     {
         match ingest(Arc::new(data), Arc::new(inbound), recipient, raw.into()).await {
