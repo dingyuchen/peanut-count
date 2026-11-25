@@ -555,6 +555,13 @@ fn written_ending(text: &str, value: &str) -> Option<String> {
         .then_some(digits)
 }
 
+/// Whether an account name carries a card or account number, a numeric part
+/// of at least three digits.
+fn has_number(name: &str) -> bool {
+    name.split([':', '-'])
+        .any(|part| part.len() >= 3 && part.bytes().all(|b| b.is_ascii_digit()))
+}
+
 /// Whether an account name carries a number that matches a cited number,
 /// where either may be the other's ending. Consecutive numeric parts of the
 /// name form one number, so "Checking-123-45678-9012" is 123456789012: it
@@ -931,13 +938,6 @@ pub async fn extract(
         .filter(|name| name.starts_with("Assets:") || name.starts_with("Liabilities:"))
         .map(|name| (name.clone(), describe_account(name, false)))
         .collect();
-    // The ledger may lack the card or account the email names. When the email
-    // cites a number, such as "ending 5678", that no account name ends with,
-    // the model may answer "none". Unnumbered accounts stay on offer, so
-    // "Liabilities:Amex" can still match an Amex alert by name.
-    let offer_none = ending
-        .as_deref()
-        .is_some_and(|ending| !sources.keys().any(|name| names_number(name, ending)));
     // Offer each kind the ledger lacks, so the first alert for a new credit
     // card is not booked to the only bank account.
     for (name, text) in DEFAULT_SOURCES {
@@ -946,20 +946,37 @@ pub async fn extract(
             sources.insert(name.to_owned(), text.to_owned());
         }
     }
-    // When the verified number on this transaction's side names accounts,
-    // only those are on offer, so the model cannot book to another card. An
-    // account named only by the other side of a transfer is never the source.
-    if let Some(ending) = ending.as_deref()
-        && sources.keys().any(|name| names_number(name, ending))
-    {
-        sources.retain(|name, _| names_number(name, ending));
-    } else if let Some(other) = other.as_deref() {
+    // Narrow the source by the verified account numbers. The model may answer
+    // "none" whenever a number rules accounts out without naming the source.
+    let mut offer_none = false;
+    match ending.as_deref() {
+        // The number on this transaction's side names accounts: only those
+        // are on offer, so the model cannot book to another card.
+        Some(ending) if sources.keys().any(|name| names_number(name, ending)) => {
+            sources.retain(|name, _| names_number(name, ending));
+        }
+        // It names none, as for a card not yet in the ledger: accounts with
+        // other numbers are out, and unnumbered ones such as
+        // "Liabilities:Amex" may still match an Amex alert by name.
+        Some(_) => {
+            sources.retain(|name, _| !has_number(name));
+            offer_none = true;
+        }
+        None => {}
+    }
+    // An account named only by the other side of a transfer is never the
+    // source, and the remaining ones are not assumed without asking.
+    if let Some(other) = other.as_deref() {
+        let before = sources.len();
         sources.retain(|name, _| !names_number(name, other));
+        offer_none |= ending.is_none() && sources.len() < before;
     }
     if sources.is_empty() {
-        return Err(rejected(
-            "The ledger has no open asset or liability account.",
-        ));
+        return Err(rejected(if offer_none {
+            "The email names an account that is not in the ledger. Open it, then forward the email again."
+        } else {
+            "The ledger has no open asset or liability account."
+        }));
     }
     let mut counters: BTreeMap<String, String> = accounts
         .iter()
@@ -2237,6 +2254,48 @@ Please view this email in an HTML-capable client.\r\n--b\r\nContent-Type: text/h
         let calls = model.calls.into_inner().unwrap();
         let offered = calls[0]["account"]["enum"].as_array().unwrap();
         assert!(!offered.contains(&json!("Assets:Savings-5678")));
+    }
+
+    #[tokio::test]
+    async fn a_ruled_out_source_is_never_replaced_by_a_guess() {
+        let mut email = parse(ALERT.as_bytes()).unwrap();
+        let answers = |source: &str| {
+            fixed(Answers::from([
+                ("account".into(), choice(source, &[])),
+                (
+                    "category".into(),
+                    choice("Expenses:Transfers", &[("Expenses:Transfers", 0.9)]),
+                ),
+            ]))
+        };
+        // Only the receiving account is named: the rest are asked, with "none".
+        email.body = "You sent SGD 500.00 to savings ending 5678 on 23 Nov 2026.".into();
+        let savings = vec![account("Assets:Savings-5678", &["SGD"], &[])];
+        let reads = Reads(json!({ "amount": "500.00", "currency": "SGD", "to_account": "5678" }));
+        let model = answers("none");
+        let result = extract(&email, &savings, &[], "USD", &reads, &model).await;
+        assert!(matches!(result, Err(Failure::Rejected(_))));
+        let calls = model.calls.into_inner().unwrap();
+        let offered = calls[0]["account"]["enum"].as_array().unwrap();
+        assert!(offered.contains(&json!("none")));
+        assert!(!offered.contains(&json!("Assets:Savings-5678")));
+        // A card not in the ledger rules out the accounts with other numbers.
+        email.body = "Your Visa ending 5678 was charged SGD 12.50 at GRAB on 23 Nov 2026.".into();
+        let cards = vec![
+            account("Liabilities:Visa-1234", &["SGD"], &[]),
+            account("Assets:Savings-8890", &["SGD"], &[]),
+        ];
+        let reads = Reads(json!({ "amount": "12.50", "currency": "SGD", "from_account": "5678" }));
+        let result = extract(
+            &email,
+            &cards,
+            &[],
+            "USD",
+            &reads,
+            &answers("Liabilities:Visa-1234"),
+        )
+        .await;
+        assert!(matches!(result, Err(Failure::Rejected(_))));
     }
 
     #[tokio::test]
