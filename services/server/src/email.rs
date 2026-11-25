@@ -607,7 +607,8 @@ const ISO_CURRENCIES: &[&str] = &[
     "PGK", "PHP", "PKR", "PLN", "PYG", "QAR", "RON", "RSD", "RUB", "RWF", "SAR", "SBD", "SCR",
     "SDG", "SEK", "SGD", "SHP", "SLE", "SOS", "SRD", "SSP", "STN", "SVC", "SYP", "SZL", "THB",
     "TJS", "TMT", "TND", "TOP", "TRY", "TTD", "TWD", "TZS", "UAH", "UGX", "USD", "UYU", "UZS",
-    "VES", "VND", "VUV", "WST", "XAF", "XCD", "XOF", "XPF", "YER", "ZAR", "ZMW", "ZWL",
+    "VED", "VES", "VND", "VUV", "WST", "XAF", "XCD", "XCG", "XOF", "XPF", "YER", "ZAR", "ZMW",
+    "ZWG", "ZWL",
 ];
 
 /// The currencies [`attached_currency`] can find written with an amount.
@@ -1362,9 +1363,24 @@ pub async fn extract(
         // Every line counts but a balance or limit, so an amount credited in
         // another currency on its own row does, and "Available balance: USD
         // 2,450.00" does not.
+        // A bare figure right after a balance label, as HTML blocks render
+        // "Available balance" and "USD 2,450.00", is that balance.
+        let bare = |line: &str| {
+            line.chars().any(|c| c.is_ascii_digit())
+                && line.chars().filter(|c| c.is_alphabetic()).count() <= 3
+        };
+        let mut after_balance = false;
         let transfer_lines: String = text
             .lines()
-            .filter(|line| !BALANCE.is_match(line))
+            .filter(|line| {
+                // Blank lines between label and figure keep the label's hold.
+                if line.trim().is_empty() {
+                    return true;
+                }
+                let balance = BALANCE.is_match(line) || (after_balance && bare(line));
+                after_balance = BALANCE.is_match(line) && !line.chars().any(|c| c.is_ascii_digit());
+                !balance
+            })
             .collect::<Vec<_>>()
             .join("\n");
         if let (Some(account), None) = (named.next(), named.next())
@@ -2515,6 +2531,11 @@ Please view this email in an HTML-capable client.\r\n--b\r\nContent-Type: text/h
             let result = extract(&email, &usd, &closed, "USD", &unread, &decide()).await;
             assert!(matches!(result, Err(Failure::Rejected(_))), "{body}");
         }
+        // So does a code added to ISO 4217 recently.
+        email.body = "Card ending 1234 purchase: XCG 125.00 on 23 Nov 2026.".into();
+        let unread = Reads(json!({ "amount": "125.00", "from_account": "1234" }));
+        let result = extract(&email, &usd, &closed, "USD", &unread, &decide()).await;
+        assert!(matches!(result, Err(Failure::Rejected(_))));
         // So does a code that is also a word.
         email.body = "Card ending 1234. Amount: TRY 1,250.00 on 23 Nov 2026.".into();
         let unread = Reads(json!({ "amount": "1,250.00", "from_account": "1234" }));
@@ -2817,6 +2838,23 @@ Please view this email in an HTML-capable client.\r\n--b\r\nContent-Type: text/h
             choice("Assets:Savings-5678", &[("Assets:Savings-5678", 0.9)]),
         )]));
         let statement = extract(&same, &same_currency, &[], "USD", &euros, &transfer)
+            .await
+            .unwrap();
+        assert_eq!(statement.rows[0].account, "Assets:Savings-5678");
+        // So is one whose label and figure are separate HTML blocks.
+        let blocks = parse(
+            "Message-ID: <blocks@bank.example>\r\n\
+From: Bank <alerts@bank.example>\r\n\
+Subject: Transfer\r\n\
+Date: Tue, 24 Nov 2026 09:15:00 +0800\r\n\
+Content-Type: text/html; charset=utf-8\r\n\
+\r\n\
+<div>EUR 100.00 debited from checking ending 1234 and credited to savings ending 5678 on 23 Nov 2026.</div>\
+<div>Available balance</div><div>USD 2,450.00</div>\r\n"
+                .as_bytes(),
+        )
+        .unwrap();
+        let statement = extract(&blocks, &same_currency, &[], "USD", &euros, &transfer)
             .await
             .unwrap();
         assert_eq!(statement.rows[0].account, "Assets:Savings-5678");
