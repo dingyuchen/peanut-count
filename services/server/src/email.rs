@@ -381,9 +381,9 @@ fn attached_currency(text: &str, span: &std::ops::Range<usize>, code: &str) -> b
         .and_then(|rest| rest.strip_prefix(code))
         .is_some_and(|rest| rest.starts_with(')'))
         || after.strip_prefix(code).is_some_and(|rest| {
-            // Not "SGD 75.30", the next amount's own code.
-            !letter(rest.chars().next())
-                && !rest.trim_start().starts_with(|c: char| c.is_ascii_digit())
+            // Not "SGD 75.30", the next amount's own code. A following day or
+            // count, as in "45.00 CHF 23 Nov 2026", is no amount.
+            !letter(rest.chars().next()) && !MONEY_NEXT.is_match(rest)
         });
     let symbol_after = SYMBOLS
         .iter()
@@ -400,21 +400,26 @@ fn attached_currency(text: &str, span: &std::ops::Range<usize>, code: &str) -> b
         || symbol_after
 }
 
-/// Active ISO 4217 codes, leaving out those that are also common English
-/// words written in capitals before a number, such as "ALL", "TOP", or "TRY".
+/// A sum of money with a fraction, such as " 75.30" or " 1,250.00", next.
+static MONEY_NEXT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*[-−+]?\d[\d,' ]*[.,]\d").unwrap());
+
+/// Active ISO 4217 codes. A code that is also an English word, such as "TRY",
+/// is kept: it counts only when written directly against the amount, and then
+/// only rejects the email when no matching code is written with it too.
 const ISO_CURRENCIES: &[&str] = &[
-    "AED", "AFN", "AMD", "ANG", "AOA", "ARS", "AUD", "AWG", "AZN", "BAM", "BBD", "BDT", "BGN",
-    "BHD", "BIF", "BMD", "BND", "BRL", "BSD", "BTN", "BWP", "BYN", "BZD", "CAD", "CDF", "CHF",
-    "CLP", "CNY", "COP", "CRC", "CVE", "CZK", "DJF", "DKK", "DOP", "DZD", "EGP", "ERN", "ETB",
-    "EUR", "FJD", "FKP", "GBP", "GEL", "GHS", "GIP", "GMD", "GNF", "GTQ", "GYD", "HKD", "HNL",
-    "HTG", "HUF", "IDR", "ILS", "INR", "IQD", "IRR", "ISK", "JMD", "JOD", "JPY", "KES", "KGS",
-    "KHR", "KMF", "KPW", "KRW", "KWD", "KYD", "KZT", "LAK", "LBP", "LKR", "LRD", "LSL", "LYD",
-    "MAD", "MDL", "MGA", "MKD", "MMK", "MNT", "MRU", "MUR", "MVR", "MWK", "MXN", "MYR", "MZN",
-    "NAD", "NGN", "NIO", "NOK", "NPR", "NZD", "OMR", "PAB", "PGK", "PHP", "PKR", "PLN", "PYG",
-    "QAR", "RON", "RSD", "RUB", "RWF", "SAR", "SBD", "SCR", "SDG", "SEK", "SGD", "SHP", "SLE",
-    "SRD", "SSP", "STN", "SVC", "SYP", "SZL", "THB", "TJS", "TMT", "TND", "TTD", "TWD", "TZS",
-    "UAH", "UGX", "USD", "UYU", "UZS", "VES", "VND", "VUV", "WST", "XAF", "XCD", "XOF", "XPF",
-    "YER", "ZAR", "ZMW", "ZWL",
+    "AED", "AFN", "ALL", "AMD", "ANG", "AOA", "ARS", "AUD", "AWG", "AZN", "BAM", "BBD", "BDT",
+    "BGN", "BHD", "BIF", "BMD", "BND", "BOB", "BRL", "BSD", "BTN", "BWP", "BYN", "BZD", "CAD",
+    "CDF", "CHF", "CLP", "CNY", "COP", "CRC", "CUP", "CVE", "CZK", "DJF", "DKK", "DOP", "DZD",
+    "EGP", "ERN", "ETB", "EUR", "FJD", "FKP", "GBP", "GEL", "GHS", "GIP", "GMD", "GNF", "GTQ",
+    "GYD", "HKD", "HNL", "HTG", "HUF", "IDR", "ILS", "INR", "IQD", "IRR", "ISK", "JMD", "JOD",
+    "JPY", "KES", "KGS", "KHR", "KMF", "KPW", "KRW", "KWD", "KYD", "KZT", "LAK", "LBP", "LKR",
+    "LRD", "LSL", "LYD", "MAD", "MDL", "MGA", "MKD", "MMK", "MNT", "MOP", "MRU", "MUR", "MVR",
+    "MWK", "MXN", "MYR", "MZN", "NAD", "NGN", "NIO", "NOK", "NPR", "NZD", "OMR", "PAB", "PEN",
+    "PGK", "PHP", "PKR", "PLN", "PYG", "QAR", "RON", "RSD", "RUB", "RWF", "SAR", "SBD", "SCR",
+    "SDG", "SEK", "SGD", "SHP", "SLE", "SOS", "SRD", "SSP", "STN", "SVC", "SYP", "SZL", "THB",
+    "TJS", "TMT", "TND", "TOP", "TRY", "TTD", "TWD", "TZS", "UAH", "UGX", "USD", "UYU", "UZS",
+    "VES", "VND", "VUV", "WST", "XAF", "XCD", "XOF", "XPF", "YER", "ZAR", "ZMW", "ZWL",
 ];
 
 /// The currencies [`attached_currency`] can find written with an amount.
@@ -1996,6 +2001,23 @@ Please view this email in an HTML-capable client.\r\n--b\r\nContent-Type: text/h
         // With the currency unread, it is rejected rather than posted in USD.
         let unread = Reads(json!({ "amount": "12.50", "account_ending": "1234" }));
         let usd = vec![account("Liabilities:Card-1234", &["USD"], &[])];
+        let result = extract(&email, &usd, &closed, "USD", &unread, &decide()).await;
+        assert!(matches!(result, Err(Failure::Rejected(_))));
+        // A currency between the amount and a date belongs to the amount.
+        email.body = "Card ending 1234\n45.00 CHF 23 Nov 2026 MIGROS".into();
+        let reads =
+            Reads(json!({ "amount": "45.00", "currency": "CHF", "account_ending": "1234" }));
+        let chf = vec![account("Liabilities:Card-1234", &["USD", "CHF"], &[])];
+        let statement = extract(&email, &chf, &closed, "USD", &reads, &decide())
+            .await
+            .unwrap();
+        assert_eq!(statement.currency, "CHF");
+        let unread = Reads(json!({ "amount": "45.00", "account_ending": "1234" }));
+        let result = extract(&email, &usd, &closed, "USD", &unread, &decide()).await;
+        assert!(matches!(result, Err(Failure::Rejected(_))));
+        // So does a code that is also a word.
+        email.body = "Card ending 1234. Amount: TRY 1,250.00 on 23 Nov 2026.".into();
+        let unread = Reads(json!({ "amount": "1,250.00", "account_ending": "1234" }));
         let result = extract(&email, &usd, &closed, "USD", &unread, &decide()).await;
         assert!(matches!(result, Err(Failure::Rejected(_))));
         // So is a code that has no symbol of its own.
