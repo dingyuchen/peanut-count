@@ -231,8 +231,9 @@ static WRITTEN_NUMBER: LazyLock<Regex> = LazyLock::new(|| {
         // the narrow no-break space.
         r"|[0-9]{1,3}(?:[ \u{a0}\u{202f}\u{2009}\u{2007}][0-9]{3})+,[0-9]{1,2}",
         r"|[0-9]+,[0-9]{2}",
-        // Dots before groups of three, as in rupiah "1.000.000,-".
-        r"|[0-9]{1,3}(?:\.[0-9]{3})+",
+        // Dots before groups of three, as in rupiah "1.000.000,-", taking any
+        // further digits so "12.5050" is read whole.
+        r"|[0-9]{1,3}(?:\.[0-9]{3})+[0-9]*",
         r"|[0-9]+(?:\.[0-9]+)?|\.[0-9]+",
     ))
     .unwrap()
@@ -326,16 +327,29 @@ fn written_amounts(text: &str, value: &str) -> Vec<(String, std::ops::Range<usiz
                 as_written
             };
             // Dots before groups of three may group whole units, as in
-            // "Rp1.000.000,-" or "Rp 50.000", rather than mark a fraction.
-            let dot_grouped = !decimal_comma
-                && found_text.contains('.')
-                && found_text
-                    .split('.')
-                    .skip(1)
-                    .all(|group| group.len() == 3 && group.bytes().all(|b| b.is_ascii_digit()));
+            // "Rp1.000.000,-" or "Rp 50.000", rather than mark a fraction. One
+            // dot is ambiguous, as "12.505 KWD" shows, so that reading needs
+            // two groups, a ",-" after, or rupiah written before.
+            let dots = found_text.matches('.').count();
+            let groups_of_three = found_text
+                .split('.')
+                .skip(1)
+                .all(|group| group.len() == 3 && group.bytes().all(|b| b.is_ascii_digit()));
+            let rupiah = {
+                let before = text[..found.start()].trim_end_matches(SPACES);
+                ["Rp", "IDR"].iter().any(|word| {
+                    before
+                        .strip_suffix(word)
+                        .is_some_and(|rest| !rest.ends_with(char::is_alphabetic))
+                })
+            };
+            let whole_units = !decimal_comma
+                && dots > 0
+                && groups_of_three
+                && (dots >= 2 || text[found.end()..].starts_with(",-") || rupiah);
             let readings = [
-                (found_text.matches('.').count() <= 1).then(|| as_written.clone()),
-                dot_grouped.then(|| found_text.replace('.', "")),
+                (decimal_comma || dots <= 1).then(|| as_written.clone()),
+                whole_units.then(|| found_text.replace('.', "")),
             ];
             let reading = readings
                 .into_iter()
@@ -1541,6 +1555,17 @@ Available balance: SGD 1,204.33.\r\n";
         assert_eq!(
             written_amount("Paid 12.505 KWD", "12.505").as_deref(),
             Some("12.505")
+        );
+        // One dot alone is a fraction, so a 1,000-fold reading is refused.
+        assert_eq!(written_amount("Paid 12.505 KWD", "12505"), None);
+        assert_eq!(written_amount("Paid USD 1.500", "1500"), None);
+        assert_eq!(
+            written_amount("Paid KWD 12.5050", "12.505").as_deref(),
+            Some("12.5050")
+        );
+        assert_eq!(
+            written_amount("Betrag: EUR 1.234.567,89", "1234567.89").as_deref(),
+            Some("1234567.89")
         );
         // Indian grouping, read whole.
         let lakh = "Debited INR 1,25,000.00 from account";
