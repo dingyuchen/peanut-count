@@ -39,6 +39,8 @@ pub struct Email {
     pub subject: String,
     pub sent: Option<NaiveDate>,
     pub body: String,
+    /// The HTML alternative's text, when the body came from plain text.
+    pub alternative: Option<String>,
 }
 
 #[derive(Debug)]
@@ -87,6 +89,10 @@ fn read(outer: MessageRef, raw: &[u8]) -> Email {
     let sent = message.date().and_then(|date| {
         NaiveDate::from_ymd_opt(date.year.into(), date.month.into(), date.day.into())
     });
+    let bounded = |text: String| {
+        truncate_lines(&clean(truncate_lines(&text, MAX_TEXT * 4)), MAX_TEXT).to_owned()
+    };
+    let (body, alternative) = body_text(message);
     Email {
         id,
         from: clean(truncate(&from, MAX_HEADER)),
@@ -98,11 +104,8 @@ fn read(outer: MessageRef, raw: &[u8]) -> Email {
         sent,
         // Bound the text before cleaning it, leaving room for the whitespace
         // that cleaning removes, and cut at a line so no value is split.
-        body: truncate_lines(
-            &clean(truncate_lines(&body_text(message), MAX_TEXT * 4)),
-            MAX_TEXT,
-        )
-        .to_owned(),
+        body: bounded(body),
+        alternative: alternative.map(bounded),
     }
 }
 
@@ -112,10 +115,10 @@ static BLOCK_TAG: LazyLock<Regex> = LazyLock::new(|| {
 
 static CELL_TAG: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)<(/?t[dh]\b)").unwrap());
 
-/// The first text body. HTML gets a line break at each row and block tag and
-/// a space between table cells, so a row such as "Total | SGD 12.50" reads as
-/// one line.
-fn body_text(message: MessageRef) -> String {
+/// The first text body, and the HTML alternative's text when the body is
+/// plain text. HTML gets a line break at each row and block tag and a space
+/// between table cells, so a row such as "Total | SGD 12.50" reads as one line.
+fn body_text(message: MessageRef) -> (String, Option<String>) {
     let is_html = |part: &MessagePart| matches!(part.kind(), PartKind::Html);
     let as_text = |part: MessagePart| {
         let body = part.text().unwrap_or_default();
@@ -132,17 +135,9 @@ fn body_text(message: MessageRef) -> String {
     };
     let html_part = message.html_body().find(is_html);
     match message.text_body().find(MessagePart::is_text) {
-        Some(part) if is_html(&part) => as_text(part),
-        Some(part) => {
-            let text = as_text(part);
-            // A plain-text alternative such as "View this email in HTML"
-            // states no figures; read the HTML alternative instead.
-            match html_part {
-                Some(html) if !text.contains(|c: char| c.is_ascii_digit()) => as_text(html),
-                _ => text,
-            }
-        }
-        None => html_part.map(as_text).unwrap_or_default(),
+        Some(part) if is_html(&part) => (as_text(part), None),
+        Some(part) => (as_text(part), html_part.map(as_text)),
+        None => (html_part.map(as_text).unwrap_or_default(), None),
     }
 }
 
@@ -222,9 +217,10 @@ fn truncate(text: &str, chars: usize) -> &str {
 }
 
 /// A number as written in the text: optionally grouped with commas or
-/// apostrophes, with an optional decimal fraction.
+/// apostrophes, with an optional decimal fraction, or a bare fraction such as
+/// ".50".
 static WRITTEN_NUMBER: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"[0-9]{1,3}(?:[,'’][0-9]{3})+(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?").unwrap()
+    Regex::new(r"[0-9]{1,3}(?:[,'’][0-9]{3})+(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?|\.[0-9]+").unwrap()
 });
 
 /// A number without grouping, leading zeros, or trailing fraction zeros, so
@@ -235,7 +231,7 @@ fn canonical(number: &str) -> Option<String> {
         .filter(|c| !matches!(c, ',' | '\'' | '’' | ' '))
         .collect();
     let (whole, fraction) = plain.split_once('.').unwrap_or((&plain, ""));
-    if whole.is_empty()
+    if (whole.is_empty() && fraction.is_empty())
         || !whole.bytes().all(|b| b.is_ascii_digit())
         || !fraction.bytes().all(|b| b.is_ascii_digit())
     {
@@ -261,20 +257,31 @@ fn written_amount(text: &str, value: &str) -> Option<String> {
     if wanted.len() > 24 || !wanted.bytes().any(|b| matches!(b, b'1'..=b'9')) {
         return None;
     }
+    let digit = |c: Option<char>| c.is_some_and(|c| c.is_ascii_digit());
+    let separator = |c: Option<char>| matches!(c, Some('.' | ',' | '\'' | '’'));
     WRITTEN_NUMBER.find_iter(text).find_map(|found| {
-        // Skip part of a longer number, such as the "12" of "12.505".
-        let after = &text[found.end()..];
-        let continues = after.starts_with(|c: char| c.is_ascii_digit())
-            || (after.starts_with(['.', ','])
-                && after[1..].starts_with(|c: char| c.is_ascii_digit()));
+        // Skip part of a longer number, such as the "12" of "12.505" or the
+        // "50" of "1.50".
+        let mut after = text[found.end()..].chars();
+        let mut before = text[..found.start()].chars().rev();
+        let (next, prev) = (after.next(), before.next());
+        let fragment = digit(next)
+            || digit(prev)
+            || (separator(next) && digit(after.next()))
+            || (separator(prev) && digit(before.next()));
         let as_written = found.as_str().replace([',', '\'', '’'], "");
-        (!continues && canonical(&as_written).as_deref() == Some(wanted.as_str()))
+        let as_written = if as_written.starts_with('.') {
+            format!("0{as_written}")
+        } else {
+            as_written
+        };
+        (!fragment && canonical(&as_written).as_deref() == Some(wanted.as_str()))
             .then_some(as_written)
     })
 }
 
-/// Symbols that name exactly one currency.
-const SYMBOLS: [(&str, &str); 17] = [
+/// Symbols other than "$" that name exactly one currency.
+const SYMBOLS: [(&str, &str); 8] = [
     ("€", "EUR"),
     ("£", "GBP"),
     ("₹", "INR"),
@@ -283,56 +290,111 @@ const SYMBOLS: [(&str, &str); 17] = [
     ("฿", "THB"),
     ("₫", "VND"),
     ("₪", "ILS"),
-    ("US$", "USD"),
-    ("S$", "SGD"),
-    ("A$", "AUD"),
-    ("AU$", "AUD"),
-    ("C$", "CAD"),
-    ("CA$", "CAD"),
-    ("HK$", "HKD"),
-    ("NZ$", "NZD"),
-    ("NT$", "TWD"),
 ];
 
-/// Whether `text` states the currency `code`: by the code itself, by a
-/// symbol that names only that currency, or by "¥" for yuan or yen. A code
-/// the model inferred from a bare "$", which several currencies share, is
-/// not stated.
+/// Letters written directly before "$" that name one dollar currency.
+const DOLLARS: [(&str, &str); 12] = [
+    ("US", "USD"),
+    ("S", "SGD"),
+    ("SG", "SGD"),
+    ("A", "AUD"),
+    ("AU", "AUD"),
+    ("C", "CAD"),
+    ("CA", "CAD"),
+    ("HK", "HKD"),
+    ("NZ", "NZD"),
+    ("NT", "TWD"),
+    ("R", "BRL"),
+    ("MX", "MXN"),
+];
+
+/// A "$" with the whole run of letters written directly before it.
+static DOLLAR: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"([A-Za-z]*)\$").unwrap());
+
+/// Whether `text` states the currency `code`: by the code with no letter
+/// touching it, as in "SGD 12.50" or "SGD12.50"; by a symbol that names only
+/// that currency; or by a prefixed dollar sign such as "US$", read whole so
+/// "US$" never counts as "S$". A bare "$" or "¥", which several currencies
+/// share, states none, unless 元, RMB, or 円 settles "¥".
 fn states_currency(text: &str, code: &str) -> bool {
     if code.len() != 3 || !code.bytes().all(|b| b.is_ascii_uppercase()) {
         return false;
     }
-    let word = Regex::new(&format!(r"\b{code}\b")).unwrap();
-    word.is_match(text)
+    let touches = |c: Option<char>| c.is_some_and(|c| c.is_alphabetic());
+    let by_code = text.match_indices(code).any(|(at, _)| {
+        !touches(text[..at].chars().next_back()) && !touches(text[at + 3..].chars().next())
+    });
+    let by_dollar = DOLLAR.captures_iter(text).any(|caps| {
+        DOLLARS
+            .iter()
+            .any(|(prefix, named)| *named == code && caps[1].eq_ignore_ascii_case(prefix))
+    });
+    by_code
+        || by_dollar
         || SYMBOLS
             .iter()
             .any(|(symbol, named)| *named == code && text.contains(symbol))
-        || (code == "CNY" && (text.contains('¥') || text.contains('元') || text.contains("RMB")))
-        || (code == "JPY" && (text.contains('¥') || text.contains('円')))
+        || (code == "CNY" && text.contains('¥') && (text.contains('元') || text.contains("RMB")))
+        || (code == "JPY" && text.contains('¥') && text.contains('円'))
 }
 
 const MONTHS: [&str; 12] = [
     "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
 ];
 
-/// The model's ISO date when it is plausible and the text writes its day and
-/// month, as digits or a month name. Its year may be inferred, since many
-/// alerts omit it.
+/// The model's ISO date when it is plausible and one date expression in the
+/// text writes its day and month together, as digits or with a month name.
+/// A year written in that expression must match; a yearless expression, as
+/// many alerts write, takes the model's inferred year.
 fn written_date(text: &str, value: &str, latest: NaiveDate) -> Option<NaiveDate> {
     let date = NaiveDate::parse_from_str(value.trim(), "%Y-%m-%d").ok()?;
     let first = NaiveDate::from_ymd_opt(1900, 1, 1)?;
     if !(first..=latest).contains(&date) {
         return None;
     }
-    let numbers: Vec<u32> = text
-        .split(|c: char| !c.is_ascii_digit())
-        .filter(|run| (1..=2).contains(&run.len()))
-        .filter_map(|run| run.parse().ok())
-        .collect();
-    let lower = text.to_lowercase();
-    let day = numbers.contains(&date.day());
-    let month = numbers.contains(&date.month()) || lower.contains(MONTHS[date.month0() as usize]);
-    (day && month).then_some(date)
+    let (d, m, mon) = (date.day(), date.month(), MONTHS[date.month0() as usize]);
+    let year = r"(?P<year>[0-9]{4}|[0-9]{2})";
+    let patterns = [
+        format!(r"(?i)\b(?P<year>[0-9]{{4}})[-/.]0?{m}[-/.]0?{d}(?:T|\b)"),
+        format!(r"\b0?{d}[/.-]0?{m}(?:[/.-]{year})?\b"),
+        format!(r"\b0?{m}[/.-]0?{d}(?:[/.-]{year})?\b"),
+        format!(r"(?i)\b0?{d}(?:st|nd|rd|th)?[ -]*{mon}[a-z]*\.?(?:[ ,-]+{year})?\b"),
+        format!(r"(?i)\b{mon}[a-z]*\.?[ -]*0?{d}(?:st|nd|rd|th)?\b(?:,? +{year}\b)?"),
+    ];
+    // An expression that starts right after a digit and a separator is the
+    // tail of a longer date, as the "11-23" of "2026-11-23".
+    let tail = |caps: &regex::Captures| {
+        let mut before = text[..caps.get(0).unwrap().start()].chars().rev();
+        matches!(before.next(), Some('/' | '.' | '-'))
+            && before.next().is_some_and(|c| c.is_ascii_digit())
+    };
+    let agrees = |caps: &regex::Captures| match caps.name("year") {
+        None => true,
+        Some(written) => {
+            let value: i32 = written.as_str().parse().unwrap_or(-1);
+            let value = if written.len() == 2 {
+                2000 + value
+            } else {
+                value
+            };
+            // A number that runs on is an hour or an amount, not a year, as in
+            // "23 Nov 10:15" or "23 Nov 25.00".
+            let rest = &text[written.end()..];
+            let runs_on = rest.starts_with(':')
+                || (rest.starts_with(['.', ','])
+                    && rest[1..].starts_with(|c: char| c.is_ascii_digit()));
+            value == date.year() || runs_on
+        }
+    };
+    patterns
+        .iter()
+        .filter_map(|pattern| Regex::new(pattern).ok())
+        .any(|pattern| {
+            pattern
+                .captures_iter(text)
+                .any(|caps| !tail(&caps) && agrees(&caps))
+        })
+        .then_some(date)
 }
 
 /// The text with whitespace collapsed and lower-cased, for finding a phrase.
@@ -495,6 +557,34 @@ const EXTRACTION_PROMPT: &str = "You read one bank, card, or payment notificatio
 - payee: the merchant, person, or organisation on the other side, exactly as written.\n\
 - account_ending: the digits of the user's card or account number that the email names, such as 1234 for \"card ending 1234\".";
 
+/// Whether the model's answer has every field with an allowed type, so a
+/// malformed answer is retried rather than read as a missing value.
+fn matches_schema(answer: &Value) -> bool {
+    let Some(fields) = answer.as_object() else {
+        return false;
+    };
+    let text = |key: &str| {
+        fields
+            .get(key)
+            .is_some_and(|v| v.is_null() || v.is_string())
+    };
+    fields.get("is_transaction").is_some_and(Value::is_boolean)
+        && fields
+            .get("direction")
+            .is_some_and(|v| v.is_null() || v == "out" || v == "in")
+        && [
+            "amount",
+            "currency",
+            "settled_amount",
+            "settled_currency",
+            "date",
+            "payee",
+            "account_ending",
+        ]
+        .iter()
+        .all(|key| text(key))
+}
+
 fn extraction_schema() -> Value {
     let text = json!({ "type": ["string", "null"] });
     json!({
@@ -513,17 +603,24 @@ fn extraction_schema() -> Value {
     })
 }
 
-/// Chooses a statement row for `email` against the ledger's open accounts.
-pub async fn extract(
-    email: &Email,
-    accounts: &[OpenAccount],
-    closed: &[String],
-    default_currency: &str,
-    reader: &impl Extract,
-    model: &impl Decide,
-) -> Result<Statement, Failure> {
-    let is_closed = |name: &str| closed.iter().any(|closed| closed == name);
-    let text = format!("{}\n{}", email.subject, email.body);
+/// The fields of a transaction read from one body of an email, each checked
+/// against that body's text.
+struct Reading {
+    text: String,
+    message: String,
+    outgoing: bool,
+    amount: String,
+    currency: Option<String>,
+    settled: Option<(String, Option<String>)>,
+    date: NaiveDate,
+    payee: Option<String>,
+    ending: Option<String>,
+}
+
+/// Reads the transaction from `body`, rejecting it when the model says it is
+/// none or its amount is not written in the text.
+async fn read_body(email: &Email, body: &str, reader: &impl Extract) -> Result<Reading, Failure> {
+    let text = format!("{}\n{}", email.subject, body);
     if text.trim().is_empty() {
         return Err(rejected("The email has no readable text."));
     }
@@ -532,18 +629,21 @@ pub async fn extract(
         email.from,
         email.subject,
         email.sent.map(|date| date.to_string()).unwrap_or_default(),
-        email.body,
+        body,
     );
     let raw = reader
         .extract(EXTRACTION_PROMPT, &message, &extraction_schema())
         .await
         .map_err(Failure::Unavailable)?;
-    let found: Extraction = serde_json::from_value(raw).map_err(|error| {
+    let malformed = || {
         Failure::Unavailable(anyhow::anyhow!(
-            "extraction model answer does not match the schema ({:?} error)",
-            error.classify()
+            "extraction model answer does not match the schema"
         ))
-    })?;
+    };
+    if !matches_schema(&raw) {
+        return Err(malformed());
+    }
+    let found: Extraction = serde_json::from_value(raw).map_err(|_| malformed())?;
     if !found.is_transaction {
         return Err(rejected(
             "The email does not look like a single completed transaction.",
@@ -596,6 +696,50 @@ pub async fn extract(
         .account_ending
         .as_deref()
         .and_then(|value| written_ending(&text, value));
+    Ok(Reading {
+        text,
+        message,
+        outgoing,
+        amount,
+        currency,
+        settled,
+        date,
+        payee,
+        ending,
+    })
+}
+
+/// Chooses a statement row for `email` against the ledger's open accounts.
+pub async fn extract(
+    email: &Email,
+    accounts: &[OpenAccount],
+    closed: &[String],
+    default_currency: &str,
+    reader: &impl Extract,
+    model: &impl Decide,
+) -> Result<Statement, Failure> {
+    let is_closed = |name: &str| closed.iter().any(|closed| closed == name);
+    // A plain-text alternative can be a stub such as "View this alert online"
+    // while the HTML alternative holds the receipt, so try that before
+    // rejecting the email.
+    let reading = match read_body(email, &email.body, reader).await {
+        Err(Failure::Rejected(reason)) => match &email.alternative {
+            Some(html) => read_body(email, html, reader).await?,
+            None => return Err(Failure::Rejected(reason)),
+        },
+        other => other?,
+    };
+    let Reading {
+        text,
+        message,
+        outgoing,
+        amount,
+        currency,
+        settled,
+        date,
+        payee,
+        ending,
+    } = reading;
 
     let mut sources: BTreeMap<String, String> = accounts
         .iter()
@@ -693,13 +837,14 @@ pub async fn extract(
             }
         })
     };
-    // Keep the account the email identifies. If the amount is in a currency it
-    // cannot hold, such as a foreign purchase price, use the settled amount.
-    let (number, currency) = match (resolve(&currency), &settled) {
-        (code, _) if accepts(&source, &code) => (amount, code),
-        (_, Some((settled, code))) if accepts(&source, &resolve(code)) => {
+    // Keep the account the email identifies. A stated settled amount is what
+    // the account was actually charged or credited, so it wins when the account
+    // accepts it; otherwise use the amount itself.
+    let (number, currency) = match (&settled, resolve(&currency)) {
+        (Some((settled, code)), _) if accepts(&source, &resolve(code)) => {
             (settled.clone(), resolve(code))
         }
+        (_, code) if accepts(&source, &code) => (amount, code),
         // Rejection reasons reach the relay or a bounce, so they name no
         // account and no configured currency.
         _ => {
@@ -917,6 +1062,12 @@ Available balance: SGD 1,204.33.\r\n";
         assert_eq!(written_amount(text, "1246.00"), None);
         assert_eq!(written_amount(text, "0.00"), None);
         assert_eq!(written_amount(text, "about 12"), None);
+        // A bare fraction is read whole, never its digits alone.
+        assert_eq!(
+            written_amount("Fee USD .50", ".50").as_deref(),
+            Some("0.50")
+        );
+        assert_eq!(written_amount("Fee USD .50", "50"), None);
     }
 
     #[test]
@@ -924,7 +1075,13 @@ Available balance: SGD 1,204.33.\r\n";
         assert!(states_currency("Paid SGD 12.50", "SGD"));
         assert!(states_currency("Paid S$12.50", "SGD"));
         assert!(states_currency("Paid €12.50", "EUR"));
-        assert!(states_currency("消费 ¥128.50", "CNY"));
+        assert!(states_currency("Paid SGD12.50", "SGD"));
+        assert!(states_currency("Paid US$12.50", "USD"));
+        assert!(states_currency("消费 ¥128.50 元", "CNY"));
+        // "US$" is not "S$", and a bare "¥" is yuan or yen.
+        assert!(!states_currency("Paid US$12.50", "SGD"));
+        assert!(!states_currency("消费 ¥128.50", "CNY"));
+        assert!(!states_currency("Paid USDT 5", "USD"));
         // A bare "$" names no single currency.
         assert!(!states_currency("Paid $12.50", "USD"));
         assert!(!states_currency("Paid SGD 12.50", "USD"));
@@ -940,6 +1097,24 @@ Available balance: SGD 1,204.33.\r\n";
         assert_eq!(ok("on 11/23/2026", "2026-11-23"), Some(date("2026-11-23")));
         assert_eq!(
             ok("Transaction date: 2026-11-23T23:58", "2026-11-23"),
+            Some(date("2026-11-23"))
+        );
+        // Day and month come from one expression, and a written year must match.
+        let iso = "Transaction date: 2026-11-23. Amount: USD 12.50";
+        assert_eq!(ok(iso, "2026-11-12"), None);
+        assert_eq!(ok(iso, "2025-11-23"), None);
+        assert_eq!(
+            ok("Date: 23-Nov-25", "2025-11-23"),
+            Some(date("2025-11-23"))
+        );
+        assert_eq!(ok("Date: 23-Nov-25", "2026-11-23"), None);
+        // An hour or an amount after the date is not its year.
+        assert_eq!(
+            ok("on 23 Nov 10:15", "2026-11-23"),
+            Some(date("2026-11-23"))
+        );
+        assert_eq!(
+            ok("23 Nov 25.00 SGD", "2026-11-23"),
             Some(date("2026-11-23"))
         );
         // A date the email does not write, a future date, or no date at all.
@@ -1177,7 +1352,8 @@ Content-Type: multipart/alternative; boundary=b\r\n\r\n--b\r\nContent-Type: text
 Please view this email in an HTML-capable client.\r\n--b\r\nContent-Type: text/html\r\n\r\n\
 <p>You spent <b>SGD 12.50</b> at KOPITIAM.</p>\r\n--b--\r\n";
         let email = parse(alternative.as_bytes()).unwrap();
-        assert!(email.body.contains("SGD 12.50"), "{:?}", email.body);
+        let html = email.alternative.unwrap_or_default();
+        assert!(html.contains("SGD 12.50"), "{html:?}");
 
         // Each table row reads as one line.
         let html = "Message-ID: <h1@bank.example>\r\nSubject: Alert\r\nContent-Type: text/html\r\n\r\n\
@@ -1332,6 +1508,99 @@ Please view this email in an HTML-capable client.\r\n--b\r\nContent-Type: text/h
         unsettled["settled_amount"] = Value::Null;
         let result = extract(&email, &accounts, &[], "USD", &Reads(unsettled), &model).await;
         assert!(matches!(result, Err(Failure::Rejected(_))));
+    }
+
+    #[tokio::test]
+    async fn a_stated_settled_amount_wins_when_the_account_accepts_it() {
+        let mut email = parse(ALERT.as_bytes()).unwrap();
+        email.body =
+            "Purchase EUR 50.00, charged SGD 75.30 to card ending 1234 on 21 Nov 2026.".into();
+        let reads = Reads(json!({
+            "amount": "50.00", "currency": "EUR", "settled_amount": "75.30",
+            "settled_currency": "SGD", "account_ending": "1234",
+        }));
+        // This card accepts any currency, so EUR 50.00 would also fit.
+        let open = vec![
+            account("Liabilities:DBS-Card-1234", &[], &[]),
+            account("Expenses:Coffee", &[], &[]),
+        ];
+        let statement = extract(&email, &open, &[], "USD", &reads, &card_answers())
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                statement.currency.as_str(),
+                statement.rows[0].amount.as_str()
+            ),
+            ("SGD", "-75.30")
+        );
+    }
+
+    /// Reads nothing from a body containing `stub`, and `fields` from any other.
+    struct StubThenHtml {
+        stub: &'static str,
+        fields: Value,
+    }
+
+    impl Extract for StubThenHtml {
+        async fn extract(&self, system: &str, text: &str, schema: &Value) -> Result<Value> {
+            if text.contains(self.stub) {
+                Reads(json!({ "is_transaction": false }))
+                    .extract(system, text, schema)
+                    .await
+            } else {
+                Reads(self.fields.clone())
+                    .extract(system, text, schema)
+                    .await
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stub_plain_text_falls_back_to_the_html_alternative() {
+        let mut email = parse(ALERT.as_bytes()).unwrap();
+        email.body = "View this alert online at https://bank.example/a/2026 (c) 2026".into();
+        email.alternative = Some("You spent SGD 12.50 at KOPITIAM on 23 Nov 2026.".into());
+        let reader = StubThenHtml {
+            stub: "View this alert online",
+            fields: json!({ "amount": "12.50", "currency": "SGD", "payee": "KOPITIAM" }),
+        };
+        let statement = extract(
+            &email,
+            &card_alert_accounts(),
+            &[],
+            "USD",
+            &reader,
+            &card_answers(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(statement.rows[0].description, "KOPITIAM");
+    }
+
+    /// Returns `0` exactly as the model's answer.
+    struct Raw(Value);
+
+    impl Extract for Raw {
+        async fn extract(&self, _: &str, _: &str, _: &Value) -> Result<Value> {
+            Ok(self.0.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_malformed_answer_is_retried() {
+        let email = parse(ALERT.as_bytes()).unwrap();
+        let reader = Raw(json!({ "is_transaction": true, "amount": "12.50" }));
+        let result = extract(
+            &email,
+            &card_alert_accounts(),
+            &[],
+            "USD",
+            &reader,
+            &card_answers(),
+        )
+        .await;
+        assert!(matches!(result, Err(Failure::Unavailable(_))));
     }
 
     #[tokio::test]
