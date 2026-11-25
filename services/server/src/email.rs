@@ -335,20 +335,27 @@ fn written_amounts(text: &str, value: &str) -> Vec<(String, std::ops::Range<usiz
                 .split('.')
                 .skip(1)
                 .all(|group| group.len() == 3 && group.bytes().all(|b| b.is_ascii_digit()));
+            // Rupiah written as a word on either side, as in "Rp 50.000" or
+            // "50.000 IDR".
             let rupiah = {
                 let before = text[..found.start()].trim_end_matches(SPACES);
+                let after = text[found.end()..].trim_start_matches(SPACES);
                 ["Rp", "IDR"].iter().any(|word| {
                     before
                         .strip_suffix(word)
                         .is_some_and(|rest| !rest.ends_with(char::is_alphabetic))
+                        || after
+                            .strip_prefix(word)
+                            .is_some_and(|rest| !rest.starts_with(char::is_alphabetic))
                 })
             };
             let whole_units = !decimal_comma
                 && dots > 0
                 && groups_of_three
                 && (dots >= 2 || text[found.end()..].starts_with(",-") || rupiah);
+            // With whole units established, the dot is no fraction.
             let readings = [
-                (decimal_comma || dots <= 1).then(|| as_written.clone()),
+                (decimal_comma || (dots <= 1 && !whole_units)).then(|| as_written.clone()),
                 whole_units.then(|| found_text.replace('.', "")),
             ];
             let reading = readings
@@ -1559,6 +1566,12 @@ Available balance: SGD 1,204.33.\r\n";
         // One dot alone is a fraction, so a 1,000-fold reading is refused.
         assert_eq!(written_amount("Paid 12.505 KWD", "12505"), None);
         assert_eq!(written_amount("Paid USD 1.500", "1500"), None);
+        assert_eq!(
+            written_amount("Bayar 50.000 IDR", "50000").as_deref(),
+            Some("50000")
+        );
+        assert_eq!(written_amount("Bayar Rp 50.000", "50"), None);
+        assert_eq!(written_amount("Bayar 50.000 IDR", "50"), None);
         assert_eq!(
             written_amount("Paid KWD 12.5050", "12.505").as_deref(),
             Some("12.5050")
