@@ -1268,6 +1268,22 @@ pub async fn extract(
     };
 
     let (number, currency) = post(&source)?;
+    // The other side of a transfer, named by its verified number, must take
+    // the same currency, since a statement row has one; otherwise it would
+    // fall to Uncategorized and leave that account untouched.
+    if let Some(other) = other.as_deref() {
+        let mut named = accounts.iter().filter(|account| {
+            (account.name.starts_with("Assets:") || account.name.starts_with("Liabilities:"))
+                && names_number(&account.name, other)
+        });
+        if let (Some(account), None) = (named.next(), named.next())
+            && !account.accepts(&currency)
+        {
+            return Err(rejected(
+                "The transfer is between accounts that do not share a currency. Record it by hand.",
+            ));
+        }
+    }
 
     // The category was asked before the source was known, so it may name the
     // source itself, or an account that does not take the currency; then, or
@@ -2644,6 +2660,25 @@ Please view this email in an HTML-capable client.\r\n--b\r\nContent-Type: text/h
         let result = extract(&email, &before, &[], "USD", &reads, &model).await;
         assert!(matches!(result, Err(Failure::Rejected(_))));
         assert!(model.calls.into_inner().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_transfer_across_currencies_is_refused() {
+        let mut email = parse(ALERT.as_bytes()).unwrap();
+        email.body = "SGD 500.00 was debited from checking ending 1234 and EUR 330.00 credited to savings ending 5678 on 23 Nov 2026.".into();
+        let ledger = vec![
+            account("Assets:Checking-1234", &["SGD"], &[]),
+            account("Assets:Savings-5678", &["EUR"], &[]),
+        ];
+        let reads = Reads(json!({
+            "amount": "500.00", "currency": "SGD", "from_account": "1234", "to_account": "5678",
+        }));
+        let model = fixed(Answers::from([(
+            "category".into(),
+            choice("Expenses:Uncategorized", &[("Expenses:Uncategorized", 0.9)]),
+        )]));
+        let result = extract(&email, &ledger, &[], "USD", &reads, &model).await;
+        assert!(matches!(result, Err(Failure::Rejected(_))));
     }
 
     #[tokio::test]
