@@ -526,6 +526,19 @@ fn attached_currency(text: &str, span: &std::ops::Range<usize>, code: &str) -> b
             "JPY" => text.contains('円'),
             _ => false,
         };
+    // "JP¥12,500" or "CN¥88.00": letters before "¥" name the currency.
+    let yen_prefix = before.strip_suffix('¥').is_some_and(|rest| {
+        let prefix_len = rest.len()
+            - rest
+                .trim_end_matches(|c: char| c.is_ascii_alphabetic())
+                .len();
+        let named = match &rest[rest.len() - prefix_len..] {
+            "JP" => "JPY",
+            "CN" | "RMB" => "CNY",
+            _ => return false,
+        };
+        named == code
+    });
     let code_after = after
         .strip_prefix('(')
         .and_then(|rest| rest.strip_prefix(code))
@@ -570,6 +583,7 @@ fn attached_currency(text: &str, span: &std::ops::Range<usize>, code: &str) -> b
                 .is_some_and(|rest| !rest.starts_with(char::is_alphabetic))
     });
     code_before(before)
+        || yen_prefix
         || word_before
         || word_after
         || code_below
@@ -944,6 +958,9 @@ fn read_answer(answers: Answers) -> Option<Extraction> {
     }
     serde_json::from_value(Value::Object(fields)).ok()
 }
+
+/// A figure with a fraction, as an amount writes it.
+static FRACTION: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[0-9][.,][0-9]{1,3}\b").unwrap());
 
 /// Words that mark a balance or limit line rather than a transaction amount.
 static BALANCE: LazyLock<Regex> = LazyLock::new(|| {
@@ -1378,7 +1395,11 @@ pub async fn extract(
                     return true;
                 }
                 let balance = BALANCE.is_match(line) || (after_balance && bare(line));
-                after_balance = BALANCE.is_match(line) && !line.chars().any(|c| c.is_ascii_digit());
+                // A label holds the next figure only if it states no amount
+                // itself; an account number in it, as in "ending 5678", is fine.
+                after_balance = BALANCE.is_match(line)
+                    && !FRACTION.is_match(line)
+                    && written_currencies(line).is_empty();
                 !balance
             })
             .collect::<Vec<_>>()
@@ -1753,6 +1774,9 @@ Available balance: SGD 1,204.33.\r\n";
         assert!(stated("Pembayaran RM 10.00", "10.00", "MYR"));
         assert!(stated("Zapłacono 45,00 zł", "45.00", "PLN"));
         assert!(stated("Paid ₺120.00", "120.00", "TRY"));
+        assert!(stated("Card used for JP¥12,500 at LAWSON", "12500", "JPY"));
+        assert!(stated("Card used for CN¥88.00", "88.00", "CNY"));
+        assert!(!stated("Card used for JP¥12,500", "12500", "CNY"));
         // Only as a whole word.
         assert!(!stated("FORM10.00", "10.00", "MYR"));
         assert!(stated("Paid €12.50", "12.50", "EUR"));
@@ -2850,7 +2874,7 @@ Date: Tue, 24 Nov 2026 09:15:00 +0800\r\n\
 Content-Type: text/html; charset=utf-8\r\n\
 \r\n\
 <div>EUR 100.00 debited from checking ending 1234 and credited to savings ending 5678 on 23 Nov 2026.</div>\
-<div>Available balance</div><div>USD 2,450.00</div>\r\n"
+<div>Available balance for account ending 5678</div><div>USD 2,450.00</div>\r\n"
                 .as_bytes(),
         )
         .unwrap();
