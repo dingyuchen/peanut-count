@@ -224,7 +224,7 @@ static WRITTEN_NUMBER: LazyLock<Regex> = LazyLock::new(|| {
         r"|[0-9]{1,3}(?:\.[0-9]{3})+,[0-9]{1,2}",
         // Groups of three after spaces, as in French "1 234,56", including
         // the narrow no-break space.
-        r"|[0-9]{1,3}(?:[ \u{a0}\u{202f}][0-9]{3})+,[0-9]{1,2}",
+        r"|[0-9]{1,3}(?:[ \u{a0}\u{202f}\u{2009}\u{2007}][0-9]{3})+,[0-9]{1,2}",
         r"|[0-9]+,[0-9]{2}",
         r"|[0-9]+(?:\.[0-9]+)?|\.[0-9]+",
     ))
@@ -291,6 +291,17 @@ fn written_amounts(text: &str, value: &str) -> Vec<(String, std::ops::Range<usiz
                 || digit(prev)
                 || (separator(next) && digit(after.next()))
                 || (separator(prev) && digit(before.next()));
+            // Nor the last group of a space-grouped amount, as the "234,56" of
+            // "1 234,56" with a separator not read as grouping.
+            let spaced = matches!(
+                prev,
+                Some(' ' | '\u{a0}' | '\u{202f}' | '\u{2009}' | '\u{2007}')
+            );
+            let last_group = found
+                .as_str()
+                .split_once(',')
+                .is_some_and(|(whole, fraction)| whole.len() == 3 && fraction.len() <= 2);
+            let fragment = fragment || (spaced && last_group && digit(before.next()));
             let found_text = found.as_str();
             // One or two digits after the last comma make it a decimal comma.
             let decimal_comma = found_text.rfind(',').is_some_and(|at| {
@@ -299,7 +310,7 @@ fn written_amounts(text: &str, value: &str) -> Vec<(String, std::ops::Range<usiz
             });
             let as_written = if decimal_comma {
                 found_text
-                    .replace(['.', ' ', '\u{a0}', '\u{202f}'], "")
+                    .replace(['.', ' ', '\u{a0}', '\u{202f}', '\u{2009}', '\u{2007}'], "")
                     .replace(',', ".")
             } else {
                 found_text.replace([',', '\'', '’'], "")
@@ -474,21 +485,23 @@ fn known_currencies() -> impl Iterator<Item = &'static str> {
     ISO_CURRENCIES.iter().copied()
 }
 
-/// How each month's name starts in English, French, German, Spanish,
-/// Italian, Portuguese, and Dutch, as in "Feb", "février", or "febbraio".
+/// Each month's names and abbreviations in English, French, German, Spanish,
+/// Italian, Portuguese, and Dutch, matched whole, so "Main" is not "mai".
+/// Abbreviations that are common English words, such as Portuguese "out" or
+/// "set", are left out.
 const MONTHS: [&str; 12] = [
-    "jan|jän|ene|gen",
-    "feb|fév|fev",
-    "mar|mär",
-    "apr|avr|abr",
-    "may|mai|mag|mei",
-    "jun|juin|giu",
-    "jul|juil|lug",
-    "aug|aoû|aou|ago",
-    "sep|set",
-    "oct|okt|ott|out",
-    "nov",
-    "dec|déc|dez|dic",
+    "january|jan|janvier|janv|januar|jänner|enero|ene|gennaio|janeiro|januari",
+    "february|feb|février|févr|fevrier|fevr|februar|febrero|febbraio|fevereiro|fev|februari",
+    "march|mar|mars|märz|maerz|marzo|março|marco|maart|mrt",
+    "april|apr|avril|avr|abril|abr|aprile",
+    "may|mai|mayo|maggio|maio|mei",
+    "june|jun|juin|juni|junio|giugno|junho",
+    "july|jul|juillet|juil|juli|julio|luglio|julho",
+    "august|aug|août|aout|agosto|augustus",
+    "september|sep|sept|septembre|settembre|setembro|septiembre",
+    "october|oct|octobre|oktober|okt|octubre|ottobre|outubro",
+    "november|nov|novembre|noviembre|novembro",
+    "december|dec|décembre|decembre|déc|dezember|dez|diciembre|dicembre|dezembro",
 ];
 
 /// The model's ISO date when it is plausible and one date expression in the
@@ -513,9 +526,9 @@ fn written_date(text: &str, value: &str, latest: NaiveDate) -> Option<NaiveDate>
         // "23 Nov 2026", "1er février 2026", "25. Februar 2026", or
         // "25 de febrero de 2026".
         format!(
-            r"(?i)\b0?{d}(?:st|nd|rd|th|er|\.)?[ -]*(?:de )?(?:{mon})\p{{L}}*\.?(?:[ ,-]+(?:de )?{year})?\b"
+            r"(?i)\b0?{d}(?:st|nd|rd|th|er|\.)?[ -]*(?:de )?(?:{mon})\b\.?(?:[ ,-]+(?:de )?{year})?\b"
         ),
-        format!(r"(?i)\b(?:{mon})\p{{L}}*\.?[ -]*0?{d}(?:st|nd|rd|th)?\b(?:,? +{year}\b)?"),
+        format!(r"(?i)\b(?:{mon})\b\.?[ -]*0?{d}(?:st|nd|rd|th)?\b(?:,? +{year}\b)?"),
     ];
     // An expression that starts right after a digit and a separator is the
     // tail of a longer date, as the "11-23" of "2026-11-23".
@@ -1443,12 +1456,18 @@ Available balance: SGD 1,204.33.\r\n";
             Some("1250")
         );
         assert_eq!(written_amount("Betrag: 12,50 EUR", "1250"), None);
-        for grouped in ["1 234,56 EUR", "1\u{a0}234,56 EUR", "1\u{202f}234,56 EUR"] {
+        for grouped in [
+            "1 234,56 EUR",
+            "1\u{a0}234,56 EUR",
+            "1\u{202f}234,56 EUR",
+            "1\u{2009}234,56 EUR",
+        ] {
             assert_eq!(
                 written_amount(grouped, "1234.56").as_deref(),
                 Some("1234.56"),
                 "{grouped}"
             );
+            assert_eq!(written_amount(grouped, "234.56"), None, "{grouped}");
         }
     }
 
@@ -1574,6 +1593,13 @@ Available balance: SGD 1,204.33.\r\n";
             Some(date("2026-03-01"))
         );
         assert_eq!(ok("Date: 25 février 2026", "2026-03-25"), None);
+        // Whole month names only.
+        assert_eq!(ok("Paid at 25 Main Street", "2026-05-25"), None);
+        assert_eq!(ok("rated 5 out of 5", "2026-10-05"), None);
+        assert_eq!(
+            ok("on 25 Feb. 2026", "2026-02-25"),
+            Some(date("2026-02-25"))
+        );
     }
 
     #[test]
