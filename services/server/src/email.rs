@@ -303,10 +303,13 @@ fn written_amounts(text: &str, value: &str) -> Vec<(String, std::ops::Range<usiz
         .map(|found| found.range())
         .filter(|range| {
             let before = text[..range.start].chars().next_back();
-            let after = text[range.end..].chars().next();
+            // Punctuation after it continues the number only into digits, so
+            // "You paid XOF 12 500." ends there.
+            let mut rest = text[range.end..].chars();
+            let (after, next) = (rest.next(), rest.next());
             !digit(before)
                 && !digit(after)
-                && !separator(after)
+                && !(separator(after) && digit(next))
                 && WHOLE_CURRENCIES
                     .iter()
                     .any(|code| attached_currency(text, range, code))
@@ -649,8 +652,10 @@ fn written_date(text: &str, value: &str, latest: NaiveDate) -> Option<NaiveDate>
         format!(r"\b0?{d}[/-]0?{m}(?:[/.-]{year})?\b"),
         format!(r"\b0?{m}[/-]0?{d}(?:[/.-]{year})?\b"),
         format!(r"\b0?{d}\.0?{m}\.{year}\b"),
-        // Japanese, as in "2026年11月23日" or "11月23日".
-        format!(r"(?:(?P<year>[0-9]{{4}})年)?0?{m}月0?{d}日"),
+        // Japanese, as in "2026年11月23日" or "11月23日", read whole so the
+        // "1月23日" inside "11月23日" is not January.
+        format!(r"(?P<year>[0-9]{{4}})年0?{m}月0?{d}日"),
+        format!(r"(?:^|[^0-9年])0?{m}月0?{d}日"),
         format!(r"\b0?{m}\.0?{d}\.{year}\b"),
         // "23 Nov 2026", "1er février 2026", "25. Februar 2026", or
         // "25 de febrero de 2026".
@@ -938,6 +943,12 @@ fn read_answer(answers: Answers) -> Option<Extraction> {
     }
     serde_json::from_value(Value::Object(fields)).ok()
 }
+
+/// Words that mark a balance or limit line rather than a transaction amount.
+static BALANCE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)balance|available|limit|solde|saldo|guthaben|disponible|残高|余额|可用")
+        .unwrap()
+});
 
 /// Words that report money which may not have moved.
 static DECLINE: LazyLock<Regex> = LazyLock::new(|| {
@@ -1348,16 +1359,12 @@ pub async fn extract(
             (account.name.starts_with("Assets:") || account.name.starts_with("Liabilities:"))
                 && names_number(&account.name, other)
         });
-        // Only lines naming either account count, so a balance in another
-        // currency on its own line does not.
+        // Every line counts but a balance or limit, so an amount credited in
+        // another currency on its own row does, and "Available balance: USD
+        // 2,450.00" does not.
         let transfer_lines: String = text
             .lines()
-            .filter(|line| {
-                [Some(other), ending.as_deref()]
-                    .into_iter()
-                    .flatten()
-                    .any(|number| written_ending(line, number).is_some())
-            })
+            .filter(|line| !BALANCE.is_match(line))
             .collect::<Vec<_>>()
             .join("\n");
         if let (Some(account), None) = (named.next(), named.next())
@@ -1668,6 +1675,9 @@ Available balance: SGD 1,204.33.\r\n";
         let franc = "Montant : 12 500 XOF";
         assert_eq!(written_amount(franc, "12500").as_deref(), Some("12500"));
         assert_eq!(written_amount(franc, "500"), None);
+        let sentence = "You paid XOF 12 500. Thank you.";
+        assert_eq!(written_amount(sentence, "12500").as_deref(), Some("12500"));
+        assert_eq!(written_amount(sentence, "500"), None);
         assert_eq!(
             written_amount("Nov 23 500.00 SGD", "500.00").as_deref(),
             Some("500.00")
@@ -1857,6 +1867,8 @@ Available balance: SGD 1,204.33.\r\n";
             Some(date("2026-11-23"))
         );
         assert_eq!(ok("ご利用日：2026年11月23日", "2025-11-23"), None);
+        assert_eq!(ok("ご利用日：2026年11月23日", "2026-01-23"), None);
+        assert_eq!(ok("ご利用日：11月23日", "2026-01-23"), None);
         // Whole month names only.
         assert_eq!(ok("Paid at 25 Main Street", "2026-05-25"), None);
         assert_eq!(ok("rated 5 out of 5", "2026-10-05"), None);
@@ -2808,6 +2820,15 @@ Please view this email in an HTML-capable client.\r\n--b\r\nContent-Type: text/h
             .await
             .unwrap();
         assert_eq!(statement.rows[0].account, "Assets:Savings-5678");
+        // An amount credited in another currency on its own row counts.
+        let mut rows = parse(ALERT.as_bytes()).unwrap();
+        rows.body = "From account: ••1234\nTo account: ••5678\nAmount debited: SGD 500.00\nAmount credited: EUR 330.00\nDate: 23 Nov 2026".into();
+        let multi_rows = vec![
+            account("Assets:Checking-1234", &["SGD"], &[]),
+            account("Assets:Savings-5678", &["SGD", "EUR"], &[]),
+        ];
+        let result = extract(&rows, &multi_rows, &[], "USD", &reads, &model).await;
+        assert!(matches!(result, Err(Failure::Rejected(_))));
         // Even when the receiving account takes both currencies.
         let multi = vec![
             account("Assets:Checking-1234", &["SGD"], &[]),
