@@ -292,11 +292,16 @@ const MONTHS: [&str; 12] = [
     "december",
 ];
 
-/// Whether `after` starts with a month name or abbreviation, as the " Nov"
-/// of "23 Nov", so a day number before it is not read as an amount.
+/// Whether `after` starts with a month name or abbreviation, as the " Nov",
+/// "-Nov", or "rd Nov" after a day number in "23 Nov", "23-Nov", or "23rd Nov".
 fn starts_with_month(after: &str) -> bool {
-    let word: String = after
-        .trim_start_matches(' ')
+    let lower = after.to_ascii_lowercase();
+    let rest = ["st", "nd", "rd", "th"]
+        .iter()
+        .find_map(|suffix| lower.strip_prefix(suffix))
+        .unwrap_or(&lower);
+    let word: String = rest
+        .trim_start_matches([' ', '-'])
         .chars()
         .take_while(char::is_ascii_alphabetic)
         .collect::<String>()
@@ -388,10 +393,9 @@ fn partial_number(before: &str, number: &str, after: &str) -> bool {
     let whole = number.split('.').next().unwrap_or_default();
     digit(next)
         || digit(prev)
-        // Part of a date or time, as the "11" of "CAD 11/23/2026" or the
-        // "23" of "CAD 23 Nov".
+        // Part of a date or time, as the "11" of "CAD 11/23/2026". A day such
+        // as the "5" of "SGD 5 May 12" stays a candidate for the model.
         || continues_number(after)
-        || is_day_of_month(number, after)
         || (decimal_mark(next) && digit(next2))
         || (decimal_mark(prev) && digit(prev2))
         || (group_space(next)
@@ -406,11 +410,13 @@ fn partial_number(before: &str, number: &str, after: &str) -> bool {
             && whole.len() == 3
             && !whole.contains(',')
             && {
-                let token = before[..before.len() - prev.map_or(0, char::len_utf8)]
-                    .rsplit(char::is_whitespace)
-                    .next()
-                    .unwrap_or_default();
-                (1..=3).contains(&token.len()) && token.bytes().all(|b| b.is_ascii_digit())
+                // The digits right before the separator, which may touch a
+                // currency marker as in "CHF1’234.50", unless a date or time
+                // separator precedes them.
+                let head = &before[..before.len() - prev.map_or(0, char::len_utf8)];
+                let digits = head.len() - head.trim_end_matches(|c: char| c.is_ascii_digit()).len();
+                let lead = head[..head.len() - digits].chars().next_back();
+                (1..=3).contains(&digits) && !matches!(lead, Some('-' | '/' | '.' | ':' | ','))
             })
 }
 
@@ -761,11 +767,11 @@ pub fn dates(text: &str, anchor: NaiveDate) -> Vec<(NaiveDate, String)> {
                     vec![(year, b, a), (year, a, b)]
                 }
             };
-            // In "23 Nov 25 SGD" the 25 may be the year or the amount, so offer
-            // the yearless reading too.
+            // In "23 Nov 25 SGD" or "23 Nov 1250 SGD" the number may be the year
+            // or the amount, so offer the yearless reading too.
             if caps
                 .name("year")
-                .is_some_and(|year| year.len() <= 2 && CODE_AFTER.is_match(&text[year.end()..]))
+                .is_some_and(|year| CODE_AFTER.is_match(&text[year.end()..]))
             {
                 let yearless: Vec<_> = readings.iter().map(|&(_, m, d)| (None, m, d)).collect();
                 readings.extend(yearless);
@@ -1460,6 +1466,11 @@ Available balance: SGD 1,204.33.\r\n";
             both.contains(&date("2025-11-23")) && both.contains(&date("2026-11-23")),
             "{both:?}"
         );
+        let four: Vec<_> = dates("23 Nov 1250 SGD", anchor)
+            .into_iter()
+            .map(|(d, _)| d)
+            .collect();
+        assert!(four.contains(&date("2026-11-23")), "{four:?}");
         // A yearless date after the anchor belongs to the previous year.
         assert_eq!(dates("on 30 Dec", anchor)[0].0, date("2025-12-30"));
     }
@@ -1513,12 +1524,23 @@ Available balance: SGD 1,204.33.\r\n";
                 ("33.50".into(), "SGD".into())
             ]
         );
-        // A day-and-month date after the code is not the next amount.
-        let found: Vec<_> = amounts("Total $25.00 CAD 23 Nov")
-            .into_iter()
-            .map(|(m, _)| (m.number, m.currency.unwrap()))
-            .collect();
-        assert_eq!(found, [("25.00".into(), "CAD".into())]);
+        // A day-and-month date after the code is not the next amount, so the
+        // amount keeps CAD; the day stays an extra candidate for the model.
+        for dated in [
+            "Total $25.00 CAD 23 Nov",
+            "Total $25.00 CAD 23-Nov",
+            "Total $25.00 CAD 23rd Nov",
+        ] {
+            let found: Vec<_> = amounts(dated)
+                .into_iter()
+                .map(|(m, _)| (m.number, m.currency))
+                .collect();
+            assert_eq!(found[0], ("25.00".into(), Some("CAD".into())), "{dated}");
+        }
+        // A marked amount before a month name stays a candidate.
+        assert_eq!(amounts("Paid SGD 5 May 12 at Cafe")[0].0.number, "5");
+        // A glued currency marker does not hide a thousands group.
+        assert!(amounts("Total CHF1’234.50 CHF").is_empty());
         // The end of an ISO date is not a thousands group.
         let found = amounts("Paid on 2026-11-23 250.00 SGD");
         assert_eq!(found.len(), 1);
