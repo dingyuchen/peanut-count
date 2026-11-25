@@ -1,3 +1,6 @@
+mod clairic;
+mod email;
+mod inbound;
 mod ledger;
 mod mcp;
 mod mobile;
@@ -71,6 +74,19 @@ enum Command {
         /// Directory for the account registry and individual ledgers.
         #[arg(long)]
         data: PathBuf,
+        #[command(flatten)]
+        inbound: inbound::InboundArgs,
+    },
+    /// Import one forwarded transaction email from standard input, for an MTA pipe.
+    IngestEmail {
+        /// Directory for the account registry and individual ledgers.
+        #[arg(long)]
+        data: PathBuf,
+        /// Envelope recipient, the account's forwarding address.
+        #[arg(long)]
+        recipient: String,
+        #[command(flatten)]
+        inbound: inbound::InboundArgs,
     },
     /// Serve the Streamable HTTP MCP endpoint.
     Serve {
@@ -163,8 +179,23 @@ async fn main() -> Result<()> {
         }
         Command::Status => print_json(&Store::open(&db)?.status()?)?,
         Command::DiscardPending { id } => Store::open(&db)?.discard_pending(&id.to_string())?,
-        Command::MobileServe { listen, data } => {
-            mobile::serve(listen, data).await?;
+        Command::MobileServe {
+            listen,
+            data,
+            inbound,
+        } => {
+            let relay_token = std::env::var("PEANUT_INBOUND_TOKEN").ok();
+            mobile::serve(listen, data, inbound.config()?, relay_token).await?;
+        }
+        Command::IngestEmail {
+            data,
+            recipient,
+            inbound,
+        } => {
+            let code = inbound::ingest_stdin(data, inbound.config(), recipient).await;
+            if code != 0 {
+                std::process::exit(code);
+            }
         }
         Command::Serve {
             listen,

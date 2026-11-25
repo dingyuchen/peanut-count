@@ -315,3 +315,39 @@ fn beancount_accepts_investment_export() {
         String::from_utf8_lossy(&result.stderr)
     );
 }
+
+#[test]
+fn a_late_entry_before_a_close_is_reversed_on_or_before_the_close() {
+    let records = |reversed: &str| {
+        vec![
+            open("Liabilities:Visa-1234", "SGD", "STRICT"),
+            open("Expenses:Transport", "SGD", "STRICT"),
+            record(
+                "close",
+                json!({ "type": "close", "date": "2026-02-01", "account": "Liabilities:Visa-1234" }),
+            ),
+            // Imported after the close, dated before it.
+            transaction(
+                "grab",
+                "2026-01-20",
+                vec![
+                    posting("Liabilities:Visa-1234", "-12.50", "SGD"),
+                    posting("Expenses:Transport", "12.50", "SGD"),
+                ],
+            ),
+            record(
+                "undo",
+                json!({ "type": "reverse", "date": reversed, "target": "grab" }),
+            ),
+        ]
+    };
+    let ledger = Ledger::build(records("2026-02-01")).unwrap();
+    let visa = ledger
+        .accounts()
+        .into_iter()
+        .find(|account| account.name == "Liabilities:Visa-1234")
+        .unwrap();
+    assert_eq!(visa.closed, "2026-02-01".parse().ok());
+    // After the close, the card can no longer take the reversal.
+    assert!(error(records("2026-02-02")).contains("closed"));
+}

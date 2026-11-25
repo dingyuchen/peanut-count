@@ -17,7 +17,7 @@ The root Cargo workspace keeps builds and tests available from the repo root.
 
 ## Build and start a ledger
 
-Build with Rust 1.89 or newer and a C compiler for the bundled SQLite library.
+Build with Rust 1.98 or newer and a C compiler for the bundled SQLite library.
 
 ```sh
 cargo build --release --locked
@@ -186,6 +186,179 @@ entries to a dedicated self-hosted libSQL database. Mobile devices exchange
 statement imports through the mobile API.
 
 See the [iOS setup guide](apps/ios/README.md) for the share and import flow.
+
+## Forwarded transaction emails
+
+Each mobile account can have a secret forwarding address. Forward a bank
+alert, card notification, or receipt to it, and the server records the
+transaction in that account's ledger. The entry is stored as a one-row
+statement, so it reaches the iOS app on the next sync like a PDF import.
+
+One model, Clairic Flash, reads each email. First it reads the transaction's
+fields from the email's text: whether it reports a completed transaction,
+whether money went out or came in, the amount and its currency, any amount
+settled in another currency, the date, the payee, and the card or account
+number. The server checks each field against the text before using it.
+The amount must be a number written in the email. A currency must be stated
+by its ISO code or by a symbol that names only that currency, such as `€` or
+`S$`. A bare `$` takes the account's only currency, or the configured
+default, when that is a dollar or peso currency, and a bare `¥` only yen or
+yuan; otherwise the email is rejected. A date must write its day and month, and a payee or card number must
+appear verbatim. A field that fails these checks is dropped, or the email is
+rejected if the amount fails. Then it chooses which of your asset or
+liability accounts was used, and the category, from your ledger's accounts.
+When the email mentions a decline or cancellation, it is also asked whether
+money actually moved, and the email is rejected if not.
+
+Name accounts after the card or account number when you can, for example
+`Liabilities:Citi-Rewards-1234`, so that "card ending 1234" matches. If an
+email cites a card or account number that no account name ends with, it can
+be rejected with a request to open that account first. Missing categories,
+and `Assets:Checking` or `Liabilities:CreditCard` when the ledger has no
+account of that kind, are opened automatically. A category the model is
+unsure about goes to `Expenses:Uncategorized` or `Income:Uncategorized`.
+Correct a wrong entry with a reversal. An entry can post to an account closed
+after its date, such as a replaced card; date its reversal on or before that
+account's close.
+
+Clairic answers typed fields over System One: Extract (`state` and typed
+`fields`); the account and category are multiple-choice fields. Set
+`PEANUT_CLAIRIC` to choose where it runs: `local` for the model's own server
+on this machine, or `cloudflare` for Workers AI. Workers AI receives the text
+of every forwarded email, and the names of the ledger accounts and categories
+offered for it, including any card or account numbers in those names.
+
+| Variable | Purpose |
+| --- | --- |
+| `PEANUT_INBOUND_DOMAIN` | Domain of the forwarding addresses. Email import is off unless it is set. |
+| `PEANUT_CLAIRIC` | `local` or `cloudflare`. Unset or empty by default, and mail is deferred until it is set. |
+| `PEANUT_CLAIRIC_URL` | Endpoint of a local Clairic server. Defaults to `http://127.0.0.1:8093/v1/systemone`. |
+| `PEANUT_CLOUDFLARE_ACCOUNT_ID` | Cloudflare account that runs Workers AI, for `cloudflare`. |
+| `PEANUT_CLAIRIC_TOKEN` | A Cloudflare API token allowed to run Workers AI, for `cloudflare`, or the local server's `CLAIRIC_API_KEY` if it sets one. |
+| `PEANUT_INBOUND_TOKEN` | Shared secret for the mail relay webhook. The webhook is off unless it is set. |
+| `PEANUT_EMAIL_CURRENCY` | Currency for a bare `$` when the account has no single currency. Defaults to USD. |
+
+The two tokens are read only from the environment. The other variables also
+have command-line flags. Run `peanut-count mobile-serve --help`.
+Create or replace an account's address with its session token. Replacing an
+address disables the old one immediately.
+
+```sh
+curl -X POST https://ledger.example.com/v1/inbound-address \
+  -H "Authorization: Bearer $SESSION_TOKEN"
+# {"address":"0628907df4434180adff5bd10164b173@in.example.com"}
+```
+
+Deliver mail in either of two ways.
+
+**Relay webhook.** Use a mail service that can POST the raw message, such as
+an email-routing worker or a provider's raw MIME webhook. Point it at
+`POST /v1/inbound-email` with the message as the body. Send
+`Authorization: Bearer $PEANUT_INBOUND_TOKEN`, and put the envelope recipient
+in `X-Peanut-Recipient`. Messages may be up to 4 MiB. The server answers once
+the import is done, which takes one to three model calls; a local model can
+take minutes on a busy machine. So allow 4 MiB bodies and a response timeout
+of at least 15 minutes in the relay and in any reverse proxy in front of the
+server, for example `client_max_body_size 4m;` and
+`proxy_read_timeout 900s;` in Nginx.
+
+| Status | Meaning | Relay action |
+| --- | --- | --- |
+| 201 | Imported | Accept |
+| 200 | Already imported | Accept |
+| 404 | Unknown address | Reject |
+| 422 | Not a transaction, or the ledger rejected it. The body has the reason. | Reject |
+| 503 | A model unset or unreachable, storage busy, ledger has unresolved sync conflicts, or too many deliveries at once | Retry later |
+
+**Local MTA pipe.** `peanut-count ingest-email` reads one message from
+standard input. It exits with 0 for an import or duplicate, 67 for an unknown
+recipient, 65 for a rejected message, and 75 to defer a retry. For Postfix,
+route the domain to a `pipe` transport that delivers one recipient per call.
+Otherwise one exit status would acknowledge every recipient of the message.
+
+```
+# master.cf
+peanut    unix  -       n       n       -       -       pipe
+  user=peanut argv=/usr/local/bin/peanut-ingest ${recipient}
+# main.cf
+peanut_destination_recipient_limit = 1
+transport_maps = hash:/etc/postfix/transport
+# /etc/postfix/transport
+in.example.com  peanut:
+```
+
+Also add the domain to `relay_domains` so that Postfix accepts its mail, and
+run `postmap /etc/postfix/transport`.
+
+The wrapper exports the variables above and runs the import. It defers
+delivery, with exit 75, when it gets anything but one recipient or cannot read
+or parse its settings, so Postfix keeps the message. A syntax error in the
+settings would otherwise end the shell with a status that Postfix bounces. The `peanut` user needs read access
+to the settings file and write access to the data directory.
+
+```sh
+#!/bin/sh
+env=/etc/peanut/inbound.env
+[ "$#" -eq 1 ] && [ -r "$env" ] || exit 75
+/bin/sh -n "$env" || exit 75
+set -a
+. "$env" || exit 75
+set +a
+/usr/local/bin/peanut-count ingest-email --data /srv/peanut/mobile-data --recipient "$1"
+status=$?
+# Discard mail for unknown addresses rather than bounce it to a sender
+# that may be forged.
+[ "$status" -eq 67 ] && exit 0
+exit "$status"
+```
+
+Postfix accepts mail for any address at the domain, because forwarding
+addresses are stored only as hashes and cannot be listed for
+`relay_recipient_maps`. The wrapper therefore discards mail for an unknown or
+replaced address instead of returning 67, which would make Postfix send a
+bounce to the envelope sender, and backscatter when that sender is forged.
+
+Duplicates are detected by the original message's Message-ID. A relay retry
+or a re-forward of the same email as an attachment is recorded once.
+Forwarding it inline twice creates a new message, which is recorded twice.
+Some issuers send two alerts for one purchase, one when it is authorized and
+one when it settles, each its own message; forwarding both records the
+purchase twice. For such a card, forward only one kind, usually the
+settlement alert, which carries the final amount of a foreign purchase, and
+reverse any purchase recorded twice.
+Amounts may use a dot as the decimal separator, with optional comma or
+apostrophe grouping, or a decimal comma where it cannot be grouping, as in
+`12,50` or `1.234,56`. `1,250` is read as one thousand two hundred fifty. The account and category questions each offer at most
+50 options. In a larger ledger, accounts named in the email and accounts of the
+expected kind come first. An email that reports several transactions is
+recorded as one of them.
+
+### Running Clairic locally
+
+Clairic Flash, the MLX port in `mlx-community/clairic-flash-4bit` (about
+6 GB), ships its own Python runtime and server, so LM Studio's engine cannot
+run it. Serve it with that runtime instead, on Python 3.12 with the pinned
+`requirements.txt` from the model folder. The model folder flattens the
+runtime's `clairic_runtime` package, so put the files back in it: keep
+`server.py` and `clairic_mlx.py` at the top, and move the other `.py` files
+except `convert.py` into `clairic_runtime/`. Then start the server with the
+weights wired into memory, so macOS does not page them out. From the folder
+that holds `server.py`:
+
+```sh
+python -s -c 'import mlx.core as mx, runpy, sys; mx.set_wired_limit(7 << 30); mx.set_cache_limit(1 << 28); sys.argv[0] = "server.py"; runpy.run_path("server.py", run_name="__main__")' \
+  --model ~/.lmstudio/models/mlx-community/clairic-flash-4bit --port 8093 --batch-size 1 --token-budget 2048
+export PEANUT_CLAIRIC=local
+```
+
+Each email takes two calls: one reads the fields and one chooses the account
+and category. On an Apple M1 Pro with 16 GB, that takes about 30 to 40
+seconds while the model has the memory to itself. Without wired weights, or alongside other
+large apps, it pages and can take minutes. To use Workers AI instead:
+
+```sh
+export PEANUT_CLAIRIC=cloudflare PEANUT_CLOUDFLARE_ACCOUNT_ID="your-account-id" PEANUT_CLAIRIC_TOKEN="your-api-token"
+```
 
 ## Verification
 

@@ -141,6 +141,8 @@ struct Account {
     currencies: Vec<String>,
     booking: Booking,
     closed: bool,
+    /// The date of the account's close entry, if any.
+    closed_on: Option<NaiveDate>,
 }
 
 #[derive(Clone)]
@@ -164,6 +166,25 @@ struct BookedTransaction {
     payee: Option<String>,
     narration: String,
     postings: Vec<BookedPosting>,
+}
+
+/// A ledger account and the currencies it accepts or has been posted in.
+#[derive(Clone, Debug, Default)]
+pub struct OpenAccount {
+    pub name: String,
+    /// Currencies the account is restricted to. Empty means any currency.
+    pub declared: Vec<String>,
+    /// Currencies the account has been posted in.
+    pub posted: Vec<String>,
+    /// When it was closed. A transaction dated on or before then may still
+    /// post to it, since a close sorts after that day's transactions.
+    pub closed: Option<NaiveDate>,
+}
+
+impl OpenAccount {
+    pub fn accepts(&self, currency: &str) -> bool {
+        self.declared.is_empty() || self.declared.iter().any(|c| c == currency)
+    }
 }
 
 #[derive(Default)]
@@ -192,6 +213,29 @@ impl Ledger {
         }
         ledger.records = records;
         Ok(ledger)
+    }
+
+    /// Every account sorted by name, open or closed, each with its declared
+    /// currencies or, for an unconstrained account, the currencies it has
+    /// been posted in.
+    pub fn accounts(&self) -> Vec<OpenAccount> {
+        let mut all: Vec<_> = self
+            .accounts
+            .iter()
+            .map(|(name, account)| OpenAccount {
+                name: name.clone(),
+                declared: account.currencies.clone(),
+                posted: self
+                    .balances
+                    .keys()
+                    .filter(|(held, _)| held == name)
+                    .map(|(_, currency)| currency.clone())
+                    .collect(),
+                closed: account.closed_on,
+            })
+            .collect();
+        all.sort_by(|a, b| a.name.cmp(&b.name));
+        all
     }
 
     pub fn canonical_entry(&self, id: &str) -> Result<&Entry> {
@@ -234,12 +278,15 @@ impl Ledger {
                         currencies: currencies.clone(),
                         booking: *booking,
                         closed: false,
+                        closed_on: None,
                     },
                 );
             }
-            Entry::Close { account, .. } => {
+            Entry::Close { account, date } => {
                 self.account(account, None)?;
-                self.accounts.get_mut(account).unwrap().closed = true;
+                let closing = self.accounts.get_mut(account).unwrap();
+                closing.closed = true;
+                closing.closed_on = Some(*date);
             }
             Entry::Commodity { currency, .. } => {
                 commodity(currency)?;

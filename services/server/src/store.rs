@@ -24,6 +24,18 @@ const SCHEMA: &str = "
 
 pub struct Store(Connection);
 
+/// The ledger has conflicting pending entries, so imports wait until they are resolved.
+#[derive(Debug)]
+pub struct LedgerBlocked;
+
+impl std::fmt::Display for LedgerBlocked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ledger has pending conflicts")
+    }
+}
+
+impl std::error::Error for LedgerBlocked {}
+
 pub struct Pending {
     pub record: Record,
     pub conflict: Option<String>,
@@ -106,7 +118,9 @@ impl Store {
         Ok(id)
     }
 
-    pub fn import_statement(&mut self, statement: &crate::mobile::Statement) -> Result<()> {
+    /// Imports a statement atomically. Returns false when the same statement
+    /// was already imported, so a concurrent duplicate delivery can tell.
+    pub fn import_statement(&mut self, statement: &crate::mobile::Statement) -> Result<bool> {
         let tx = self
             .0
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -128,12 +142,14 @@ impl Store {
                 previous == body,
                 "statement already imported with different postings"
             );
-            return Ok(());
+            return Ok(false);
         }
 
         let mut records = confirmed(&tx)?;
         for item in snapshot(&tx)?.pending {
-            ensure!(item.conflict.is_none(), "ledger has pending conflicts");
+            if item.conflict.is_some() {
+                return Err(LedgerBlocked.into());
+            }
             records.push(item.record);
         }
         let mut accounts: HashSet<String> = records
@@ -184,7 +200,20 @@ impl Store {
             params![statement.id, body],
         )?;
         tx.commit()?;
-        Ok(())
+        Ok(true)
+    }
+
+    pub fn has_statement(&self, id: &str) -> Result<bool> {
+        let initialized: bool = self.0.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'mobile_statements')",
+            [], |row| row.get(0),
+        )?;
+        Ok(initialized
+            && self.0.query_row(
+                "SELECT EXISTS(SELECT 1 FROM mobile_statements WHERE id = ?)",
+                [id],
+                |row| row.get(0),
+            )?)
     }
 
     pub fn statement_page(&self, after: i64) -> Result<Vec<(i64, crate::mobile::Statement)>> {
