@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 use crate::{
     jev::{Answer, Answers, Decide},
     ledger::OpenAccount,
-    llm::Extract,
+    llm::{Extract, Field, Kind, Request},
     mobile::{Statement, StatementRow},
 };
 
@@ -252,32 +252,47 @@ fn canonical(number: &str) -> Option<String> {
 /// The amount as written in `text`, without grouping, when the model's value
 /// is a nonzero number that the text states. A value the model computed or
 /// invented is not in the text and returns `None`.
+#[cfg(test)]
 fn written_amount(text: &str, value: &str) -> Option<String> {
-    let wanted = canonical(value.trim().trim_start_matches(['-', '+', '−']))?;
+    written_amounts(text, value)
+        .into_iter()
+        .next()
+        .map(|(amount, _)| amount)
+}
+
+/// Every place `text` writes the model's amount, as written without grouping,
+/// with the byte range of the number.
+fn written_amounts(text: &str, value: &str) -> Vec<(String, std::ops::Range<usize>)> {
+    let Some(wanted) = canonical(value.trim().trim_start_matches(['-', '+', '−'])) else {
+        return Vec::new();
+    };
     if wanted.len() > 24 || !wanted.bytes().any(|b| matches!(b, b'1'..=b'9')) {
-        return None;
+        return Vec::new();
     }
     let digit = |c: Option<char>| c.is_some_and(|c| c.is_ascii_digit());
     let separator = |c: Option<char>| matches!(c, Some('.' | ',' | '\'' | '’'));
-    WRITTEN_NUMBER.find_iter(text).find_map(|found| {
-        // Skip part of a longer number, such as the "12" of "12.505" or the
-        // "50" of "1.50".
-        let mut after = text[found.end()..].chars();
-        let mut before = text[..found.start()].chars().rev();
-        let (next, prev) = (after.next(), before.next());
-        let fragment = digit(next)
-            || digit(prev)
-            || (separator(next) && digit(after.next()))
-            || (separator(prev) && digit(before.next()));
-        let as_written = found.as_str().replace([',', '\'', '’'], "");
-        let as_written = if as_written.starts_with('.') {
-            format!("0{as_written}")
-        } else {
-            as_written
-        };
-        (!fragment && canonical(&as_written).as_deref() == Some(wanted.as_str()))
-            .then_some(as_written)
-    })
+    WRITTEN_NUMBER
+        .find_iter(text)
+        .filter_map(|found| {
+            // Skip part of a longer number, such as the "12" of "12.505" or the
+            // "50" of "1.50".
+            let mut after = text[found.end()..].chars();
+            let mut before = text[..found.start()].chars().rev();
+            let (next, prev) = (after.next(), before.next());
+            let fragment = digit(next)
+                || digit(prev)
+                || (separator(next) && digit(after.next()))
+                || (separator(prev) && digit(before.next()));
+            let as_written = found.as_str().replace([',', '\'', '’'], "");
+            let as_written = if as_written.starts_with('.') {
+                format!("0{as_written}")
+            } else {
+                as_written
+            };
+            (!fragment && canonical(&as_written).as_deref() == Some(wanted.as_str()))
+                .then(|| (as_written, found.range()))
+        })
+        .collect()
 }
 
 /// Symbols other than "$" that name exactly one currency.
@@ -308,34 +323,68 @@ const DOLLARS: [(&str, &str); 12] = [
     ("MX", "MXN"),
 ];
 
-/// A "$" with the whole run of letters written directly before it.
-static DOLLAR: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"([A-Za-z]*)\$").unwrap());
-
-/// Whether `text` states the currency `code`: by the code with no letter
-/// touching it, as in "SGD 12.50" or "SGD12.50"; by a symbol that names only
-/// that currency; or by a prefixed dollar sign such as "US$", read whole so
-/// "US$" never counts as "S$". A bare "$" or "¥", which several currencies
-/// share, states none, unless 元, RMB, or 円 settles "¥".
-fn states_currency(text: &str, code: &str) -> bool {
+/// Whether the currency `code` is written attached to the amount at `span`:
+/// directly before it, ignoring spaces, line breaks, and a sign, as in
+/// "USD 12.50", "S$12.50", "Amount (CAD): 25.00", or "USD" on the line above;
+/// or directly after it, as in "12.50 USD", "12.50 (USD)", or "128.50元". A
+/// code directly followed by another number belongs to that number. Only
+/// Latin letters touching a code make it part of a word, so "消费USD12.50"
+/// states USD. A bare "$" or "¥", which several currencies share, states
+/// none, unless 元, RMB, or 円 elsewhere settles "¥".
+fn attached_currency(text: &str, span: &std::ops::Range<usize>, code: &str) -> bool {
     if code.len() != 3 || !code.bytes().all(|b| b.is_ascii_uppercase()) {
         return false;
     }
-    let touches = |c: Option<char>| c.is_some_and(|c| c.is_alphabetic());
-    let by_code = text.match_indices(code).any(|(at, _)| {
-        !touches(text[..at].chars().next_back()) && !touches(text[at + 3..].chars().next())
-    });
-    let by_dollar = DOLLAR.captures_iter(text).any(|caps| {
+    let letter = |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphabetic());
+    let before = text[..span.start]
+        .trim_end()
+        .trim_end_matches(['-', '−', '+'])
+        .trim_end();
+    let after = text[span.end..].trim_start();
+    // "CODE" ending `before`, as a word.
+    let code_before = |before: &str| {
+        before.ends_with(code) && !letter(before[..before.len() - 3].chars().next_back())
+    };
+    let labelled = before
+        .trim_end_matches(':')
+        .trim_end()
+        .strip_suffix(')')
+        .and_then(|rest| rest.strip_suffix(code))
+        .is_some_and(|rest| rest.ends_with('('));
+    let dollar = before.strip_suffix('$').is_some_and(|rest| {
+        let prefix_len = rest.len()
+            - rest
+                .trim_end_matches(|c: char| c.is_ascii_alphabetic())
+                .len();
+        let prefix = &rest[rest.len() - prefix_len..];
         DOLLARS
             .iter()
-            .any(|(prefix, named)| *named == code && caps[1].eq_ignore_ascii_case(prefix))
+            .any(|(known, named)| *named == code && prefix.eq_ignore_ascii_case(known))
     });
-    by_code
-        || by_dollar
-        || SYMBOLS
-            .iter()
-            .any(|(symbol, named)| *named == code && text.contains(symbol))
-        || (code == "CNY" && text.contains('¥') && (text.contains('元') || text.contains("RMB")))
-        || (code == "JPY" && text.contains('¥') && text.contains('円'))
+    let symbol_before = SYMBOLS
+        .iter()
+        .any(|(symbol, named)| *named == code && before.ends_with(symbol));
+    let yen = (before.ends_with('¥') || after.starts_with('¥'))
+        && match code {
+            "CNY" => text.contains('元') || text.contains("RMB"),
+            "JPY" => text.contains('円'),
+            _ => false,
+        };
+    let code_after = after
+        .strip_prefix('(')
+        .and_then(|rest| rest.strip_prefix(code))
+        .is_some_and(|rest| rest.starts_with(')'))
+        || after.strip_prefix(code).is_some_and(|rest| {
+            // Not "SGD 75.30", the next amount's own code.
+            !letter(rest.chars().next())
+                && !rest.trim_start().starts_with(|c: char| c.is_ascii_digit())
+        });
+    let symbol_after = SYMBOLS
+        .iter()
+        .any(|(symbol, named)| *named == code && after.starts_with(symbol))
+        || (code == "CNY" && after.starts_with('元'))
+        || (code == "JPY" && after.starts_with('円'));
+    code_before(before) || labelled || dollar || symbol_before || yen || code_after || symbol_after
 }
 
 const MONTHS: [&str; 12] = [
@@ -356,8 +405,11 @@ fn written_date(text: &str, value: &str, latest: NaiveDate) -> Option<NaiveDate>
     let year = r"(?P<year>[0-9]{4}|[0-9]{2})";
     let patterns = [
         format!(r"(?i)\b(?P<year>[0-9]{{4}})[-/.]0?{m}[-/.]0?{d}(?:T|\b)"),
-        format!(r"\b0?{d}[/.-]0?{m}(?:[/.-]{year})?\b"),
-        format!(r"\b0?{m}[/.-]0?{d}(?:[/.-]{year})?\b"),
+        // A dotted date needs its year, so the "12.05" of an amount is not 12 May.
+        format!(r"\b0?{d}[/-]0?{m}(?:[/.-]{year})?\b"),
+        format!(r"\b0?{m}[/-]0?{d}(?:[/.-]{year})?\b"),
+        format!(r"\b0?{d}\.0?{m}\.{year}\b"),
+        format!(r"\b0?{m}\.0?{d}\.{year}\b"),
         format!(r"(?i)\b0?{d}(?:st|nd|rd|th)?[ -]*{mon}[a-z]*\.?(?:[ ,-]+{year})?\b"),
         format!(r"(?i)\b{mon}[a-z]*\.?[ -]*0?{d}(?:st|nd|rd|th)?\b(?:,? +{year}\b)?"),
     ];
@@ -536,7 +588,7 @@ const DEFAULT_CATEGORIES: [(&str, &str); 14] = [
 /// email's text before it is used.
 #[derive(Debug, Default, Deserialize)]
 pub struct Extraction {
-    pub is_transaction: bool,
+    pub is_transaction: Option<bool>,
     pub direction: Option<String>,
     pub amount: Option<String>,
     pub currency: Option<String>,
@@ -547,61 +599,91 @@ pub struct Extraction {
     pub account_ending: Option<String>,
 }
 
-const EXTRACTION_PROMPT: &str = "You read one bank, card, or payment notification that a user forwarded, and report the single transaction it describes. Copy values exactly as the email writes them. Never calculate, convert, or guess a value the email does not state; use null instead.\n\
-- is_transaction: true only if the email reports one completed or authorised payment, purchase, transfer, withdrawal, refund, or deposit with a stated amount. Promotions, statements, balance summaries, bills not yet paid, one-time passwords, and login alerts are false.\n\
-- direction: \"out\" if money left the user's account or was charged to it, \"in\" if money arrived or was credited (refunds, deposits, salary, transfers in).\n\
-- amount: the full amount of money that moved, as written, without the currency symbol. For a receipt, the total paid, not a line item. Never an account balance or credit limit.\n\
-- currency: the ISO 4217 code of that amount, if the email states it by code or symbol.\n\
-- settled_amount and settled_currency: for a foreign transaction, the amount actually charged or credited to the user's account in its own currency, if the email states it separately.\n\
-- date: the transaction date as YYYY-MM-DD. If the email omits the year, use the year of the Sent date, or the previous year if that would put the date after the Sent date.\n\
-- payee: the merchant, person, or organisation on the other side, exactly as written.\n\
-- account_ending: the digits of the user's card or account number that the email names, such as 1234 for \"card ending 1234\".";
+const TASK: &str = "You read one bank, card, or payment notification that a user forwarded, and report the single transaction it describes. Copy values exactly as the email writes them. Never calculate, convert, or guess a value the email does not state; use null instead.";
 
-/// Whether the model's answer has every field with an allowed type, so a
-/// malformed answer is retried rather than read as a missing value.
-fn matches_schema(answer: &Value) -> bool {
-    let Some(fields) = answer.as_object() else {
-        return false;
+const FIELDS: &[Field] = &[
+    Field {
+        name: "is_transaction",
+        kind: Kind::Boolean,
+        instructions: "True only if the email reports one completed or authorised payment, purchase, transfer, withdrawal, refund, or deposit with a stated amount. Promotions, statements, balance summaries, bills not yet paid, one-time passwords, and login alerts are false.",
+    },
+    Field {
+        name: "direction",
+        kind: Kind::Choice(&["out", "in"]),
+        instructions: "out if money left the user's account or was charged to it; in if money arrived or was credited (refunds, deposits, salary, transfers in).",
+    },
+    Field {
+        name: "amount",
+        kind: Kind::Number,
+        instructions: "The full amount of money that moved. For a receipt, the total paid, not a line item. Never an account balance or credit limit.",
+    },
+    Field {
+        name: "currency",
+        kind: Kind::Code,
+        instructions: "The three-letter ISO 4217 code of that amount, such as SGD for S$ or EUR for €. Null if the email writes only a bare $ or no currency.",
+    },
+    Field {
+        name: "settled_amount",
+        kind: Kind::Number,
+        instructions: "Only for a foreign-currency transaction that also states a second, converted amount in the account's own currency, such as the 75.30 in 'EUR 50.00 (SGD 75.30)': that second amount. Null when the email states only one amount.",
+    },
+    Field {
+        name: "settled_currency",
+        kind: Kind::Code,
+        instructions: "The currency of the second, converted amount: the code written next to it, such as SGD in 'EUR 50.00 (SGD 75.30)'. Never the currency of the first amount. Null when the email states only one amount.",
+    },
+    Field {
+        name: "date",
+        kind: Kind::Date,
+        instructions: "The date of the transaction.",
+    },
+    Field {
+        name: "payee",
+        kind: Kind::Text,
+        instructions: "The merchant, person, or organisation on the other side, exactly as written.",
+    },
+    Field {
+        name: "account_ending",
+        kind: Kind::Text,
+        instructions: "The digits of the user's card or account number that the email names, such as 1234 for 'card ending 1234'.",
+    },
+];
+
+/// The model's answer as an [`Extraction`], or `None` when a field is missing
+/// or has a type its kind does not allow, so a malformed answer is retried
+/// rather than read as a missing value. Numbers become text, as the email
+/// would write them without grouping.
+fn read_answer(answer: Value) -> Option<Extraction> {
+    let Value::Object(mut fields) = answer else {
+        return None;
     };
-    let text = |key: &str| {
-        fields
-            .get(key)
-            .is_some_and(|v| v.is_null() || v.is_string())
-    };
-    fields.get("is_transaction").is_some_and(Value::is_boolean)
-        && fields
-            .get("direction")
-            .is_some_and(|v| v.is_null() || v == "out" || v == "in")
-        && [
-            "amount",
-            "currency",
-            "settled_amount",
-            "settled_currency",
-            "date",
-            "payee",
-            "account_ending",
-        ]
-        .iter()
-        .all(|key| text(key))
+    for field in FIELDS {
+        let value = fields.get_mut(field.name)?;
+        let allowed = match (field.kind, &*value) {
+            (_, Value::Null) => true,
+            (Kind::Boolean, value) => value.is_boolean(),
+            (Kind::Choice(words), Value::String(word)) => words.contains(&word.as_str()),
+            (Kind::Number, Value::Number(number)) => {
+                *value = Value::String(number.to_string());
+                true
+            }
+            (Kind::Number | Kind::Text | Kind::Code | Kind::Date, value) => value.is_string(),
+            _ => false,
+        };
+        if !allowed {
+            return None;
+        }
+    }
+    serde_json::from_value(Value::Object(fields)).ok()
 }
 
-fn extraction_schema() -> Value {
-    let text = json!({ "type": ["string", "null"] });
-    json!({
-        "type": "object",
-        "additionalProperties": false,
-        "required": [
-            "is_transaction", "direction", "amount", "currency", "settled_amount",
-            "settled_currency", "date", "payee", "account_ending",
-        ],
-        "properties": {
-            "is_transaction": { "type": "boolean" },
-            "direction": { "type": ["string", "null"], "enum": ["out", "in", null] },
-            "amount": text, "currency": text, "settled_amount": text,
-            "settled_currency": text, "date": text, "payee": text, "account_ending": text,
-        },
-    })
-}
+/// Words that report money which may not have moved.
+static DECLINE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)\b(?:declined?|failed|failure|unsuccessful|cancell?ed|cancell?ation|rejected|reversed|voided|not (?:been )?(?:approved|processed|completed))\b",
+    )
+    .unwrap()
+});
 
 /// The fields of a transaction read from one body of an email, each checked
 /// against that body's text.
@@ -611,7 +693,7 @@ struct Reading {
     outgoing: bool,
     amount: String,
     currency: Option<String>,
-    settled: Option<(String, Option<String>)>,
+    settled: Option<(String, String)>,
     date: NaiveDate,
     payee: Option<String>,
     ending: Option<String>,
@@ -632,19 +714,20 @@ async fn read_body(email: &Email, body: &str, reader: &impl Extract) -> Result<R
         body,
     );
     let raw = reader
-        .extract(EXTRACTION_PROMPT, &message, &extraction_schema())
+        .extract(&Request {
+            task: TASK,
+            text: &message,
+            reference_date: email.sent,
+            fields: FIELDS,
+        })
         .await
         .map_err(Failure::Unavailable)?;
-    let malformed = || {
+    let found = read_answer(raw).ok_or_else(|| {
         Failure::Unavailable(anyhow::anyhow!(
             "extraction model answer does not match the schema"
         ))
-    };
-    if !matches_schema(&raw) {
-        return Err(malformed());
-    }
-    let found: Extraction = serde_json::from_value(raw).map_err(|_| malformed())?;
-    if !found.is_transaction {
+    })?;
+    if found.is_transaction != Some(true) {
         return Err(rejected(
             "The email does not look like a single completed transaction.",
         ));
@@ -658,26 +741,34 @@ async fn read_body(email: &Email, body: &str, reader: &impl Extract) -> Result<R
             ));
         }
     };
-    let Some(amount) = found
+    let places = found
         .amount
         .as_deref()
-        .and_then(|value| written_amount(&text, value))
-    else {
+        .map(|value| written_amounts(&text, value))
+        .unwrap_or_default();
+    let Some((amount, _)) = places.first().cloned() else {
         return Err(rejected(
             "The transaction amount is not written in the email.",
         ));
     };
-    let stated = |code: &Option<String>| {
+    // A currency counts only where it is written attached to that amount.
+    let attached = |places: &[(String, std::ops::Range<usize>)], code: &Option<String>| {
         code.as_deref()
             .map(|code| code.trim().to_ascii_uppercase())
-            .filter(|code| states_currency(&text, code))
+            .filter(|code| {
+                places
+                    .iter()
+                    .any(|(_, span)| attached_currency(&text, span, code))
+            })
     };
-    let currency = stated(&found.currency);
-    let settled = found
-        .settled_amount
-        .as_deref()
-        .and_then(|value| written_amount(&text, value))
-        .map(|amount| (amount, stated(&found.settled_currency)));
+    let currency = attached(&places, &found.currency);
+    // A settled amount without its own written currency could be anything,
+    // so it is used only with one.
+    let settled = found.settled_amount.as_deref().and_then(|value| {
+        let places = written_amounts(&text, value);
+        let (amount, _) = places.first().cloned()?;
+        Some((amount, attached(&places, &found.settled_currency)?))
+    });
     let latest = email
         .sent
         .unwrap_or_else(|| chrono::Utc::now().date_naive())
@@ -740,6 +831,32 @@ pub async fn extract(
         payee,
         ending,
     } = reading;
+    let state = json!({ "email": message });
+    // An email that mentions a decline or cancellation may report money that
+    // never moved, or a refund for a cancelled order that did, so ask.
+    if DECLINE.is_match(&text) {
+        let question = json!({ "moved": {
+            "type": "noul",
+            "instructions": "Did money actually move in the transaction that `email` reports? Answer no if the payment or purchase was declined, failed, or cancelled before it completed. A refund, including one for a cancelled order, did move money.",
+        }});
+        let answers = model
+            .decide(state.clone(), question)
+            .await
+            .map_err(Failure::Unavailable)?;
+        match answers.get("moved") {
+            Some(Answer::Noul { noul }) if *noul >= 0.5 => {}
+            Some(Answer::Noul { .. }) | Some(Answer::Refusal) => {
+                return Err(rejected(
+                    "The email reports a declined, failed, or cancelled transaction.",
+                ));
+            }
+            _ => {
+                return Err(Failure::Unavailable(anyhow::anyhow!(
+                    "decision model did not answer `moved`"
+                )));
+            }
+        }
+    }
 
     let mut sources: BTreeMap<String, String> = accounts
         .iter()
@@ -785,7 +902,6 @@ pub async fn extract(
     }
     let sources = limit(sources, &text, ending.as_deref(), |_| 1);
 
-    let state = json!({ "email": message });
     let source = if sources.len() == 1 && !offer_none {
         sources.keys().next().unwrap().clone()
     } else {
@@ -841,9 +957,7 @@ pub async fn extract(
     // the account was actually charged or credited, so it wins when the account
     // accepts it; otherwise use the amount itself.
     let (number, currency) = match (&settled, resolve(&currency)) {
-        (Some((settled, code)), _) if accepts(&source, &resolve(code)) => {
-            (settled.clone(), resolve(code))
-        }
+        (Some((settled, code)), _) if accepts(&source, code) => (settled.clone(), code.clone()),
         (_, code) if accepts(&source, &code) => (amount, code),
         // Rejection reasons reach the relay or a bounce, so they name no
         // account and no configured currency.
@@ -1013,7 +1127,7 @@ Available balance: SGD 1,204.33.\r\n";
     struct Reads(Value);
 
     impl Extract for Reads {
-        async fn extract(&self, _: &str, _: &str, _: &Value) -> Result<Value> {
+        async fn extract(&self, _: &Request<'_>) -> Result<Value> {
             let mut found = json!({
                 "is_transaction": true, "direction": "out", "amount": null, "currency": null,
                 "settled_amount": null, "settled_currency": null, "date": null, "payee": null,
@@ -1071,21 +1185,37 @@ Available balance: SGD 1,204.33.\r\n";
     }
 
     #[test]
-    fn currencies_must_be_stated_by_code_or_symbol() {
-        assert!(states_currency("Paid SGD 12.50", "SGD"));
-        assert!(states_currency("Paid S$12.50", "SGD"));
-        assert!(states_currency("Paid €12.50", "EUR"));
-        assert!(states_currency("Paid SGD12.50", "SGD"));
-        assert!(states_currency("Paid US$12.50", "USD"));
-        assert!(states_currency("消费 ¥128.50 元", "CNY"));
+    fn currencies_must_be_attached_to_the_amount() {
+        let stated = |text: &str, value: &str, code: &str| {
+            written_amounts(text, value)
+                .iter()
+                .any(|(_, span)| attached_currency(text, span, code))
+        };
+        assert!(stated("Paid SGD 12.50", "12.50", "SGD"));
+        assert!(stated("Paid S$12.50", "12.50", "SGD"));
+        assert!(stated("Paid €12.50", "12.50", "EUR"));
+        assert!(stated("Paid SGD12.50", "12.50", "SGD"));
+        assert!(stated("Paid US$12.50", "12.50", "USD"));
+        assert!(stated("Paid -USD 12.50", "12.50", "USD"));
+        assert!(stated("Paid 12.50 USD", "12.50", "USD"));
+        assert!(stated("Paid 12.50 (USD)", "12.50", "USD"));
+        assert!(stated("Amount (CAD): 25.00", "25.00", "CAD"));
+        assert!(stated("Amount\nUSD\n12.50", "12.50", "USD"));
+        assert!(stated("消费USD12.50", "12.50", "USD"));
+        assert!(stated("消费 ¥128.50 元", "128.50", "CNY"));
+        assert!(stated("消费 128.50元", "128.50", "CNY"));
         // "US$" is not "S$", and a bare "¥" is yuan or yen.
-        assert!(!states_currency("Paid US$12.50", "SGD"));
-        assert!(!states_currency("消费 ¥128.50", "CNY"));
-        assert!(!states_currency("Paid USDT 5", "USD"));
+        assert!(!stated("Paid US$12.50", "12.50", "SGD"));
+        assert!(!stated("消费 ¥128.50", "128.50", "CNY"));
+        assert!(!stated("Paid USDT 5", "5", "USD"));
         // A bare "$" names no single currency.
-        assert!(!states_currency("Paid $12.50", "USD"));
-        assert!(!states_currency("Paid SGD 12.50", "USD"));
-        assert!(!states_currency("Paid SGD 12.50", "sgd"));
+        assert!(!stated("Paid $12.50", "12.50", "USD"));
+        assert!(!stated("Paid SGD 12.50", "12.50", "USD"));
+        assert!(!stated("Paid SGD 12.50", "12.50", "sgd"));
+        // A code elsewhere in the email, or one that belongs to the next
+        // amount, does not state this amount's currency.
+        assert!(!stated("Paid $12.50. Limit USD 5,000", "12.50", "USD"));
+        assert!(!stated("Paid 12.50 SGD 75.30", "12.50", "SGD"));
     }
 
     #[test]
@@ -1117,6 +1247,9 @@ Available balance: SGD 1,204.33.\r\n";
             ok("23 Nov 25.00 SGD", "2026-11-23"),
             Some(date("2026-11-23"))
         );
+        // A dotted date needs its year, so an amount is not a date.
+        assert_eq!(ok("Paid 12.05 SGD", "2026-05-12"), None);
+        assert_eq!(ok("on 12.05.2026", "2026-05-12"), Some(date("2026-05-12")));
         // A date the email does not write, a future date, or no date at all.
         assert_eq!(ok("on 22 Nov 2026", "2026-11-23"), None);
         assert_eq!(ok("on 30 Nov 2026", "2026-11-30"), None);
@@ -1543,15 +1676,13 @@ Please view this email in an HTML-capable client.\r\n--b\r\nContent-Type: text/h
     }
 
     impl Extract for StubThenHtml {
-        async fn extract(&self, system: &str, text: &str, schema: &Value) -> Result<Value> {
-            if text.contains(self.stub) {
+        async fn extract(&self, request: &Request<'_>) -> Result<Value> {
+            if request.text.contains(self.stub) {
                 Reads(json!({ "is_transaction": false }))
-                    .extract(system, text, schema)
+                    .extract(request)
                     .await
             } else {
-                Reads(self.fields.clone())
-                    .extract(system, text, schema)
-                    .await
+                Reads(self.fields.clone()).extract(request).await
             }
         }
     }
@@ -1582,7 +1713,7 @@ Please view this email in an HTML-capable client.\r\n--b\r\nContent-Type: text/h
     struct Raw(Value);
 
     impl Extract for Raw {
-        async fn extract(&self, _: &str, _: &str, _: &Value) -> Result<Value> {
+        async fn extract(&self, _: &Request<'_>) -> Result<Value> {
             Ok(self.0.clone())
         }
     }
@@ -1601,6 +1732,83 @@ Please view this email in an HTML-capable client.\r\n--b\r\nContent-Type: text/h
         )
         .await;
         assert!(matches!(result, Err(Failure::Unavailable(_))));
+    }
+
+    #[tokio::test]
+    async fn a_declined_payment_is_confirmed_before_import() {
+        let mut email = parse(ALERT.as_bytes()).unwrap();
+        email.body = "Your payment of SGD 12.50 at KOPITIAM on 23 Nov 2026 was declined.".into();
+        let reads = Reads(json!({ "amount": "12.50", "currency": "SGD", "payee": "KOPITIAM" }));
+        let with_moved = |noul: f64| {
+            let mut answers = card_answers().answers;
+            answers.insert("moved".into(), Answer::Noul { noul });
+            fixed(answers)
+        };
+        let declined = with_moved(0.1);
+        let result = extract(
+            &email,
+            &card_alert_accounts(),
+            &[],
+            "USD",
+            &reads,
+            &declined,
+        )
+        .await;
+        assert!(matches!(result, Err(Failure::Rejected(_))));
+        assert!(declined.calls.lock().unwrap()[0].get("moved").is_some());
+        // A refund for a cancelled order did move money.
+        email.body =
+            "Order cancelled. A refund of SGD 12.50 from KOPITIAM was made on 23 Nov 2026.".into();
+        let refund = Reads(json!({
+            "direction": "in", "amount": "12.50", "currency": "SGD", "payee": "KOPITIAM",
+        }));
+        let statement = extract(
+            &email,
+            &card_alert_accounts(),
+            &[],
+            "USD",
+            &refund,
+            &with_moved(0.9),
+        )
+        .await
+        .unwrap();
+        assert_eq!(statement.rows[0].amount, "12.50");
+        // Without the decline words, no question is asked.
+        let plain = card_answers();
+        email.body = "You spent SGD 12.50 at KOPITIAM on 23 Nov 2026.".into();
+        extract(&email, &card_alert_accounts(), &[], "USD", &reads, &plain)
+            .await
+            .unwrap();
+        assert!(
+            plain
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|q| q.get("moved").is_none())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_settled_amount_needs_its_own_currency() {
+        let mut email = parse(ALERT.as_bytes()).unwrap();
+        // The model reads 75.30 as an SGD settled amount, but no currency is
+        // written with it, so the SGD card is not charged 75.30.
+        email.body = "Paid EUR 50.00 (75.30) at CAFE DE FLORE on 21 Nov 2026.".into();
+        let reads = Reads(json!({
+            "amount": "50.00", "currency": "EUR", "settled_amount": "75.30",
+            "settled_currency": "SGD", "payee": "CAFE DE FLORE",
+        }));
+        let result = extract(
+            &email,
+            &card_alert_accounts(),
+            &[],
+            "USD",
+            &reads,
+            &card_answers(),
+        )
+        .await;
+        assert!(matches!(result, Err(Failure::Rejected(_))));
     }
 
     #[tokio::test]

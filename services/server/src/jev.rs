@@ -14,6 +14,10 @@ const MAX_REPLY_BYTES: usize = 1024 * 1024;
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum Answer {
+    /// P(yes) for a yes/no question.
+    Noul {
+        noul: f64,
+    },
     Choice {
         choice: String,
         #[serde(default)]

@@ -216,17 +216,21 @@ account of that kind, are opened automatically. A category the decision model
 is unsure about goes to `Expenses:Uncategorized` or `Income:Uncategorized`.
 Correct a wrong entry with a reversal.
 
-The extraction model is any OpenAI-compatible chat completions endpoint that
-supports JSON schema output, such as LM Studio, llama.cpp, or a hosted API.
-The decision model is any server that speaks TypeSafe Jev's `/v1/systemone`
+The extraction model reads typed fields from the email. By default it speaks
+System One: Extract (`/v1/systemone` with `state` and typed `fields`), as
+Cloudflare's Clairic does on Workers AI or locally. With
+`PEANUT_EXTRACT_FORMAT=chat` it is any OpenAI-compatible chat completions
+endpoint that supports JSON schema output, such as LM Studio, llama.cpp, or a
+hosted API. The decision model is any server that speaks TypeSafe Jev's `/v1/systemone`
 format, including hosted Jev, LM Studio, and llama.cpp. A hosted model
 receives the text of every forwarded email.
 
 | Variable | Purpose |
 | --- | --- |
 | `PEANUT_INBOUND_DOMAIN` | Domain of the forwarding addresses. Email import is off unless it is set. |
-| `PEANUT_EXTRACT_URL` | Full chat completions URL of the extraction model. Empty by default, and mail is deferred until it is set. |
-| `PEANUT_EXTRACT_MODEL` | Extraction model ID. |
+| `PEANUT_EXTRACT_URL` | Full URL of the extraction endpoint. Empty by default, and mail is deferred until it is set. |
+| `PEANUT_EXTRACT_FORMAT` | `systemone` (the default) or `chat`. |
+| `PEANUT_EXTRACT_MODEL` | Extraction model ID. Required for `chat`; optional for `systemone`. |
 | `PEANUT_EXTRACT_TOKEN` | Bearer token for a hosted extraction API. |
 | `PEANUT_JEV_URL` | Full decision endpoint URL. Empty by default, and mail is deferred until it is set. |
 | `PEANUT_JEV_MODEL` | Decision model ID. |
@@ -305,22 +309,41 @@ options. In a larger ledger, accounts named in the email and accounts of the
 expected kind come first. An email that reports several transactions is
 recorded as one of them.
 
-### Local models with LM Studio
+### Local models
 
-LM Studio serves both models. For extraction, load a general instruction
-model. It may be a reasoning model: if LM Studio returns the
+Clairic Flash, the MLX port in `mlx-community/clairic-flash-4bit` (about
+6 GB), ships its own Python runtime and server, so LM Studio's engine cannot
+run it. Serve it with that runtime instead, on Python 3.12 with the pinned
+`requirements.txt` from the model folder. The model folder flattens the
+runtime's `clairic_runtime` package, so put the files back in it: keep
+`server.py` and `clairic_mlx.py` at the top, and move the other `.py` files
+except `convert.py` into `clairic_runtime/`. Then start the server with the
+weights wired into memory, so macOS does not page them out. From the folder
+that holds `server.py`:
+
+```sh
+python -s -c 'import mlx.core as mx, runpy, sys; mx.set_wired_limit(7 << 30); mx.set_cache_limit(1 << 28); sys.argv[0] = "server.py"; runpy.run_path("server.py", run_name="__main__")' \
+  --model ~/.lmstudio/models/mlx-community/clairic-flash-4bit --port 8093 --batch-size 1 --token-budget 2048
+export PEANUT_EXTRACT_URL=http://127.0.0.1:8093/v1/systemone
+```
+
+On an Apple M1 Pro with 16 GB, it reads an alert in about 15 to 25 seconds
+while it has the memory to itself. Without wired weights, or alongside other
+large apps, it pages and can take minutes. For a lighter
+extraction model, LM Studio serves a general instruction model over chat
+completions. It may be a reasoning model: if LM Studio returns the
 schema-constrained answer as reasoning and leaves the message content empty,
 the server reads the answer from the reasoning.
 
 ```sh
-lms load clairic-flash --identifier clairic-flash
+lms load qwen/qwen3.5-4b --identifier qwen-extract
 lms server start
 export PEANUT_EXTRACT_URL=http://127.0.0.1:1234/v1/chat/completions
-export PEANUT_EXTRACT_MODEL=clairic-flash
+export PEANUT_EXTRACT_FORMAT=chat PEANUT_EXTRACT_MODEL=qwen-extract
 ```
 
-`qwen/qwen3.5-4b` (about 3 GB) also works and reads an alert in about two
-seconds on an Apple M1 Pro. For decisions, LM Studio serves `/v1/systemone`
+`qwen/qwen3.5-4b` is about 3 GB and reads an alert in about two seconds on
+an Apple M1 Pro. For decisions, LM Studio serves `/v1/systemone`
 for models it lists as decision models.
 
 ```sh
