@@ -217,9 +217,14 @@ fn truncate(text: &str, chars: usize) -> &str {
 /// A number as written in the text: optionally grouped with commas or
 /// apostrophes, with an optional decimal fraction, or a bare fraction such as
 /// ".50".
+/// Spaces that may group an amount's digits or sit between it and its code.
+const SPACES: [char; 6] = [' ', '\t', '\u{a0}', '\u{202f}', '\u{2009}', '\u{2007}'];
+
 static WRITTEN_NUMBER: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(concat!(
-        r"[0-9]{1,3}(?:[,'’][0-9]{3})+(?:\.[0-9]+)?",
+        // Indian grouping, as in "1,25,000.00".
+        r"[0-9]{1,2}(?:,[0-9]{2})+,[0-9]{3}(?:\.[0-9]+)?",
+        r"|[0-9]{1,3}(?:[,'’][0-9]{3})+(?:\.[0-9]+)?",
         // A decimal comma: "1.234,56", or two digits after it, as in "12,50".
         r"|[0-9]{1,3}(?:\.[0-9]{3})+,[0-9]{1,2}",
         // Groups of three after spaces, as in French "1 234,56", including
@@ -293,10 +298,7 @@ fn written_amounts(text: &str, value: &str) -> Vec<(String, std::ops::Range<usiz
                 || (separator(prev) && digit(before.next()));
             // Nor the last group of a space-grouped amount, as the "234,56" of
             // "1 234,56" with a separator not read as grouping.
-            let spaced = matches!(
-                prev,
-                Some(' ' | '\u{a0}' | '\u{202f}' | '\u{2009}' | '\u{2007}')
-            );
+            let spaced = prev.is_some_and(|c| SPACES.contains(&c));
             let last_group = found
                 .as_str()
                 .split_once(',')
@@ -310,7 +312,8 @@ fn written_amounts(text: &str, value: &str) -> Vec<(String, std::ops::Range<usiz
             });
             let as_written = if decimal_comma {
                 found_text
-                    .replace(['.', ' ', '\u{a0}', '\u{202f}', '\u{2009}', '\u{2007}'], "")
+                    .replace('.', "")
+                    .replace(SPACES, "")
                     .replace(',', ".")
             } else {
                 found_text.replace([',', '\'', '’'], "")
@@ -374,7 +377,7 @@ fn attached_currency(text: &str, span: &std::ops::Range<usize>, code: &str) -> b
         .trim_end();
     // A code after the amount must be on its line, so a footer or the next
     // line's figure is not read as its currency.
-    let after = text[span.end..].trim_start_matches([' ', '\t', '\u{a0}', '\u{202f}', '\u{2009}']);
+    let after = text[span.end..].trim_start_matches(SPACES);
     // "CODE" ending `before`, as a word.
     let code_before = |before: &str| {
         before.ends_with(code) && !letter(before[..before.len() - 3].chars().next_back())
@@ -490,18 +493,18 @@ fn known_currencies() -> impl Iterator<Item = &'static str> {
 /// Abbreviations that are common English words, such as Portuguese "out" or
 /// "set", are left out.
 const MONTHS: [&str; 12] = [
-    "january|jan|janvier|janv|januar|jänner|enero|ene|gennaio|janeiro|januari",
+    "january|jan|janvier|janv|januar|jänner|enero|ene|gennaio|gen|janeiro|januari",
     "february|feb|février|févr|fevrier|fevr|februar|febrero|febbraio|fevereiro|fev|februari",
     "march|mar|mars|märz|maerz|marzo|março|marco|maart|mrt",
     "april|apr|avril|avr|abril|abr|aprile",
-    "may|mai|mayo|maggio|maio|mei",
-    "june|jun|juin|juni|junio|giugno|junho",
-    "july|jul|juillet|juil|juli|julio|luglio|julho",
+    "may|mai|mayo|maggio|mag|maio|mei",
+    "june|jun|juin|juni|junio|giugno|giu|junho",
+    "july|jul|juillet|juil|juli|julio|luglio|lug|julho",
     "august|aug|août|aout|agosto|augustus",
     "september|sep|sept|septembre|settembre|setembro|septiembre",
-    "october|oct|octobre|oktober|okt|octubre|ottobre|outubro",
+    "october|oct|octobre|oktober|okt|octubre|ottobre|ott|outubro",
     "november|nov|novembre|noviembre|novembro",
-    "december|dec|décembre|decembre|déc|dezember|dez|diciembre|dicembre|dezembro",
+    "december|dec|décembre|decembre|déc|dezember|dez|diciembre|dic|dicembre|dezembro",
 ];
 
 /// The model's ISO date when it is plausible and one date expression in the
@@ -1456,6 +1459,11 @@ Available balance: SGD 1,204.33.\r\n";
             Some("1250")
         );
         assert_eq!(written_amount("Betrag: 12,50 EUR", "1250"), None);
+        // Indian grouping, read whole.
+        let lakh = "Debited INR 1,25,000.00 from account";
+        assert_eq!(written_amount(lakh, "125000").as_deref(), Some("125000.00"));
+        assert_eq!(written_amount(lakh, "25000"), None);
+        assert_eq!(written_amount(lakh, "1.25"), None);
         for grouped in [
             "1 234,56 EUR",
             "1\u{a0}234,56 EUR",
@@ -1494,6 +1502,11 @@ Available balance: SGD 1,204.33.\r\n";
         assert!(stated("45.00 CHF 23 Nov 2026", "45.00", "CHF"));
         assert!(stated(
             "Montant : 1\u{202f}234,56\u{202f}EUR",
+            "1234.56",
+            "EUR"
+        ));
+        assert!(stated(
+            "Montant : 1\u{2007}234,56\u{2007}EUR",
             "1234.56",
             "EUR"
         ));
@@ -1599,6 +1612,10 @@ Available balance: SGD 1,204.33.\r\n";
         assert_eq!(
             ok("on 25 Feb. 2026", "2026-02-25"),
             Some(date("2026-02-25"))
+        );
+        assert_eq!(
+            ok("Fecha: 03 dic. 2025", "2025-12-03"),
+            Some(date("2025-12-03"))
         );
     }
 
