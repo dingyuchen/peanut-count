@@ -307,6 +307,11 @@ exec /usr/local/bin/peanut-count ingest-email --data /srv/peanut/mobile-data --r
 Duplicates are detected by the original message's Message-ID. A relay retry
 or a re-forward of the same email as an attachment is recorded once.
 Forwarding it inline twice creates a new message, which is recorded twice.
+Some issuers send two alerts for one purchase, one when it is authorized and
+one when it settles, each its own message; forwarding both records the
+purchase twice. For such a card, forward only one kind, usually the
+settlement alert, which carries the final amount of a foreign purchase, and
+reverse any purchase recorded twice.
 Amounts may use a dot as the decimal separator, with optional comma or
 apostrophe grouping, or a decimal comma where it cannot be grouping, as in
 `12,50` or `1.234,56`. `1,250` is read as one thousand two hundred fifty. The account and category questions each offer at most
