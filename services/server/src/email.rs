@@ -1164,14 +1164,26 @@ async fn read_body(email: &Email, body: &str, reader: &impl Extract) -> Result<R
     let settled = found.settled_amount.as_deref().and_then(|value| {
         let places = written_amounts(&text, value);
         let (amount, _) = places.first().cloned()?;
-        let named = attached(&places, &found.settled_currency)
-            .map(Settled::Code)
-            .or_else(|| {
+        // The model's code when written with it; else the one code written
+        // with it, as in "CAD $75.25"; else a bare symbol. Two codes are
+        // ambiguous.
+        let codes: Vec<&str> = known_currencies()
+            .filter(|code| {
                 places
                     .iter()
-                    .find_map(|(_, span)| bare_symbol(&text, span))
-                    .map(Settled::Symbol)
-            })?;
+                    .any(|(_, span)| attached_currency(&text, span, code))
+            })
+            .collect();
+        let named = match (attached(&places, &found.settled_currency), &codes[..]) {
+            (Some(code), _) => Settled::Code(code),
+            (None, [code]) => Settled::Code((*code).to_owned()),
+            (None, []) => Settled::Symbol(
+                places
+                    .iter()
+                    .find_map(|(_, span)| bare_symbol(&text, span))?,
+            ),
+            (None, _) => return None,
+        };
         Some((amount, named))
     });
     let latest = email
@@ -1535,10 +1547,15 @@ pub async fn extract(
         if let (Some(account), None) = (named.next(), named.next())
             && account.name != source
         {
+            // A bare symbol counts too: "¥75,000 credited" is no USD.
+            let mut symbols = WRITTEN_NUMBER
+                .find_iter(&transfer_lines)
+                .filter_map(|found| bare_symbol(&transfer_lines, &found.range()));
             if !account.accepts(&currency)
                 || written_currencies(&transfer_lines)
                     .iter()
                     .any(|code| *code != currency)
+                || symbols.any(|symbol| !symbol_means(symbol, &currency))
             {
                 return Err(rejected(
                     "The transfer is between accounts that do not share a currency. Record it by hand.",
@@ -3045,6 +3062,18 @@ Content-Type: text/html; charset=utf-8\r\n\
         ];
         let result = extract(&email, &multi, &[], "USD", &reads, &model).await;
         assert!(matches!(result, Err(Failure::Rejected(_))));
+        // A bare yen credit cannot be the dollar debit.
+        let mut yen = parse(ALERT.as_bytes()).unwrap();
+        yen.body = "USD 500.00 debited from account ending 1234\n¥75,000 credited to account ending 5678\nDate: 23 Nov 2026".into();
+        let open = vec![
+            account("Assets:Checking-1234", &["USD"], &[]),
+            account("Assets:Savings-5678", &[], &[]),
+        ];
+        let dollars = Reads(json!({
+            "amount": "500.00", "currency": "USD", "from_account": "1234", "to_account": "5678",
+        }));
+        let result = extract(&yen, &open, &[], "USD", &dollars, &model).await;
+        assert!(matches!(result, Err(Failure::Rejected(_))));
     }
 
     #[tokio::test]
@@ -3140,6 +3169,23 @@ Content-Type: text/html; charset=utf-8\r\n\
                 statement.rows[0].amount.as_str()
             ),
             ("USD", "-55.25")
+        );
+        // A code with the symbol names it, so CAD is not taken for USD.
+        email.body = "Card ending 1234\nTransaction amount: EUR 50.00\nBilled amount: CAD $75.25\nDate: 21 Nov 2026".into();
+        let usd_posted = vec![account("Liabilities:Card-1234", &[], &["USD"])];
+        let cad = Reads(json!({
+            "amount": "50.00", "currency": "EUR", "settled_amount": "75.25",
+            "from_account": "1234",
+        }));
+        let statement = extract(&email, &usd_posted, &closed, "USD", &cad, &model)
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                statement.currency.as_str(),
+                statement.rows[0].amount.as_str()
+            ),
+            ("CAD", "-75.25")
         );
     }
 
