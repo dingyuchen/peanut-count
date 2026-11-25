@@ -366,7 +366,19 @@ static SPLIT_SUFFIX: LazyLock<Regex> = LazyLock::new(|| {
 
 /// Joins a currency marker and its number that layout split across lines.
 fn join_split_amounts(text: &str) -> String {
-    let text = SPLIT_PREFIX.replace_all(text, "$1 $2");
+    let text = SPLIT_PREFIX.replace_all(text, |caps: &regex::Captures| {
+        let marker = caps.get(1).unwrap();
+        // A code that already follows a number on its own line, as in
+        // "Total paid: $25.00 CAD" above "123 Main Street", qualifies that
+        // amount and is not joined to the next line.
+        let line = &text[..marker.start()];
+        let line = &line[line.rfind('\n').map_or(0, |at| at + 1)..];
+        if line.trim_end().ends_with(|c: char| c.is_ascii_digit()) {
+            caps[0].to_owned()
+        } else {
+            format!("{} {}", &caps[1], &caps[2])
+        }
+    });
     SPLIT_SUFFIX.replace_all(&text, "$1 $2").into_owned()
 }
 
@@ -632,7 +644,7 @@ static CARD_DIGITS: LazyLock<Regex> = LazyLock::new(|| {
         // A number may follow its label on the same line, or, after an
         // explicit identifier label such as "Card number" or "Account:", on
         // one of the next two lines, as separate HTML blocks render it.
-        r"(?i)(?:\bending(?: in| with)?\s*|\bends (?:in|with)\s*|[x*•]{2,}[ -]?)(?P<tail>[0-9]{3,4})\b|\b(?:account|acct|a/c|card)(?: (?:no\.?|num\.?|number))?[ \t]*[:#.]?[ \t]*\(?(?:[x*•]+[ -]?)?(?P<number>[0-9]{3,19}(?:-[0-9]{1,19}| [0-9]{3,19}){0,4})\b|\b(?:account|acct|a/c|card)(?: (?:no\.?|num\.?|number)[ \t]*[:#.]?|[ \t]*[:#])[ \t]*(?:\r?\n[ \t]*){1,2}(?:[x*•]+[ -]?)?(?P<below>[0-9]{3,19}(?:-[0-9]{1,19}| [0-9]{3,19}){0,4})\b",
+        r"(?i)(?:\bending(?: in| with)?[ \t]*[:#]?\s*|\bends (?:in|with)[ \t]*[:#]?\s*|[x*•]{2,}[ -]?)(?P<tail>[0-9]{3,4})\b|\b(?:account|acct|a/c|card)(?: (?:no\.?|num\.?|number))?[ \t]*[:#.]?[ \t]*\(?(?:[x*•]+[ -]?)?(?P<number>[0-9]{3,19}(?:-[0-9]{1,19}| [0-9]{3,19}){0,4})\b|\b(?:account|acct|a/c|card)(?: (?:no\.?|num\.?|number)[ \t]*[:#.]?|[ \t]*[:#])[ \t]*(?:\r?\n[ \t]*){1,2}(?:[x*•]+[ -]?)?(?P<below>[0-9]{3,19}(?:-[0-9]{1,19}| [0-9]{3,19}){0,4})\b",
     )
     .unwrap()
 });
@@ -810,7 +822,10 @@ pub fn dates(text: &str, anchor: NaiveDate) -> Vec<(NaiveDate, String)> {
 
 static PAYEE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?m)\b(?i:at|to|from|merchant(?: name)?:|payee:|paid to|recipient:|description:|transaction details:)\s+(?P<payee>[\p{Lu}0-9][\p{L}\p{M}0-9&'’*./ -]{1,60}?)(?:\s+(?i:on|for|via|using|with|ending|at|from|is|has|was|of)\b|[,;:!()\n]|\.\s|\.?$)",
+        // After "at", "to", or "from" the name must start with a capital or a
+        // digit, so "to your account" is not a payee; an explicit label such
+        // as "Merchant:" accepts "amazon.com".
+        r"(?m)(?:\b(?i:at|to|from)\s+(?P<payee>[\p{Lu}0-9][\p{L}\p{M}0-9&'’*./ -]{1,60}?)|\b(?i:merchant(?: name)?:|payee:|paid to|recipient:|description:|transaction details:)\s+(?P<labelled>[\p{L}0-9][\p{L}\p{M}0-9&'’*./ -]{1,60}?))(?:\s+(?i:on|for|via|using|with|ending|at|from|is|has|was|of)\b|[,;:!()\n]|\.\s|\.?$)",
     )
     .unwrap()
 });
@@ -819,7 +834,13 @@ static PAYEE: LazyLock<Regex> = LazyLock::new(|| {
 pub fn payees(text: &str) -> Vec<String> {
     let mut found: Vec<String> = Vec::new();
     for caps in PAYEE.captures_iter(text) {
-        let payee = caps["payee"].trim().trim_end_matches(['.', '-', '/', ' ']);
+        let payee = caps
+            .name("payee")
+            .or(caps.name("labelled"))
+            .unwrap()
+            .as_str()
+            .trim()
+            .trim_end_matches(['.', '-', '/', ' ']);
         if payee.len() >= 2
             && payee.chars().any(char::is_alphabetic)
             && found.len() < MAX_CANDIDATES
@@ -1585,6 +1606,13 @@ Available balance: SGD 1,204.33.\r\n";
             "Amount\nSGD 12.50\n7.25 USD"
         );
         assert_eq!(join_split_amounts("$\n12.50\nCAD"), "$ 12.50 CAD");
+        // A code that already qualifies an amount is not joined to the next line.
+        let kept = join_split_amounts("Total paid: $25.00 CAD\n123 Main Street");
+        let found: Vec<_> = amounts(&kept)
+            .into_iter()
+            .map(|(m, _)| (m.number, m.currency))
+            .collect();
+        assert_eq!(found, [("25.00".into(), Some("CAD".into()))], "{kept:?}");
         // A label before the currency on its line.
         let labelled = join_split_amounts("Amount: USD\n25.00\nAvailable balance: USD 500.00");
         let found: Vec<_> = amounts(&labelled)
@@ -1886,6 +1914,8 @@ Content-Transfer-Encoding: base64\r\n\r\n{}",
             cited_numbers("Credit card (5678) was charged USD 25.00"),
             ["5678"]
         );
+        assert_eq!(cited_numbers("Card ending: 5678"), ["5678"]);
+        assert_eq!(cited_numbers("Card ending in: 5678"), ["5678"]);
         assert!(cited_numbers("Card: 100.00 USD").is_empty());
         assert_eq!(cited_numbers("Card: 5678 1000.00 USD"), ["5678"]);
         assert_eq!(cited_numbers("Card:\n5678"), ["5678"]);
@@ -1900,6 +1930,8 @@ Content-Transfer-Encoding: base64\r\n\r\n{}",
     #[test]
     fn finds_unicode_payees() {
         assert_eq!(payees("Merchant: Café de Flore\n"), ["Café de Flore"]);
+        assert_eq!(payees("Merchant: amazon.com\n"), ["amazon.com"]);
+        assert!(payees("Transferred to your account").is_empty());
     }
 
     #[test]
