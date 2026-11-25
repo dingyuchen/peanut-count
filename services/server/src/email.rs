@@ -6,7 +6,10 @@
 //! card number must appear in it. A second call then has Clairic choose the
 //! user's account and the category among the ledger's accounts.
 
-use std::{collections::BTreeMap, sync::LazyLock};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::LazyLock,
+};
 
 use anyhow::{Context, Result};
 use chrono::{Datelike, Days, NaiveDate};
@@ -335,13 +338,16 @@ fn written_amounts(text: &str, value: &str) -> Vec<(String, std::ops::Range<usiz
                 .split('.')
                 .skip(1)
                 .all(|group| group.len() == 3 && group.bytes().all(|b| b.is_ascii_digit()));
-            // Rupiah attached to the amount by the currency rules, as in
-            // "Rp 50.000", "50.000 IDR", "IDR -50.000", or "Amount (IDR): 50.000".
-            let rupiah = attached_currency(text, &found.range(), "IDR");
+            // A currency without minor units attached to the amount, as in
+            // "Rp 50.000", "50.000 VND", or "Amount (IDR): 50.000", where a
+            // dot before three digits cannot mark a fraction.
+            let whole_currency = WHOLE_CURRENCIES
+                .iter()
+                .any(|code| attached_currency(text, &found.range(), code));
             let whole_units = !decimal_comma
                 && dots > 0
                 && groups_of_three
-                && (dots >= 2 || text[found.end()..].starts_with(",-") || rupiah);
+                && (dots >= 2 || text[found.end()..].starts_with(",-") || whole_currency);
             // With whole units established, the dot is no fraction.
             let readings = [
                 (decimal_comma || (dots <= 1 && !whole_units)).then(|| as_written.clone()),
@@ -379,7 +385,31 @@ const SYMBOLS: &[(&str, &str)] = &[
 const WORD_BEFORE: &[(&str, &str)] = &[("RM", "MYR"), ("Rp", "IDR")];
 
 /// Local abbreviations written as a word after the amount, as in "45,00 zł".
-const WORD_AFTER: &[(&str, &str)] = &[("zł", "PLN"), ("Kč", "CZK"), ("Ft", "HUF")];
+const WORD_AFTER: &[(&str, &str)] = &[
+    ("zł", "PLN"),
+    ("Kč", "CZK"),
+    ("Ft", "HUF"),
+    ("VNĐ", "VND"),
+    ("đ", "VND"),
+];
+
+/// Currencies without minor units in practice, which group thousands with
+/// dots in many locales: Indonesian rupiah, Vietnamese dong, and the ISO 4217
+/// currencies with no decimals.
+const WHOLE_CURRENCIES: &[&str] = &[
+    "IDR", "VND", "BIF", "CLP", "DJF", "GNF", "ISK", "JPY", "KMF", "KRW", "PYG", "RWF", "UGX",
+    "VUV", "XAF", "XOF", "XPF",
+];
+
+/// Every currency attached to some amount written in `text`.
+fn written_currencies(text: &str) -> BTreeSet<&'static str> {
+    WRITTEN_NUMBER
+        .find_iter(text)
+        .flat_map(|found| {
+            known_currencies().filter(move |code| attached_currency(text, &found.range(), code))
+        })
+        .collect()
+}
 
 /// Letters written directly before "$" that name one dollar currency.
 const DOLLARS: [(&str, &str); 12] = [
@@ -1268,16 +1298,20 @@ pub async fn extract(
     };
 
     let (number, currency) = post(&source)?;
-    // The other side of a transfer, named by its verified number, must take
-    // the same currency, since a statement row has one; otherwise it would
-    // fall to Uncategorized and leave that account untouched.
+    // A transfer to the user's own account, named by its verified number,
+    // is one row in one currency, so both sides must be in it: that account
+    // must take it, and the email must write no other currency with an
+    // amount, as for "SGD 500 debited, EUR 330 credited".
     if let Some(other) = other.as_deref() {
         let mut named = accounts.iter().filter(|account| {
             (account.name.starts_with("Assets:") || account.name.starts_with("Liabilities:"))
                 && names_number(&account.name, other)
         });
         if let (Some(account), None) = (named.next(), named.next())
-            && !account.accepts(&currency)
+            && (!account.accepts(&currency)
+                || written_currencies(&text)
+                    .iter()
+                    .any(|code| *code != currency))
         {
             return Err(rejected(
                 "The transfer is between accounts that do not share a currency. Record it by hand.",
@@ -1577,7 +1611,12 @@ Available balance: SGD 1,204.33.\r\n";
         );
         assert_eq!(written_amount("Bayar Rp 50.000", "50"), None);
         assert_eq!(written_amount("Bayar 50.000 IDR", "50"), None);
-        for written in ["Refund IDR -50.000", "Amount (IDR): 50.000"] {
+        for written in [
+            "Refund IDR -50.000",
+            "Amount (IDR): 50.000",
+            "So tien 50.000 VND",
+            "So tien 50.000đ",
+        ] {
             assert_eq!(
                 written_amount(written, "50000").as_deref(),
                 Some("50000"),
@@ -2678,6 +2717,13 @@ Please view this email in an HTML-capable client.\r\n--b\r\nContent-Type: text/h
             choice("Expenses:Uncategorized", &[("Expenses:Uncategorized", 0.9)]),
         )]));
         let result = extract(&email, &ledger, &[], "USD", &reads, &model).await;
+        assert!(matches!(result, Err(Failure::Rejected(_))));
+        // Even when the receiving account takes both currencies.
+        let multi = vec![
+            account("Assets:Checking-1234", &["SGD"], &[]),
+            account("Assets:Savings-5678", &["SGD", "EUR"], &[]),
+        ];
+        let result = extract(&email, &multi, &[], "USD", &reads, &model).await;
         assert!(matches!(result, Err(Failure::Rejected(_))));
     }
 
