@@ -323,7 +323,8 @@ const DOLLARS: [(&str, &str); 12] = [
 
 /// Whether the currency `code` is written attached to the amount at `span`:
 /// directly before it, ignoring spaces, line breaks, and a sign, as in
-/// "USD 12.50", "S$12.50", "Amount (CAD): 25.00", or "USD" on the line above;
+/// "USD 12.50", "S$12.50", "CAD $12.50", "Amount (CAD): 25.00", or "USD" on
+/// the line above;
 /// or directly after it, as in "12.50 USD", "12.50 (USD)", or "128.50元". A
 /// code directly followed by another number belongs to that number. Only
 /// Latin letters touching a code make it part of a word, so "消费USD12.50"
@@ -362,6 +363,13 @@ fn attached_currency(text: &str, span: &std::ops::Range<usize>, code: &str) -> b
     let symbol_before = SYMBOLS
         .iter()
         .any(|(symbol, named)| *named == code && before.ends_with(symbol));
+    // A code, then a symbol, as in "CAD $12.50" or "EUR €12.50".
+    let code_then_symbol = SYMBOLS
+        .iter()
+        .map(|(symbol, _)| *symbol)
+        .chain(["$", "¥"])
+        .filter_map(|symbol| before.strip_suffix(symbol))
+        .any(|rest| code_before(rest.trim_end()));
     let yen = (before.ends_with('¥') || after.starts_with('¥'))
         && match code {
             "CNY" => text.contains('元') || text.contains("RMB"),
@@ -382,7 +390,27 @@ fn attached_currency(text: &str, span: &std::ops::Range<usize>, code: &str) -> b
         .any(|(symbol, named)| *named == code && after.starts_with(symbol))
         || (code == "CNY" && after.starts_with('元'))
         || (code == "JPY" && after.starts_with('円'));
-    code_before(before) || labelled || dollar || symbol_before || yen || code_after || symbol_after
+    code_before(before)
+        || code_then_symbol
+        || labelled
+        || dollar
+        || symbol_before
+        || yen
+        || code_after
+        || symbol_after
+}
+
+/// The currencies [`attached_currency`] can recognize by code or symbol.
+fn known_currencies() -> impl Iterator<Item = &'static str> {
+    let mut codes: Vec<&str> = SYMBOLS
+        .iter()
+        .chain(DOLLARS.iter())
+        .map(|(_, code)| *code)
+        .chain(["CNY", "JPY"])
+        .collect();
+    codes.sort_unstable();
+    codes.dedup();
+    codes.into_iter()
 }
 
 const MONTHS: [&str; 12] = [
@@ -690,6 +718,8 @@ struct Reading {
     outgoing: bool,
     amount: String,
     currency: Option<String>,
+    /// Currencies written attached to the amount, whatever the model said.
+    written: Vec<&'static str>,
     settled: Option<(String, String)>,
     date: NaiveDate,
     payee: Option<String>,
@@ -758,6 +788,13 @@ async fn read_body(email: &Email, body: &str, reader: &impl Extract) -> Result<R
             })
     };
     let currency = attached(&places, &found.currency);
+    let written = known_currencies()
+        .filter(|code| {
+            places
+                .iter()
+                .any(|(_, span)| attached_currency(&text, span, code))
+        })
+        .collect();
     // A settled amount without its own written currency could be anything,
     // so it is used only with one.
     let settled = found.settled_amount.as_deref().and_then(|value| {
@@ -789,6 +826,7 @@ async fn read_body(email: &Email, body: &str, reader: &impl Extract) -> Result<R
         outgoing,
         amount,
         currency,
+        written,
         settled,
         date,
         payee,
@@ -821,6 +859,7 @@ pub async fn extract(
         outgoing,
         amount,
         currency,
+        written,
         settled,
         date,
         payee,
@@ -874,11 +913,37 @@ pub async fn extract(
     let find = |name: &str| accounts.iter().find(|account| account.name == name);
     // Accounts created on import accept any currency.
     let accepts = |name: &str, currency: &str| find(name).is_none_or(|a| a.accepts(currency));
-    if let Some(source) = &known {
-        counters.remove(source);
-        if let Some(code) = &currency {
-            counters.retain(|name, _| accepts(name, code));
+    // The amount and currency to post to `source`.
+    let post = |source: &str| -> Result<(String, String), Failure> {
+        // An amount whose currency the email does not state, such as a bare
+        // "$", takes the account's only currency, or the configured default.
+        let resolved = currency.clone().unwrap_or_else(|| {
+            let account = find(source).cloned().unwrap_or_default();
+            match (&account.declared[..], &account.posted[..]) {
+                ([only], _) | ([], [only]) => only.clone(),
+                _ => default_currency.to_owned(),
+            }
+        });
+        // Keep the account the email identifies. A stated settled amount is
+        // what the account was actually charged or credited, so it wins when
+        // the account accepts it; otherwise use the amount itself, unless the
+        // email writes a different currency with it. Rejection reasons reach
+        // the relay or a bounce, so they name no account and no currency.
+        match &settled {
+            Some((settled, code)) if accepts(source, code) => Ok((settled.clone(), code.clone())),
+            _ if !written.is_empty() && !written.contains(&resolved.as_str()) => Err(rejected(
+                "The currency written with the amount could not be confirmed.",
+            )),
+            _ if accepts(source, &resolved) => Ok((amount.clone(), resolved)),
+            _ => Err(rejected(
+                "The email has no settled amount in a currency the account accepts.",
+            )),
         }
+    };
+    if let Some(source) = &known {
+        let (_, currency) = post(source)?;
+        counters.remove(source);
+        counters.retain(|name, _| accepts(name, &currency));
     }
     let counters = limit(counters, &text, ending.as_deref(), |name| {
         let root = name.split(':').next().unwrap_or_default();
@@ -908,7 +973,13 @@ pub async fn extract(
         );
     }
     let source_instructions = format!(
-        "Which of the user's accounts did the transaction move money in or out of? For a transfer between two accounts, the one the email reports as debited or charged, if it is listed. Match bank names and card or account numbers where possible. Options: {source_menu}"
+        "Which of the user's accounts did the transaction move money {}? For a transfer between two of the user's accounts, the one the email reports as {}, if it is listed. Match bank names and card or account numbers where possible. Options: {source_menu}",
+        if outgoing { "out of" } else { "into" },
+        if outgoing {
+            "debited or charged"
+        } else {
+            "credited"
+        },
     );
     let category_options: Vec<&str> = counters.keys().map(String::as_str).collect();
     let category_instructions = format!(
@@ -975,31 +1046,7 @@ pub async fn extract(
         },
     };
 
-    // An amount whose currency the email does not state, such as a bare "$",
-    // takes the account's only currency, or the configured default.
-    let resolve = |code: &Option<String>| {
-        code.clone().unwrap_or_else(|| {
-            let account = find(&source).cloned().unwrap_or_default();
-            match (&account.declared[..], &account.posted[..]) {
-                ([only], _) | ([], [only]) => only.clone(),
-                _ => default_currency.to_owned(),
-            }
-        })
-    };
-    // Keep the account the email identifies. A stated settled amount is what
-    // the account was actually charged or credited, so it wins when the account
-    // accepts it; otherwise use the amount itself.
-    let (number, currency) = match (&settled, resolve(&currency)) {
-        (Some((settled, code)), _) if accepts(&source, code) => (settled.clone(), code.clone()),
-        (_, code) if accepts(&source, &code) => (amount, code),
-        // Rejection reasons reach the relay or a bounce, so they name no
-        // account and no configured currency.
-        _ => {
-            return Err(rejected(
-                "The email has no settled amount in a currency the account accepts.",
-            ));
-        }
-    };
+    let (number, currency) = post(&source)?;
 
     // The category was asked before the source was known, so it may name the
     // source itself, or an account that does not take the currency; then, or
@@ -1269,6 +1316,9 @@ Available balance: SGD 1,204.33.\r\n";
         assert!(stated("Paid 12.50 USD", "12.50", "USD"));
         assert!(stated("Paid 12.50 (USD)", "12.50", "USD"));
         assert!(stated("Amount (CAD): 25.00", "25.00", "CAD"));
+        assert!(stated("Charged CAD $12.50", "12.50", "CAD"));
+        assert!(stated("Charged USD $12.50", "12.50", "USD"));
+        assert!(!stated("Charged CAD $12.50", "12.50", "USD"));
         assert!(stated("Amount\nUSD\n12.50", "12.50", "USD"));
         assert!(stated("消费USD12.50", "12.50", "USD"));
         assert!(stated("消费 ¥128.50 元", "128.50", "CNY"));
@@ -1909,6 +1959,85 @@ Please view this email in an HTML-capable client.\r\n--b\r\nContent-Type: text/h
         )
         .await;
         assert!(matches!(result, Err(Failure::Rejected(_))));
+    }
+
+    #[tokio::test]
+    async fn a_currency_written_with_the_amount_is_never_replaced() {
+        let mut email = parse(ALERT.as_bytes()).unwrap();
+        email.subject = String::new();
+        email.body =
+            "Your card ending 1234 was charged CAD $12.50 at TIM HORTONS on 23 Nov 2026.".into();
+        let card = vec![account("Liabilities:Card-1234", &["USD", "CAD"], &[])];
+        let closed = ["Assets:Checking".to_owned()];
+        let decide = || {
+            fixed(Answers::from([(
+                "category".into(),
+                choice("Expenses:Dining", &[("Expenses:Dining", 0.9)]),
+            )]))
+        };
+        // Read as CAD, it is posted in CAD.
+        let reads =
+            Reads(json!({ "amount": "12.50", "currency": "CAD", "account_ending": "1234" }));
+        let statement = extract(&email, &card, &closed, "USD", &reads, &decide())
+            .await
+            .unwrap();
+        assert_eq!(statement.currency, "CAD");
+        // With the currency unread, it is rejected rather than posted in USD.
+        let unread = Reads(json!({ "amount": "12.50", "account_ending": "1234" }));
+        let usd = vec![account("Liabilities:Card-1234", &["USD"], &[])];
+        let result = extract(&email, &usd, &closed, "USD", &unread, &decide()).await;
+        assert!(matches!(result, Err(Failure::Rejected(_))));
+    }
+
+    #[tokio::test]
+    async fn categories_are_offered_in_the_posted_currency() {
+        let mut email = parse(ALERT.as_bytes()).unwrap();
+        email.body =
+            "Your card ending 1234 was charged EUR 50.00 (SGD 75.30) at CAFE DE FLORE on 21 Nov 2026."
+                .into();
+        let ledger = vec![
+            account("Liabilities:Card-1234", &["SGD"], &[]),
+            account("Expenses:Cafes", &["SGD"], &[]),
+        ];
+        let closed = ["Assets:Checking".to_owned()];
+        let reads = Reads(json!({
+            "amount": "50.00", "currency": "EUR", "settled_amount": "75.30",
+            "settled_currency": "SGD", "account_ending": "1234",
+        }));
+        let model = fixed(Answers::from([(
+            "category".into(),
+            choice("Expenses:Cafes", &[("Expenses:Cafes", 0.9)]),
+        )]));
+        let statement = extract(&email, &ledger, &closed, "USD", &reads, &model)
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                statement.currency.as_str(),
+                statement.rows[0].account.as_str()
+            ),
+            ("SGD", "Expenses:Cafes")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_incoming_transfer_asks_for_the_credited_account() {
+        let mut email = parse(ALERT.as_bytes()).unwrap();
+        email.body = "Your account ending 8890 was credited SGD 100.00 on 23 Nov 2026.".into();
+        let reads = Reads(json!({ "direction": "in", "amount": "100.00", "currency": "SGD" }));
+        let model = fixed(Answers::from([
+            ("account".into(), choice("Assets:DBS-Savings", &[])),
+            (
+                "category".into(),
+                choice("Income:Uncategorized", &[("Income:Uncategorized", 0.9)]),
+            ),
+        ]));
+        extract(&email, &card_alert_accounts(), &[], "USD", &reads, &model)
+            .await
+            .unwrap();
+        let calls = model.calls.into_inner().unwrap();
+        let asked = calls[0]["account"]["instructions"].as_str().unwrap();
+        assert!(asked.contains("money into") && asked.contains("reports as credited"));
     }
 
     #[tokio::test]

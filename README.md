@@ -329,7 +329,7 @@ seconds while the model has the memory to itself. Without wired weights, or alon
 large apps, it pages and can take minutes. To use Workers AI instead:
 
 ```sh
-export PEANUT_CLAIRIC=cloudflare PEANUT_CLOUDFLARE_ACCOUNT_ID=<account id> PEANUT_CLAIRIC_TOKEN=<API token>
+export PEANUT_CLAIRIC=cloudflare PEANUT_CLOUDFLARE_ACCOUNT_ID="your-account-id" PEANUT_CLAIRIC_TOKEN="your-api-token"
 ```
 
 ## Verification
