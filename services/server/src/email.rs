@@ -1377,7 +1377,9 @@ pub async fn extract(
     // A transfer to the user's own account, named by its verified number,
     // is one row in one currency, so both sides must be in it: that account
     // must take it, and the email must write no other currency with an
-    // amount, as for "SGD 500 debited, EUR 330 credited".
+    // amount, as for "SGD 500 debited, EUR 330 credited". Then that account
+    // is the other side, whatever the category answer.
+    let mut counterpart = None;
     if let Some(other) = other.as_deref() {
         let mut named = accounts.iter().filter(|account| {
             (account.name.starts_with("Assets:") || account.name.starts_with("Liabilities:"))
@@ -1411,33 +1413,39 @@ pub async fn extract(
             .collect::<Vec<_>>()
             .join("\n");
         if let (Some(account), None) = (named.next(), named.next())
-            && (!account.accepts(&currency)
+            && account.name != source
+        {
+            if !account.accepts(&currency)
                 || written_currencies(&transfer_lines)
                     .iter()
-                    .any(|code| *code != currency))
-        {
-            return Err(rejected(
-                "The transfer is between accounts that do not share a currency. Record it by hand.",
-            ));
+                    .any(|code| *code != currency)
+            {
+                return Err(rejected(
+                    "The transfer is between accounts that do not share a currency. Record it by hand.",
+                ));
+            }
+            counterpart = Some(account.name.clone());
         }
     }
 
     // The category was asked before the source was known, so it may name the
     // source itself, or an account that does not take the currency; then, or
     // when the model is unsure, fall back to Uncategorized.
-    let category = answers
-        .get("category")
-        .and_then(|answer| match &answer.value {
-            Value::String(name)
-                if counters.contains_key(name)
-                    && *name != source
-                    && accepts(name, &currency)
-                    && answer.confidence.unwrap_or(1.0) >= MIN_CATEGORY =>
-            {
-                Some(name.clone())
-            }
-            _ => None,
-        });
+    let category = counterpart.or_else(|| {
+        answers
+            .get("category")
+            .and_then(|answer| match &answer.value {
+                Value::String(name)
+                    if counters.contains_key(name)
+                        && *name != source
+                        && accepts(name, &currency)
+                        && answer.confidence.unwrap_or(1.0) >= MIN_CATEGORY =>
+                {
+                    Some(name.clone())
+                }
+                _ => None,
+            })
+    });
     let account = match category {
         Some(account) => account,
         None => {
@@ -2900,6 +2908,16 @@ Content-Type: text/html; charset=utf-8\r\n\
         ];
         let result = extract(&rows, &multi_rows, &[], "USD", &reads, &model).await;
         assert!(matches!(result, Err(Failure::Rejected(_))));
+        // A same-currency transfer goes to the named account, even when the
+        // model is unsure of the category.
+        let unsure = fixed(Answers::from([(
+            "category".into(),
+            choice("Expenses:Uncategorized", &[("Expenses:Uncategorized", 0.1)]),
+        )]));
+        let statement = extract(&same, &same_currency, &[], "USD", &euros, &unsure)
+            .await
+            .unwrap();
+        assert_eq!(statement.rows[0].account, "Assets:Savings-5678");
         // Even when the receiving account takes both currencies.
         let multi = vec![
             account("Assets:Checking-1234", &["SGD"], &[]),

@@ -303,8 +303,19 @@ env=/etc/peanut/inbound.env
 set -a
 . "$env" || exit 75
 set +a
-exec /usr/local/bin/peanut-count ingest-email --data /srv/peanut/mobile-data --recipient "$1"
+/usr/local/bin/peanut-count ingest-email --data /srv/peanut/mobile-data --recipient "$1"
+status=$?
+# Discard mail for unknown addresses rather than bounce it to a sender
+# that may be forged.
+[ "$status" -eq 67 ] && exit 0
+exit "$status"
 ```
+
+Postfix accepts mail for any address at the domain, because forwarding
+addresses are stored only as hashes and cannot be listed for
+`relay_recipient_maps`. The wrapper therefore discards mail for an unknown or
+replaced address instead of returning 67, which would make Postfix send a
+bounce to the envelope sender, and backscatter when that sender is forged.
 
 Duplicates are detected by the original message's Message-ID. A relay retry
 or a re-forward of the same email as an attachment is recorded once.
