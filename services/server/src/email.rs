@@ -393,7 +393,17 @@ fn attached_currency(text: &str, span: &std::ops::Range<usize>, code: &str) -> b
         .any(|(symbol, named)| *named == code && after.starts_with(symbol))
         || (code == "CNY" && after.starts_with('元'))
         || (code == "JPY" && after.starts_with('円'));
+    // A wrapped line holding only the code, as in "45.00" then "EUR".
+    let code_below = after
+        .strip_prefix(['\r', '\n'])
+        .map(|rest| rest.trim_start_matches(['\r', '\n']))
+        .and_then(|rest| rest.lines().next())
+        .is_some_and(|line| {
+            let line = line.trim();
+            line == code || line.strip_prefix('(').and_then(|l| l.strip_suffix(')')) == Some(code)
+        });
     code_before(before)
+        || code_below
         || code_then_symbol
         || labelled
         || dollar
@@ -406,10 +416,12 @@ fn attached_currency(text: &str, span: &std::ops::Range<usize>, code: &str) -> b
 /// A sum of money with a fraction, such as " 75.30" or " 1,250.00", next.
 static MONEY_NEXT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[ \t]*[-−+]?\d[\d,' ]*[.,]\d").unwrap());
-/// A numeric date with its year, such as " 23.11.2026", next. Without a
-/// year, "23.11" is as likely a sum.
-static DATE_NEXT: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^[ \t]*\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\b").unwrap());
+/// A numeric date with its year, such as " 23.11.2026" or " 2026.11.23",
+/// next. Without a year, "23.11" is as likely a sum.
+static DATE_NEXT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^[ \t]*(?:\d{1,2}[./-]\d{1,2}[./-]\d{2,4}|\d{4}[./-]\d{1,2}[./-]\d{1,2})\b")
+        .unwrap()
+});
 
 /// Active ISO 4217 codes. A code that is also an English word, such as "TRY",
 /// is kept: it counts only when written directly against the amount, and then
@@ -1343,6 +1355,9 @@ Available balance: SGD 1,204.33.\r\n";
         assert!(stated("Refund: CAD -$12.50", "-12.50", "CAD"));
         assert!(stated("45.00 CHF 23 Nov 2026", "45.00", "CHF"));
         assert!(stated("45.00 CHF 23.11.2026", "45.00", "CHF"));
+        assert!(stated("45.00 CHF 2026.11.23", "45.00", "CHF"));
+        assert!(stated("Total\n45.00\nEUR\nThank you", "45.00", "EUR"));
+        assert!(stated("Total\r\n45.00\r\n(EUR)", "45.00", "EUR"));
         // A code on the next line belongs to something else.
         assert!(!stated(
             "Purchase: $45.00\nJPY 5000 available",
@@ -2031,6 +2046,16 @@ Please view this email in an HTML-capable client.\r\n--b\r\nContent-Type: text/h
         let unread = Reads(json!({ "amount": "45.00", "account_ending": "1234" }));
         let result = extract(&email, &usd, &closed, "USD", &unread, &decide()).await;
         assert!(matches!(result, Err(Failure::Rejected(_))));
+        // So does a code on the line below, and one before a year-first date.
+        let unread = Reads(json!({ "amount": "45.00", "account_ending": "1234" }));
+        for body in [
+            "Card ending 1234 at MIGROS\nTotal 45.00\nCHF\n",
+            "Card ending 1234 at MIGROS\n45.00 CHF 2026.11.23",
+        ] {
+            email.body = body.into();
+            let result = extract(&email, &usd, &closed, "USD", &unread, &decide()).await;
+            assert!(matches!(result, Err(Failure::Rejected(_))), "{body}");
+        }
         // So does a code that is also a word.
         email.body = "Card ending 1234. Amount: TRY 1,250.00 on 23 Nov 2026.".into();
         let unread = Reads(json!({ "amount": "1,250.00", "account_ending": "1234" }));
