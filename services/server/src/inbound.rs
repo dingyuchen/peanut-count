@@ -26,9 +26,8 @@ use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 use crate::{
+    clairic::{self, Clairic, Host},
     email::{self, Failure},
-    jev::Jev,
-    llm::{Format, Reader},
     mobile::{self, ApiError, ApiResult, INTERNAL},
     store::Store,
 };
@@ -36,7 +35,7 @@ use crate::{
 /// Largest accepted raw message. Alerts are small; this leaves room for HTML and inline images.
 pub const MAX_EMAIL_BYTES: usize = 4 * 1024 * 1024;
 /// Relay deliveries processed at once. Each holds up to one message in memory
-/// and waits on the decision model, so excess deliveries are deferred.
+/// and waits on the model, so excess deliveries are deferred.
 static RELAY_SLOTS: Semaphore = Semaphore::const_new(4);
 
 #[derive(clap::Args)]
@@ -45,29 +44,17 @@ pub struct InboundArgs {
     /// Email import is off unless this is set.
     #[arg(long, env = "PEANUT_INBOUND_DOMAIN")]
     inbound_domain: Option<String>,
-    /// Extraction model endpoint, for example http://127.0.0.1:8093/v1/systemone
-    /// for Clairic, or http://127.0.0.1:1234/v1/chat/completions with
-    /// --extract-format chat. Set PEANUT_EXTRACT_TOKEN for hosted APIs.
-    #[arg(long, env = "PEANUT_EXTRACT_URL")]
-    extract_url: Option<String>,
-    /// Wire format of the extraction endpoint.
-    #[arg(
-        long,
-        env = "PEANUT_EXTRACT_FORMAT",
-        value_enum,
-        default_value = "systemone"
-    )]
-    extract_format: Format,
-    /// Extraction model ID, for example clairic-flash. Required for the chat format.
-    #[arg(long, env = "PEANUT_EXTRACT_MODEL")]
-    extract_model: Option<String>,
-    /// Decision model endpoint in Jev's /v1/systemone format, for example
-    /// http://127.0.0.1:1234/v1/systemone. Set PEANUT_JEV_TOKEN for hosted APIs.
-    #[arg(long, env = "PEANUT_JEV_URL")]
-    jev_url: Option<String>,
-    /// Decision model ID, for example typesafe/jev-1.14.
-    #[arg(long, env = "PEANUT_JEV_MODEL")]
-    jev_model: Option<String>,
+    /// Where Clairic Flash, which reads each email and chooses its accounts,
+    /// runs: `local` for its own server, or `cloudflare` for Workers AI. Email
+    /// is deferred until it is set.
+    #[arg(long, env = "PEANUT_CLAIRIC", value_enum)]
+    clairic: Option<Host>,
+    /// Endpoint of a local Clairic server.
+    #[arg(long, env = "PEANUT_CLAIRIC_URL", default_value = clairic::LOCAL_URL)]
+    clairic_url: String,
+    /// Cloudflare account that runs Workers AI, for `cloudflare`.
+    #[arg(long, env = "PEANUT_CLOUDFLARE_ACCOUNT_ID")]
+    cloudflare_account_id: Option<String>,
     /// Currency for an amount written with a bare "$" when the account has no single currency.
     #[arg(long, env = "PEANUT_EMAIL_CURRENCY", default_value = "USD")]
     email_currency: String,
@@ -75,8 +62,7 @@ pub struct InboundArgs {
 
 pub struct Inbound {
     domain: String,
-    reader: Option<Reader>,
-    model: Option<Jev>,
+    model: Option<Clairic>,
     default_currency: String,
 }
 
@@ -101,29 +87,21 @@ impl InboundArgs {
                 && self.email_currency.bytes().all(|b| b.is_ascii_uppercase()),
             "email currency must be a three-letter code such as USD"
         );
-        let model = match set(self.jev_url) {
+        // A Cloudflare API token, or the local server's CLAIRIC_API_KEY.
+        let token = set(std::env::var("PEANUT_CLAIRIC_TOKEN").ok());
+        let model = match self.clairic {
             None => None,
-            Some(url) => {
-                let model = set(self.jev_model).context("set --jev-model or PEANUT_JEV_MODEL")?;
-                let token = set(std::env::var("PEANUT_JEV_TOKEN").ok());
-                Some(Jev::new(url, model, token)?)
-            }
-        };
-        let reader = match set(self.extract_url) {
-            None => None,
-            Some(url) => {
-                let model = set(self.extract_model);
-                ensure!(
-                    self.extract_format != Format::Chat || model.is_some(),
-                    "set --extract-model or PEANUT_EXTRACT_MODEL for the chat format"
-                );
-                let token = set(std::env::var("PEANUT_EXTRACT_TOKEN").ok());
-                Some(Reader::new(url, self.extract_format, model, token)?)
+            Some(Host::Local) => Some(Clairic::local(self.clairic_url, token)?),
+            Some(Host::Cloudflare) => {
+                let account = set(self.cloudflare_account_id).context(
+                    "set --cloudflare-account-id or PEANUT_CLOUDFLARE_ACCOUNT_ID for Workers AI",
+                )?;
+                let token = token.context("set PEANUT_CLAIRIC_TOKEN to a Cloudflare API token")?;
+                Some(Clairic::cloudflare(account.trim(), token)?)
             }
         };
         Ok(Some(Inbound {
             domain,
-            reader,
             model,
             default_currency: self.email_currency,
         }))
@@ -157,7 +135,7 @@ pub async fn ingest(
     let paths = data.clone();
     let prepared = tokio::task::spawn_blocking(move || -> Result<_, IngestError> {
         let user = recipient_user(&paths, &config.domain, &recipient)?.ok_or(UnknownRecipient)?;
-        if config.model.is_none() || config.reader.is_none() {
+        if config.model.is_none() {
             return Err(NotConfigured);
         }
         let email = email::parse(&raw).map_err(|error| Rejected(format!("{error:#}")))?;
@@ -186,20 +164,12 @@ pub async fn ingest(
     };
 
     let model = inbound.model.as_ref().ok_or(NotConfigured)?;
-    let reader = inbound.reader.as_ref().ok_or(NotConfigured)?;
-    let statement = email::extract(
-        &email,
-        &accounts,
-        &closed,
-        &inbound.default_currency,
-        reader,
-        model,
-    )
-    .await
-    .map_err(|failure| match failure {
-        Failure::Rejected(reason) => Rejected(reason),
-        Failure::Unavailable(error) => Unavailable(error),
-    })?;
+    let statement = email::extract(&email, &accounts, &closed, &inbound.default_currency, model)
+        .await
+        .map_err(|failure| match failure {
+            Failure::Rejected(reason) => Rejected(reason),
+            Failure::Unavailable(error) => Unavailable(error),
+        })?;
 
     tokio::task::spawn_blocking(move || {
         let mut store = Store::open(&mobile::ledger_path(&data, &user)).map_err(Unavailable)?;
@@ -379,7 +349,7 @@ async fn receive(State(state): State<InboundState>, headers: HeaderMap, raw: Byt
             .into_response(),
         Err(IngestError::NotConfigured) => ApiError(
             StatusCode::SERVICE_UNAVAILABLE,
-            "Email import has no extraction or decision model configured.",
+            "Email import has no model configured.",
         )
         .into_response(),
         Err(IngestError::Unavailable(error)) => {
@@ -445,9 +415,7 @@ pub async fn ingest_stdin(
                 EX_DATAERR
             }
             Err(IngestError::NotConfigured) => {
-                eprintln!(
-                    "peanut-count: set PEANUT_EXTRACT_URL, PEANUT_JEV_URL, and PEANUT_JEV_MODEL to import email"
-                );
+                eprintln!("peanut-count: set PEANUT_CLAIRIC to import email");
                 EX_TEMPFAIL
             }
             Err(IngestError::Unavailable(error)) => {
@@ -471,36 +439,27 @@ Date: Tue, 24 Nov 2026 09:15:00 +0800\r\n\
 A transaction of S$12.50 was made with your credit card on 23 Nov 2026 at STARBUCKS VIVOCITY.\r\n\
 Available balance: SGD 1,204.33.\r\n";
 
-    /// Serves fixed extraction answers, in both formats, and decision answers,
+    /// Serves Clairic's answers to the extraction and the decision questions,
     /// and returns the server's base URL.
     async fn fake_model() -> String {
-        let app = Router::new()
-            .route(
-                "/v1/chat/completions",
-                post(|Json(request): Json<serde_json::Value>| async move {
-                    // The schema constrains the answer, and the email is the user message.
-                    assert_eq!(request["response_format"]["type"], "json_schema");
-                    let email = request["messages"][1]["content"].as_str().unwrap();
-                    assert!(email.contains("STARBUCKS VIVOCITY"));
-                    let content = json!({
-                        "is_transaction": true, "direction": "out", "amount": "12.50",
-                        "currency": "SGD", "settled_amount": null, "settled_currency": null,
-                        "date": "2026-11-23", "payee": "STARBUCKS VIVOCITY", "account_ending": null,
-                    });
-                    Json(json!({ "choices": [{ "message": { "content": content.to_string() } }] }))
-                }),
-            )
-            .route(
-                "/clairic/v1/systemone",
-                post(|Json(request): Json<serde_json::Value>| async move {
-                    // Typed fields, with the email as the state.
-                    assert_eq!(request["fields"]["amount"]["type"], "number");
-                    assert_eq!(request["fields"]["currency"]["knowledge"], true);
-                    assert_eq!(request["reference_date"], "2026-11-24");
-                    assert!(request["state"].as_str().unwrap().contains("STARBUCKS VIVOCITY"));
-                    let value = |value: Value| json!({ "value": value, "confidence": 0.99 });
-                    // Workers AI wraps the answer in `result`.
-                    Json(json!({ "success": true, "result": { "answers": {
+        let app = Router::new().route(
+            "/clairic/v1/systemone",
+            post(|Json(request): Json<serde_json::Value>| async move {
+                // Typed fields, with the email as the state.
+                assert_eq!(request["model"], "clairic-flash");
+                assert_eq!(request["reference_date"], "2026-11-24");
+                assert!(
+                    request["state"]
+                        .as_str()
+                        .unwrap()
+                        .contains("STARBUCKS VIVOCITY")
+                );
+                let fields = &request["fields"];
+                let value = |value: Value| json!({ "value": value, "confidence": 0.99 });
+                let answers = if fields.get("amount").is_some() {
+                    assert_eq!(fields["amount"]["type"], "number");
+                    assert_eq!(fields["currency"]["knowledge"], true);
+                    json!({
                         "is_transaction": value(json!(true)), "direction": value(json!("out")),
                         "amount": value(json!(12.5)), "currency": value(json!("SGD")),
                         "settled_amount": { "value": null, "p_null": 0.99 },
@@ -509,20 +468,26 @@ Available balance: SGD 1,204.33.\r\n";
                         "payee": value(json!("STARBUCKS VIVOCITY")),
                         // A value that failed its grammar is no value.
                         "account_ending": { "value": "12", "valid": false },
-                    }}}))
-                }),
-            )
-            .route(
-                "/jev/v1/systemone",
-                post(|Json(request): Json<serde_json::Value>| async move {
-                    let has = |name: &str| request["questions"].get(name).is_some();
-                    assert!(has("account") != has("category"));
-                    Json(json!({ "model": "fake", "answers": {
-                        "account": { "type": "choice", "choice": "Liabilities:CreditCard" },
-                        "category": { "type": "choice", "choice": "Expenses:Dining", "probabilities": { "Expenses:Dining": 0.93 } },
-                    }}))
-                }),
-            );
+                    })
+                } else {
+                    // The account and category are chosen from the options offered.
+                    let offers = |name: &str, option: &str| {
+                        fields[name]["enum"]
+                            .as_array()
+                            .unwrap()
+                            .contains(&json!(option))
+                    };
+                    assert!(offers("account", "Liabilities:CreditCard"));
+                    assert!(offers("category", "Expenses:Dining"));
+                    json!({
+                        "account": value(json!("Liabilities:CreditCard")),
+                        "category": value(json!("Expenses:Dining")),
+                    })
+                };
+                // Workers AI wraps the answer in `result`.
+                Json(json!({ "success": true, "result": { "answers": answers } }))
+            }),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -530,44 +495,16 @@ Available balance: SGD 1,204.33.\r\n";
     }
 
     fn inbound(base: Option<String>) -> Arc<Inbound> {
-        inbound_with(base, Format::Systemone)
-    }
-
-    fn inbound_with(base: Option<String>, format: Format) -> Arc<Inbound> {
         Arc::new(Inbound {
             domain: "in.example.com".into(),
-            reader: base.as_ref().map(|base| {
-                match format {
-                    Format::Systemone => {
-                        Reader::new(format!("{base}/clairic/v1/systemone"), format, None, None)
-                    }
-                    Format::Chat => Reader::new(
-                        format!("{base}/v1/chat/completions"),
-                        format,
-                        Some("fake".into()),
-                        None,
-                    ),
-                }
-                .unwrap()
-            }),
-            model: base.map(|base| {
-                Jev::new(format!("{base}/jev/v1/systemone"), "fake".into(), None).unwrap()
-            }),
+            model: base
+                .map(|base| Clairic::local(format!("{base}/clairic/v1/systemone"), None).unwrap()),
             default_currency: "USD".into(),
         })
     }
 
     #[tokio::test]
     async fn forwarded_email_becomes_a_synced_statement() {
-        imports_with(Format::Systemone).await;
-    }
-
-    #[tokio::test]
-    async fn a_chat_extraction_model_works_too() {
-        imports_with(Format::Chat).await;
-    }
-
-    async fn imports_with(format: Format) {
         let temp = tempfile::tempdir().unwrap();
         let data = Arc::new(temp.path().to_path_buf());
         mobile::init_registry(&data).unwrap();
@@ -576,7 +513,7 @@ Available balance: SGD 1,204.33.\r\n";
             .execute("INSERT INTO users VALUES('u1', 'alice', 'unused')", [])
             .unwrap();
         let address = rotate_address(&data, "in.example.com", "u1").unwrap();
-        let config = inbound_with(Some(fake_model().await), format);
+        let config = inbound(Some(fake_model().await));
         let deliver =
             |recipient: String| ingest(data.clone(), config.clone(), recipient, Bytes::from(ALERT));
 

@@ -194,7 +194,7 @@ alert, card notification, or receipt to it, and the server records the
 transaction in that account's ledger. The entry is stored as a one-row
 statement, so it reaches the iOS app on the next sync like a PDF import.
 
-Two models read each email. An extraction model reads the transaction's
+One model, Clairic Flash, reads each email. First it reads the transaction's
 fields from the email's text: whether it reports a completed transaction,
 whether money went out or came in, the amount and its currency, any amount
 settled in another currency, the date, the payee, and the card or account
@@ -204,41 +204,37 @@ by its ISO code or by a symbol that names only that currency, such as `€` or
 `S$`. A bare `$` takes the account's only currency, or the configured
 default. A date must write its day and month, and a payee or card number must
 appear verbatim. A field that fails these checks is dropped, or the email is
-rejected if the amount fails. A decision model then chooses which of your
-asset or liability accounts was used, and the category.
+rejected if the amount fails. Then it chooses which of your asset or
+liability accounts was used, and the category, from your ledger's accounts.
+When the email mentions a decline or cancellation, it is also asked whether
+money actually moved, and the email is rejected if not.
 
 Name accounts after the card or account number when you can, for example
 `Liabilities:Citi-Rewards-1234`, so that "card ending 1234" matches. If an
 email cites a card or account number that no account name ends with, it can
 be rejected with a request to open that account first. Missing categories,
 and `Assets:Checking` or `Liabilities:CreditCard` when the ledger has no
-account of that kind, are opened automatically. A category the decision model
-is unsure about goes to `Expenses:Uncategorized` or `Income:Uncategorized`.
+account of that kind, are opened automatically. A category the model is
+unsure about goes to `Expenses:Uncategorized` or `Income:Uncategorized`.
 Correct a wrong entry with a reversal.
 
-The extraction model reads typed fields from the email. By default it speaks
-System One: Extract (`/v1/systemone` with `state` and typed `fields`), as
-Cloudflare's Clairic does on Workers AI or locally. With
-`PEANUT_EXTRACT_FORMAT=chat` it is any OpenAI-compatible chat completions
-endpoint that supports JSON schema output, such as LM Studio, llama.cpp, or a
-hosted API. The decision model is any server that speaks TypeSafe Jev's `/v1/systemone`
-format, including hosted Jev, LM Studio, and llama.cpp. A hosted model
-receives the text of every forwarded email.
+Clairic answers typed fields over System One: Extract (`state` and typed
+`fields`); the account and category are multiple-choice fields. Set
+`PEANUT_CLAIRIC` to choose where it runs: `local` for the model's own server
+on this machine, or `cloudflare` for Workers AI. Workers AI receives the text
+of every forwarded email.
 
 | Variable | Purpose |
 | --- | --- |
 | `PEANUT_INBOUND_DOMAIN` | Domain of the forwarding addresses. Email import is off unless it is set. |
-| `PEANUT_EXTRACT_URL` | Full URL of the extraction endpoint. Empty by default, and mail is deferred until it is set. |
-| `PEANUT_EXTRACT_FORMAT` | `systemone` (the default) or `chat`. |
-| `PEANUT_EXTRACT_MODEL` | Extraction model ID. Required for `chat`; optional for `systemone`. |
-| `PEANUT_EXTRACT_TOKEN` | Bearer token for a hosted extraction API. |
-| `PEANUT_JEV_URL` | Full decision endpoint URL. Empty by default, and mail is deferred until it is set. |
-| `PEANUT_JEV_MODEL` | Decision model ID. |
-| `PEANUT_JEV_TOKEN` | Bearer token for a hosted decision API. |
+| `PEANUT_CLAIRIC` | `local` or `cloudflare`. Empty by default, and mail is deferred until it is set. |
+| `PEANUT_CLAIRIC_URL` | Endpoint of a local Clairic server. Defaults to `http://127.0.0.1:8093/v1/systemone`. |
+| `PEANUT_CLOUDFLARE_ACCOUNT_ID` | Cloudflare account that runs Workers AI, for `cloudflare`. |
+| `PEANUT_CLAIRIC_TOKEN` | A Cloudflare API token allowed to run Workers AI, for `cloudflare`, or the local server's `CLAIRIC_API_KEY` if it sets one. |
 | `PEANUT_INBOUND_TOKEN` | Shared secret for the mail relay webhook. The webhook is off unless it is set. |
 | `PEANUT_EMAIL_CURRENCY` | Currency for a bare `$` when the account has no single currency. Defaults to USD. |
 
-The three tokens are read only from the environment. The other variables also
+The two tokens are read only from the environment. The other variables also
 have command-line flags. Run `peanut-count mobile-serve --help`.
 Create or replace an account's address with its session token. Replacing an
 address disables the old one immediately.
@@ -304,12 +300,12 @@ Duplicates are detected by the original message's Message-ID. A relay retry
 or a re-forward of the same email as an attachment is recorded once.
 Forwarding it inline twice creates a new message, which is recorded twice.
 Amounts use a dot as the decimal separator, with optional comma or
-apostrophe grouping. Each decision question offers the model at most 50
-options. In a larger ledger, accounts named in the email and accounts of the
+apostrophe grouping. The account and category questions each offer at most
+50 options. In a larger ledger, accounts named in the email and accounts of the
 expected kind come first. An email that reports several transactions is
 recorded as one of them.
 
-### Local models
+### Running Clairic locally
 
 Clairic Flash, the MLX port in `mlx-community/clairic-flash-4bit` (about
 6 GB), ships its own Python runtime and server, so LM Studio's engine cannot
@@ -324,42 +320,17 @@ that holds `server.py`:
 ```sh
 python -s -c 'import mlx.core as mx, runpy, sys; mx.set_wired_limit(7 << 30); mx.set_cache_limit(1 << 28); sys.argv[0] = "server.py"; runpy.run_path("server.py", run_name="__main__")' \
   --model ~/.lmstudio/models/mlx-community/clairic-flash-4bit --port 8093 --batch-size 1 --token-budget 2048
-export PEANUT_EXTRACT_URL=http://127.0.0.1:8093/v1/systemone
+export PEANUT_CLAIRIC=local
 ```
 
-On an Apple M1 Pro with 16 GB, it reads an alert in about 15 to 25 seconds
-while it has the memory to itself. Without wired weights, or alongside other
-large apps, it pages and can take minutes. For a lighter
-extraction model, LM Studio serves a general instruction model over chat
-completions. It may be a reasoning model: if LM Studio returns the
-schema-constrained answer as reasoning and leaves the message content empty,
-the server reads the answer from the reasoning.
+Each email takes two calls: one reads the fields and one chooses the account
+and category. On an Apple M1 Pro with 16 GB, that takes about 30 to 40
+seconds while the model has the memory to itself. Without wired weights, or alongside other
+large apps, it pages and can take minutes. To use Workers AI instead:
 
 ```sh
-lms load qwen/qwen3.5-4b --identifier qwen-extract
-lms server start
-export PEANUT_EXTRACT_URL=http://127.0.0.1:1234/v1/chat/completions
-export PEANUT_EXTRACT_FORMAT=chat PEANUT_EXTRACT_MODEL=qwen-extract
+export PEANUT_CLAIRIC=cloudflare PEANUT_CLOUDFLARE_ACCOUNT_ID=<account id> PEANUT_CLAIRIC_TOKEN=<API token>
 ```
-
-`qwen/qwen3.5-4b` is about 3 GB and reads an alert in about two seconds on
-an Apple M1 Pro. For decisions, LM Studio serves `/v1/systemone`
-for models it lists as decision models.
-
-```sh
-lms get https://huggingface.co/ggml-org/lev-GGUF@Q4_K_M
-lms load lev --identifier lev
-lms server start
-export PEANUT_JEV_URL=http://127.0.0.1:1234/v1/systemone PEANUT_JEV_MODEL=lev
-```
-
-`ggml-org/lev-GGUF` is about 3 GB at Q4_K_M. Each email takes one extraction
-call and one or two decision calls, about 5 to 9 seconds in all on an Apple
-M1 Pro. The `feder-cr/jev` GGUF
-(jevos-v4) loads in LM Studio as an ordinary language model, not a decision
-model, so its `/v1/systemone` endpoint does not serve it. Run jevos with its
-own `jev serve` binary on port 8017 instead. `ggml-org/OpenJev-GGUF` needs
-about 20 GB.
 
 ## Verification
 

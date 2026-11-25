@@ -1,11 +1,10 @@
 //! Turns a forwarded transaction email into a one-row statement.
 //!
-//! An extraction model reads the transaction's fields from the email's text.
-//! Each field is then checked against that text: the amount must be a number
-//! written in the email, a currency must be stated by its code or an
-//! unambiguous symbol, and a date, payee, or card number must appear in it.
-//! A decision model then chooses the user's account and the category among
-//! the ledger's accounts.
+//! Clairic reads the transaction's fields from the email's text. Each field is
+//! then checked against that text: the amount must be a number written in the
+//! email, a currency must be written attached to it, and a date, payee, or
+//! card number must appear in it. A second call then has Clairic choose the
+//! user's account and the category among the ledger's accounts.
 
 use std::{collections::BTreeMap, sync::LazyLock};
 
@@ -14,17 +13,16 @@ use chrono::{Datelike, Days, NaiveDate};
 use mail_parser::{MessageParser, MessagePart, MessageRef, PartKind, html_to_text};
 use regex::Regex;
 use serde::Deserialize;
-use serde_json::{Map, Value, json};
+use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    jev::{Answer, Answers, Decide},
+    clairic::{Answers, Extract, Field, Kind, Request},
     ledger::OpenAccount,
-    llm::{Extract, Field, Kind, Request},
     mobile::{Statement, StatementRow},
 };
 
-/// Longest email text, in characters, that is sent to the models.
+/// Longest email text, in characters, that is sent to the model.
 const MAX_TEXT: usize = 12_000;
 /// Longest subject or sender, in characters.
 const MAX_HEADER: usize = 300;
@@ -599,9 +597,7 @@ pub struct Extraction {
     pub account_ending: Option<String>,
 }
 
-const TASK: &str = "You read one bank, card, or payment notification that a user forwarded, and report the single transaction it describes. Copy values exactly as the email writes them. Never calculate, convert, or guess a value the email does not state; use null instead.";
-
-const FIELDS: &[Field] = &[
+const FIELDS: &[Field<'static>] = &[
     Field {
         name: "is_transaction",
         kind: Kind::Boolean,
@@ -653,10 +649,11 @@ const FIELDS: &[Field] = &[
 /// or has a type its kind does not allow, so a malformed answer is retried
 /// rather than read as a missing value. Numbers become text, as the email
 /// would write them without grouping.
-fn read_answer(answer: Value) -> Option<Extraction> {
-    let Value::Object(mut fields) = answer else {
-        return None;
-    };
+fn read_answer(answers: Answers) -> Option<Extraction> {
+    let mut fields: Map<String, Value> = answers
+        .into_iter()
+        .map(|(name, answer)| (name, answer.value))
+        .collect();
     for field in FIELDS {
         let value = fields.get_mut(field.name)?;
         let allowed = match (field.kind, &*value) {
@@ -715,7 +712,6 @@ async fn read_body(email: &Email, body: &str, reader: &impl Extract) -> Result<R
     );
     let raw = reader
         .extract(&Request {
-            task: TASK,
             text: &message,
             reference_date: email.sent,
             fields: FIELDS,
@@ -806,16 +802,15 @@ pub async fn extract(
     accounts: &[OpenAccount],
     closed: &[String],
     default_currency: &str,
-    reader: &impl Extract,
-    model: &impl Decide,
+    model: &impl Extract,
 ) -> Result<Statement, Failure> {
     let is_closed = |name: &str| closed.iter().any(|closed| closed == name);
     // A plain-text alternative can be a stub such as "View this alert online"
     // while the HTML alternative holds the receipt, so try that before
     // rejecting the email.
-    let reading = match read_body(email, &email.body, reader).await {
+    let reading = match read_body(email, &email.body, model).await {
         Err(Failure::Rejected(reason)) => match &email.alternative {
-            Some(html) => read_body(email, html, reader).await?,
+            Some(html) => read_body(email, html, model).await?,
             None => return Err(Failure::Rejected(reason)),
         },
         other => other?,
@@ -831,33 +826,6 @@ pub async fn extract(
         payee,
         ending,
     } = reading;
-    let state = json!({ "email": message });
-    // An email that mentions a decline or cancellation may report money that
-    // never moved, or a refund for a cancelled order that did, so ask.
-    if DECLINE.is_match(&text) {
-        let question = json!({ "moved": {
-            "type": "noul",
-            "instructions": "Did money actually move in the transaction that `email` reports? Answer no if the payment or purchase was declined, failed, or cancelled before it completed. A refund, including one for a cancelled order, did move money.",
-        }});
-        let answers = model
-            .decide(state.clone(), question)
-            .await
-            .map_err(Failure::Unavailable)?;
-        match answers.get("moved") {
-            Some(Answer::Noul { noul }) if *noul >= 0.5 => {}
-            Some(Answer::Noul { .. }) | Some(Answer::Refusal) => {
-                return Err(rejected(
-                    "The email reports a declined, failed, or cancelled transaction.",
-                ));
-            }
-            _ => {
-                return Err(Failure::Unavailable(anyhow::anyhow!(
-                    "decision model did not answer `moved`"
-                )));
-            }
-        }
-    }
-
     let mut sources: BTreeMap<String, String> = accounts
         .iter()
         .map(|account| &account.name)
@@ -901,47 +869,112 @@ pub async fn extract(
         }
     }
     let sources = limit(sources, &text, ending.as_deref(), |_| 1);
-
-    let source = if sources.len() == 1 && !offer_none {
-        sources.keys().next().unwrap().clone()
-    } else {
-        let mut criteria: Map<String, Value> = sources
-            .iter()
-            .map(|(name, text)| (name.clone(), Value::String(text.clone())))
-            .collect();
-        if offer_none {
-            criteria.insert(
-                "none".into(),
-                "None of these: the account this transaction moves money in or out of is not listed.".into(),
-            );
+    // With one account on offer, the source is known before asking.
+    let known = (sources.len() == 1 && !offer_none).then(|| sources.keys().next().unwrap().clone());
+    let find = |name: &str| accounts.iter().find(|account| account.name == name);
+    // Accounts created on import accept any currency.
+    let accepts = |name: &str, currency: &str| find(name).is_none_or(|a| a.accepts(currency));
+    if let Some(source) = &known {
+        counters.remove(source);
+        if let Some(code) = &currency {
+            counters.retain(|name, _| accepts(name, code));
         }
-        let question = json!({ "account": {
-            "type": "choice",
-            "instructions": "Which of the user's accounts did the transaction in `email` move money in or out of? For a transfer between two accounts, choose the one the email reports as debited or charged if it is listed. Match bank names and card or account numbers where possible.",
-            "criteria": criteria,
-        }});
-        let answers = model
-            .decide(state.clone(), question)
-            .await
-            .map_err(Failure::Unavailable)?;
-        let keys: Vec<&str> = sources
-            .keys()
-            .map(String::as_str)
-            .chain(offer_none.then_some("none"))
-            .collect();
-        match choice(&answers, "account", &keys)? {
-            "none" => {
+    }
+    let counters = limit(counters, &text, ending.as_deref(), |name| {
+        let root = name.split(':').next().unwrap_or_default();
+        match (root, outgoing) {
+            ("Expenses", true) | ("Income", false) => 1,
+            ("Expenses", false) => 2,
+            ("Income", true) => 4,
+            _ => 3,
+        }
+    });
+
+    // Ask every question in one call. Each is a choice among account names,
+    // with what each option means written into its instructions.
+    let menu = |options: &BTreeMap<String, String>| {
+        options
+            .iter()
+            .map(|(name, meaning)| format!("{name}: {meaning}."))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let mut source_options: Vec<&str> = sources.keys().map(String::as_str).collect();
+    let mut source_menu = menu(&sources);
+    if offer_none {
+        source_options.push("none");
+        source_menu.push_str(
+            " none: none of these; the account this transaction moves money in or out of is not listed.",
+        );
+    }
+    let source_instructions = format!(
+        "Which of the user's accounts did the transaction move money in or out of? For a transfer between two accounts, the one the email reports as debited or charged, if it is listed. Match bank names and card or account numbers where possible. Options: {source_menu}"
+    );
+    let category_options: Vec<&str> = counters.keys().map(String::as_str).collect();
+    let category_instructions = format!(
+        "{} Options: {}",
+        if outgoing {
+            "Money left the user's account. Which account best describes what it was spent on, or which of the user's own accounts received it?"
+        } else {
+            "Money arrived in the user's account. Which account best describes where it came from? For a refund, the spending category it reverses. For a transfer, the user's own account it came from."
+        },
+        menu(&counters)
+    );
+    let mut questions = vec![Field {
+        name: "category",
+        kind: Kind::Choice(&category_options),
+        instructions: &category_instructions,
+    }];
+    if known.is_none() {
+        questions.push(Field {
+            name: "account",
+            kind: Kind::Choice(&source_options),
+            instructions: &source_instructions,
+        });
+    }
+    // An email that mentions a decline or cancellation may report money that
+    // never moved, or a refund for a cancelled order that did, so ask.
+    if DECLINE.is_match(&text) {
+        questions.push(Field {
+            name: "moved",
+            kind: Kind::Boolean,
+            instructions: "Did money actually move in the transaction the email reports? False if the payment, purchase, or transfer was declined, failed, or cancelled before it completed. A refund, including one for a cancelled order, did move money.",
+        });
+    }
+    let answers = model
+        .extract(&Request {
+            text: &message,
+            reference_date: email.sent,
+            fields: &questions,
+        })
+        .await
+        .map_err(Failure::Unavailable)?;
+    let chosen = |name: &str| answers.get(name).map(|answer| &answer.value);
+    if DECLINE.is_match(&text) && chosen("moved") != Some(&Value::Bool(true)) {
+        return Err(rejected(
+            "The email reports a declined, failed, or cancelled transaction.",
+        ));
+    }
+    let source = match known {
+        Some(source) => source,
+        None => match chosen("account") {
+            Some(Value::String(name)) if name == "none" && offer_none => {
                 return Err(rejected(
                     "The email names an account that is not in the ledger. Open it, then forward the email again.",
                 ));
             }
-            source => source.to_owned(),
-        }
+            Some(Value::String(name)) if sources.contains_key(name) => name.clone(),
+            Some(Value::Null) => {
+                return Err(rejected("The model could not choose the account."));
+            }
+            _ => {
+                return Err(Failure::Unavailable(anyhow::anyhow!(
+                    "model gave no valid `account` answer"
+                )));
+            }
+        },
     };
 
-    let find = |name: &str| accounts.iter().find(|account| account.name == name);
-    // Accounts created on import accept any currency.
-    let accepts = |name: &str, currency: &str| find(name).is_none_or(|a| a.accepts(currency));
     // An amount whose currency the email does not state, such as a bare "$",
     // takes the account's only currency, or the configured default.
     let resolve = |code: &Option<String>| {
@@ -968,63 +1001,38 @@ pub async fn extract(
         }
     };
 
-    // Ask for the category separately: in the same call the model tends to
-    // pick the source account the email names, which crowds out categories.
-    counters.remove(&source);
-    counters.retain(|name, _| accepts(name, &currency));
-    let counters = limit(counters, &text, ending.as_deref(), |name| {
-        let root = name.split(':').next().unwrap_or_default();
-        match (root, outgoing) {
-            ("Expenses", true) | ("Income", false) => 1,
-            ("Expenses", false) => 2,
-            ("Income", true) => 4,
-            _ => 3,
-        }
-    });
-    let instructions = if outgoing {
-        "Money left the user's account in `email`. Which account best describes what it was spent on, or which of the user's own accounts received it?"
-    } else {
-        "Money arrived in the user's account in `email`. Which account best describes where it came from? For a refund, choose the spending category it reverses. For a transfer, choose the user's own account it came from."
-    };
-    let category = json!({
-        "category": { "type": "choice", "instructions": instructions, "criteria": counters },
-    });
-    let answers = model
-        .decide(state, category)
-        .await
-        .map_err(Failure::Unavailable)?;
-    let account = match answers.get("category") {
-        Some(Answer::Choice {
-            probabilities,
-            choice,
-        }) if counters.contains_key(choice) => {
-            let p = probabilities.get(choice).copied().unwrap_or(1.0);
-            (p >= MIN_CATEGORY).then(|| choice.clone())
-        }
-        Some(Answer::Refusal) => None,
-        _ => {
-            return Err(Failure::Unavailable(anyhow::anyhow!(
-                "decision model did not answer `category`"
-            )));
-        }
-    }
-    .map_or_else(
-        || {
+    // The category was asked before the source was known, so it may name the
+    // source itself, or an account that does not take the currency; then, or
+    // when the model is unsure, fall back to Uncategorized.
+    let category = answers
+        .get("category")
+        .and_then(|answer| match &answer.value {
+            Value::String(name)
+                if counters.contains_key(name)
+                    && *name != source
+                    && accepts(name, &currency)
+                    && answer.confidence.unwrap_or(1.0) >= MIN_CATEGORY =>
+            {
+                Some(name.clone())
+            }
+            _ => None,
+        });
+    let account = match category {
+        Some(account) => account,
+        None => {
             let fallback = if outgoing {
                 "Expenses:Uncategorized"
             } else {
                 "Income:Uncategorized"
             };
             if is_closed(fallback) || !accepts(fallback, &currency) {
-                Err(rejected(
+                return Err(rejected(
                     "No category fits, and the fallback category is closed or does not accept the transaction's currency.",
-                ))
-            } else {
-                Ok(fallback.to_owned())
+                ));
             }
-        },
-        Ok,
-    )?;
+            fallback.to_owned()
+        }
+    };
 
     let description = payee
         .or_else(|| (!email.subject.is_empty()).then(|| email.subject.clone()))
@@ -1047,7 +1055,7 @@ pub async fn extract(
     })
 }
 
-/// Options some decision backends accept per question; llama.cpp allows 52 for OpenJev.
+/// Most options offered in one question, to keep its instructions short.
 const MAX_CHOICES: usize = 50;
 
 /// Keeps at most [`MAX_CHOICES`] options: the Uncategorized fallbacks, then
@@ -1078,21 +1086,12 @@ fn limit(
     ordered.into_iter().collect()
 }
 
-fn choice<'a>(answers: &'a Answers, name: &str, keys: &[&str]) -> Result<&'a str, Failure> {
-    match answers.get(name) {
-        Some(Answer::Choice { choice, .. }) if keys.contains(&choice.as_str()) => Ok(choice),
-        Some(Answer::Refusal) => Err(rejected(format!(
-            "The decision model declined to choose the {name}."
-        ))),
-        _ => Err(Failure::Unavailable(anyhow::anyhow!(
-            "decision model gave no valid `{name}` answer"
-        ))),
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
+    use crate::clairic::Answer;
 
     const ALERT: &str = "Message-ID: <alert-1@bank.example>\r\n\
 From: Bank Alerts <alerts@bank.example>\r\n\
@@ -1103,7 +1102,8 @@ Content-Type: text/plain; charset=utf-8\r\n\
 A transaction of S$12.50 was made with your card ending 1234 on 23 Nov 2026 at STARBUCKS VIVOCITY.\r\n\
 Available balance: SGD 1,204.33.\r\n";
 
-    /// Returns the same answers to every call and records each call's questions.
+    /// Answers decision questions from a fixed map, null where it has no
+    /// answer, and records each call's questions as Clairic receives them.
     struct Fixed {
         answers: Answers,
         calls: std::sync::Mutex<Vec<Value>>,
@@ -1116,18 +1116,86 @@ Available balance: SGD 1,204.33.\r\n";
         }
     }
 
-    impl Decide for Fixed {
-        async fn decide(&self, _: Value, questions: Value) -> Result<Answers> {
-            self.calls.lock().unwrap().push(questions);
-            Ok(self.answers.clone())
+    impl Fixed {
+        fn decide(&self, request: &Request<'_>) -> Answers {
+            let questions = crate::clairic::specs(request.fields);
+            self.calls.lock().unwrap().push(Value::Object(questions));
+            request
+                .fields
+                .iter()
+                .map(|field| {
+                    let answer = self.answers.get(field.name).cloned();
+                    (
+                        field.name.to_owned(),
+                        answer.unwrap_or_else(|| value(Value::Null)),
+                    )
+                })
+                .collect()
         }
+    }
+
+    /// The model: `reader` answers the extraction and `decider` the decision
+    /// questions.
+    struct Model<'a, R> {
+        reader: &'a R,
+        decider: &'a Fixed,
+    }
+
+    impl<R: Extract + Sync> Extract for Model<'_, R> {
+        async fn extract(&self, request: &Request<'_>) -> Result<Answers> {
+            if request
+                .fields
+                .iter()
+                .any(|field| field.name == "is_transaction")
+            {
+                self.reader.extract(request).await
+            } else {
+                Ok(self.decider.decide(request))
+            }
+        }
+    }
+
+    async fn extract(
+        email: &Email,
+        accounts: &[OpenAccount],
+        closed: &[String],
+        currency: &str,
+        reader: &(impl Extract + Sync),
+        decider: &Fixed,
+    ) -> Result<Statement, Failure> {
+        super::extract(
+            email,
+            accounts,
+            closed,
+            currency,
+            &Model { reader, decider },
+        )
+        .await
+    }
+
+    fn value(value: Value) -> Answer {
+        Answer {
+            value,
+            confidence: None,
+        }
+    }
+
+    /// Answers with the values of a JSON object.
+    fn answers(object: Value) -> Answers {
+        let Value::Object(fields) = object else {
+            panic!("expected an object");
+        };
+        fields
+            .into_iter()
+            .map(|(name, found)| (name, value(found)))
+            .collect()
     }
 
     /// Returns a fixed extraction, filling unset fields with null.
     struct Reads(Value);
 
     impl Extract for Reads {
-        async fn extract(&self, _: &Request<'_>) -> Result<Value> {
+        async fn extract(&self, _: &Request<'_>) -> Result<Answers> {
             let mut found = json!({
                 "is_transaction": true, "direction": "out", "amount": null, "currency": null,
                 "settled_amount": null, "settled_currency": null, "date": null, "payee": null,
@@ -1136,17 +1204,18 @@ Available balance: SGD 1,204.33.\r\n";
             for (key, value) in self.0.as_object().unwrap() {
                 found[key] = value.clone();
             }
-            Ok(found)
+            Ok(answers(found))
         }
     }
 
-    fn choice(value: &str, probabilities: &[(&str, f64)]) -> Answer {
-        Answer::Choice {
-            choice: value.into(),
-            probabilities: probabilities
+    /// A choice, with the model's confidence where `probabilities` names it.
+    fn choice(chosen: &str, probabilities: &[(&str, f64)]) -> Answer {
+        Answer {
+            value: json!(chosen),
+            confidence: probabilities
                 .iter()
-                .map(|(k, p)| (k.to_string(), *p))
-                .collect(),
+                .find(|(name, _)| *name == chosen)
+                .map(|(_, p)| *p),
         }
     }
 
@@ -1560,15 +1629,46 @@ Please view this email in an HTML-capable client.\r\n--b\r\nContent-Type: text/h
             )
         );
         statement.entries().unwrap();
-        // The cited card matches an account, so "none" is not offered, and the
-        // category question leaves out the source account.
+        // The cited card matches an account, so "none" is not offered, and
+        // every question goes in one call.
         let calls = model.calls.into_inner().unwrap();
-        assert!(calls[0]["account"]["criteria"].get("none").is_none());
-        assert!(
-            calls[1]["category"]["criteria"]
-                .get("Liabilities:DBS-Card-1234")
-                .is_none()
-        );
+        assert_eq!(calls.len(), 1);
+        let offered = calls[0]["account"]["enum"].as_array().unwrap();
+        assert!(offered.contains(&json!("Liabilities:DBS-Card-1234")));
+        assert!(!offered.contains(&json!("none")));
+        assert!(calls[0].get("moved").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_category_naming_the_source_falls_back_to_uncategorized() {
+        let email = parse(ALERT.as_bytes()).unwrap();
+        let reads = Reads(json!({ "amount": "12.50", "currency": "SGD" }));
+        let model = fixed(Answers::from([
+            ("account".into(), choice("Liabilities:DBS-Card-1234", &[])),
+            (
+                "category".into(),
+                choice(
+                    "Liabilities:DBS-Card-1234",
+                    &[("Liabilities:DBS-Card-1234", 0.9)],
+                ),
+            ),
+        ]));
+        let statement = extract(&email, &card_alert_accounts(), &[], "USD", &reads, &model)
+            .await
+            .unwrap();
+        assert_eq!(statement.rows[0].account, "Expenses:Uncategorized");
+        // So does a category the model is unsure of.
+        let unsure = fixed(Answers::from([
+            ("account".into(), choice("Liabilities:DBS-Card-1234", &[])),
+            (
+                "category".into(),
+                choice("Expenses:Coffee", &[("Expenses:Coffee", 0.2)]),
+            ),
+        ]));
+        let statement = extract(&email, &card_alert_accounts(), &[], "USD", &reads, &unsure)
+            .await
+            .unwrap();
+        assert_eq!(statement.rows[0].account, "Expenses:Uncategorized");
     }
 
     #[tokio::test]
@@ -1676,7 +1776,7 @@ Please view this email in an HTML-capable client.\r\n--b\r\nContent-Type: text/h
     }
 
     impl Extract for StubThenHtml {
-        async fn extract(&self, request: &Request<'_>) -> Result<Value> {
+        async fn extract(&self, request: &Request<'_>) -> Result<Answers> {
             if request.text.contains(self.stub) {
                 Reads(json!({ "is_transaction": false }))
                     .extract(request)
@@ -1713,8 +1813,8 @@ Please view this email in an HTML-capable client.\r\n--b\r\nContent-Type: text/h
     struct Raw(Value);
 
     impl Extract for Raw {
-        async fn extract(&self, _: &Request<'_>) -> Result<Value> {
-            Ok(self.0.clone())
+        async fn extract(&self, _: &Request<'_>) -> Result<Answers> {
+            Ok(answers(self.0.clone()))
         }
     }
 
@@ -1739,12 +1839,12 @@ Please view this email in an HTML-capable client.\r\n--b\r\nContent-Type: text/h
         let mut email = parse(ALERT.as_bytes()).unwrap();
         email.body = "Your payment of SGD 12.50 at KOPITIAM on 23 Nov 2026 was declined.".into();
         let reads = Reads(json!({ "amount": "12.50", "currency": "SGD", "payee": "KOPITIAM" }));
-        let with_moved = |noul: f64| {
+        let with_moved = |moved: bool| {
             let mut answers = card_answers().answers;
-            answers.insert("moved".into(), Answer::Noul { noul });
+            answers.insert("moved".into(), value(json!(moved)));
             fixed(answers)
         };
-        let declined = with_moved(0.1);
+        let declined = with_moved(false);
         let result = extract(
             &email,
             &card_alert_accounts(),
@@ -1768,7 +1868,7 @@ Please view this email in an HTML-capable client.\r\n--b\r\nContent-Type: text/h
             &[],
             "USD",
             &refund,
-            &with_moved(0.9),
+            &with_moved(true),
         )
         .await
         .unwrap();
@@ -1836,8 +1936,10 @@ Please view this email in an HTML-capable client.\r\n--b\r\nContent-Type: text/h
         assert_eq!(statement.rows[0].description, "Grab");
         // A ledger with only a bank account is still offered a credit card.
         let calls = model.calls.into_inner().unwrap();
-        let offered = calls[0]["account"]["criteria"].as_object().unwrap();
-        assert!(offered.contains_key("Liabilities:CreditCard") && !offered.contains_key("none"));
+        let offered = calls[0]["account"]["enum"].as_array().unwrap();
+        assert!(
+            offered.contains(&json!("Liabilities:CreditCard")) && !offered.contains(&json!("none"))
+        );
     }
 
     #[tokio::test]
@@ -1850,7 +1952,12 @@ Please view this email in an HTML-capable client.\r\n--b\r\nContent-Type: text/h
         let result = extract(&email, &card_alert_accounts(), &[], "USD", &reads, &model).await;
         assert!(matches!(result, Err(Failure::Rejected(_))));
         let calls = model.calls.into_inner().unwrap();
-        assert!(calls[0]["account"]["criteria"].get("none").is_some());
+        assert!(
+            calls[0]["account"]["enum"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("none"))
+        );
     }
 
     #[test]
