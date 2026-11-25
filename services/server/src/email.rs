@@ -631,6 +631,67 @@ const ISO_CURRENCIES: &[&str] = &[
     "ZWG", "ZWL",
 ];
 
+/// A "$" or "¥" written directly before or after the amount at `span` with
+/// no letters naming its currency, as in "$12.00" or "¥12,500" but not
+/// "US$12.00" or "JP¥12,500".
+fn bare_symbol(text: &str, span: &std::ops::Range<usize>) -> Option<char> {
+    let before = text[..span.start]
+        .trim_end_matches(SPACES)
+        .trim_end_matches(['-', '−', '+'])
+        .trim_end_matches(SPACES);
+    let after = text[span.end..].trim_start_matches(SPACES);
+    ['$', '¥', '￥'].into_iter().find(|symbol| {
+        before
+            .strip_suffix(*symbol)
+            .is_some_and(|rest| !rest.ends_with(|c: char| c.is_alphabetic()))
+            || after.starts_with(*symbol)
+    })
+}
+
+/// Whether a bare `symbol` can mean `currency`.
+fn symbol_means(symbol: char, currency: &str) -> bool {
+    match symbol {
+        '¥' | '￥' => matches!(currency, "JPY" | "CNY"),
+        '$' => matches!(
+            currency,
+            "USD"
+                | "SGD"
+                | "AUD"
+                | "CAD"
+                | "HKD"
+                | "NZD"
+                | "TWD"
+                | "BRL"
+                | "MXN"
+                | "ARS"
+                | "CLP"
+                | "COP"
+                | "UYU"
+                | "BSD"
+                | "BBD"
+                | "BZD"
+                | "BMD"
+                | "KYD"
+                | "XCD"
+                | "TTD"
+                | "JMD"
+                | "LRD"
+                | "NAD"
+                | "SBD"
+                | "FJD"
+                | "GYD"
+                | "SRD"
+                | "BND"
+                | "DOP"
+                | "CUP"
+                | "TOP"
+                | "WST"
+                | "MOP"
+        ),
+        _ => true,
+    }
+}
+
 /// The currencies [`attached_currency`] can find written with an amount.
 fn known_currencies() -> impl Iterator<Item = &'static str> {
     ISO_CURRENCIES.iter().copied()
@@ -992,6 +1053,9 @@ struct Reading {
     currency: Option<String>,
     /// Currencies written attached to the amount, whatever the model said.
     written: Vec<&'static str>,
+    /// A bare "$" or "¥" written with the amount, which limits its currency
+    /// to those the symbol can mean.
+    symbol: Option<char>,
     settled: Option<(String, String)>,
     date: NaiveDate,
     payee: Option<String>,
@@ -1064,6 +1128,7 @@ async fn read_body(email: &Email, body: &str, reader: &impl Extract) -> Result<R
             })
     };
     let currency = attached(&places, &found.currency);
+    let symbol = places.iter().find_map(|(_, span)| bare_symbol(&text, span));
     let written = known_currencies()
         .filter(|code| {
             places
@@ -1109,6 +1174,7 @@ async fn read_body(email: &Email, body: &str, reader: &impl Extract) -> Result<R
         amount,
         currency,
         written,
+        symbol,
         settled,
         date,
         payee,
@@ -1141,6 +1207,7 @@ pub async fn extract(
         amount,
         currency,
         written,
+        symbol,
         settled,
         date,
         payee,
@@ -1259,6 +1326,10 @@ pub async fn extract(
         match &settled {
             Some((settled, code)) if accepts(source, code) => Ok((settled.clone(), code.clone())),
             _ if !written.is_empty() && !written.contains(&resolved.as_str()) => Err(rejected(
+                "The currency written with the amount could not be confirmed.",
+            )),
+            // A bare "¥" is yen or yuan, and a bare "$" a dollar or peso.
+            _ if symbol.is_some_and(|symbol| !symbol_means(symbol, &resolved)) => Err(rejected(
                 "The currency written with the amount could not be confirmed.",
             )),
             _ if accepts(source, &resolved) => Ok((amount.clone(), resolved)),
@@ -2953,6 +3024,36 @@ Content-Type: text/html; charset=utf-8\r\n\
             ),
             ("Assets:DBS-Savings-8890", "Liabilities:Citi-1234")
         );
+    }
+
+    #[tokio::test]
+    async fn a_bare_yen_amount_never_takes_another_currency() {
+        let mut email = parse(ALERT.as_bytes()).unwrap();
+        email.body = "Your card ending 1234 was used for ¥12,500 at LAWSON on 23 Nov 2026.".into();
+        let usd_card = vec![account("Liabilities:Card-1234", &["USD"], &[])];
+        let closed = ["Assets:Checking".to_owned()];
+        let decide = || {
+            fixed(Answers::from([(
+                "category".into(),
+                choice("Expenses:Groceries", &[("Expenses:Groceries", 0.9)]),
+            )]))
+        };
+        // The model's JPY is not stated by "¥" alone, and USD cannot be it.
+        let reads = Reads(json!({ "amount": "12500", "currency": "JPY", "from_account": "1234" }));
+        let result = extract(&email, &usd_card, &closed, "USD", &reads, &decide()).await;
+        assert!(matches!(result, Err(Failure::Rejected(_))));
+        // A yen card takes it.
+        let yen_card = vec![account("Liabilities:Card-1234", &["JPY"], &[])];
+        let statement = extract(&email, &yen_card, &closed, "USD", &reads, &decide())
+            .await
+            .unwrap();
+        assert_eq!(statement.currency, "JPY");
+        // And a bare "$" never becomes euros.
+        email.body = "Your card ending 1234 was charged $12.00 at AMAZON on 23 Nov 2026.".into();
+        let eur_card = vec![account("Liabilities:Card-1234", &["EUR"], &[])];
+        let dollars = Reads(json!({ "amount": "12.00", "from_account": "1234" }));
+        let result = extract(&email, &eur_card, &closed, "USD", &dollars, &decide()).await;
+        assert!(matches!(result, Err(Failure::Rejected(_))));
     }
 
     #[tokio::test]

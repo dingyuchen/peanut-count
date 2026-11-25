@@ -202,7 +202,8 @@ number. The server checks each field against the text before using it.
 The amount must be a number written in the email. A currency must be stated
 by its ISO code or by a symbol that names only that currency, such as `€` or
 `S$`. A bare `$` takes the account's only currency, or the configured
-default. A date must write its day and month, and a payee or card number must
+default, when that is a dollar or peso currency, and a bare `¥` only yen or
+yuan; otherwise the email is rejected. A date must write its day and month, and a payee or card number must
 appear verbatim. A field that fails these checks is dropped, or the email is
 rejected if the amount fails. Then it chooses which of your asset or
 liability accounts was used, and the category, from your ledger's accounts.
