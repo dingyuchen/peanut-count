@@ -74,7 +74,7 @@ pub trait Extract {
 }
 
 /// Where Clairic runs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Host {
     /// The model's own server on this machine, or one the operator runs.
     Local,

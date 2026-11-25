@@ -46,9 +46,13 @@ pub struct InboundArgs {
     inbound_domain: Option<String>,
     /// Where Clairic Flash, which reads each email and chooses its accounts,
     /// runs: `local` for its own server, or `cloudflare` for Workers AI. Email
-    /// is deferred until it is set.
-    #[arg(long, env = "PEANUT_CLAIRIC", value_enum)]
-    clairic: Option<Host>,
+    /// is deferred until it is set. An empty value counts as unset.
+    #[arg(
+        long,
+        env = "PEANUT_CLAIRIC",
+        value_parser = clap::builder::PossibleValuesParser::new(["local", "cloudflare", ""])
+    )]
+    clairic: Option<String>,
     /// Endpoint of a local Clairic server.
     #[arg(long, env = "PEANUT_CLAIRIC_URL", default_value = clairic::LOCAL_URL)]
     clairic_url: String,
@@ -89,7 +93,12 @@ impl InboundArgs {
         );
         // A Cloudflare API token, or the local server's CLAIRIC_API_KEY.
         let token = set(std::env::var("PEANUT_CLAIRIC_TOKEN").ok());
-        let model = match self.clairic {
+        let host = match self.clairic.as_deref() {
+            Some("local") => Some(Host::Local),
+            Some("cloudflare") => Some(Host::Cloudflare),
+            _ => None,
+        };
+        let model = match host {
             None => None,
             Some(Host::Local) => Some(Clairic::local(self.clairic_url, token)?),
             Some(Host::Cloudflare) => {

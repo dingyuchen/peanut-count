@@ -227,7 +227,7 @@ of every forwarded email.
 | Variable | Purpose |
 | --- | --- |
 | `PEANUT_INBOUND_DOMAIN` | Domain of the forwarding addresses. Email import is off unless it is set. |
-| `PEANUT_CLAIRIC` | `local` or `cloudflare`. Empty by default, and mail is deferred until it is set. |
+| `PEANUT_CLAIRIC` | `local` or `cloudflare`. Unset or empty by default, and mail is deferred until it is set. |
 | `PEANUT_CLAIRIC_URL` | Endpoint of a local Clairic server. Defaults to `http://127.0.0.1:8093/v1/systemone`. |
 | `PEANUT_CLOUDFLARE_ACCOUNT_ID` | Cloudflare account that runs Workers AI, for `cloudflare`. |
 | `PEANUT_CLAIRIC_TOKEN` | A Cloudflare API token allowed to run Workers AI, for `cloudflare`, or the local server's `CLAIRIC_API_KEY` if it sets one. |
@@ -251,7 +251,12 @@ Deliver mail in either of two ways.
 an email-routing worker or a provider's raw MIME webhook. Point it at
 `POST /v1/inbound-email` with the message as the body. Send
 `Authorization: Bearer $PEANUT_INBOUND_TOKEN`, and put the envelope recipient
-in `X-Peanut-Recipient`. Messages may be up to 4 MiB.
+in `X-Peanut-Recipient`. Messages may be up to 4 MiB. The server answers once
+the import is done, which takes one to three model calls; a local model can
+take minutes on a busy machine. So allow 4 MiB bodies and a response timeout
+of at least 15 minutes in the relay and in any reverse proxy in front of the
+server, for example `client_max_body_size 4m;` and
+`proxy_read_timeout 900s;` in Nginx.
 
 | Status | Meaning | Relay action |
 | --- | --- | --- |
