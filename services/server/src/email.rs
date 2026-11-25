@@ -925,6 +925,13 @@ pub async fn extract(
             sources.insert(name.to_owned(), text.to_owned());
         }
     }
+    // When the email's verified card or account number names accounts, only
+    // those are on offer, so the model cannot book to another card.
+    if let Some(ending) = ending.as_deref()
+        && sources.keys().any(|name| names_number(name, ending))
+    {
+        sources.retain(|name, _| names_number(name, ending));
+    }
     if sources.is_empty() {
         return Err(rejected(
             "The ledger has no open asset or liability account.",
@@ -1743,13 +1750,11 @@ Please view this email in an HTML-capable client.\r\n--b\r\nContent-Type: text/h
             )
         );
         statement.entries().unwrap();
-        // The cited card matches an account, so "none" is not offered, and
+        // The cited card names one account, so the source is not asked, and
         // every question goes in one call.
         let calls = model.calls.into_inner().unwrap();
         assert_eq!(calls.len(), 1);
-        let offered = calls[0]["account"]["enum"].as_array().unwrap();
-        assert!(offered.contains(&json!("Liabilities:DBS-Card-1234")));
-        assert!(!offered.contains(&json!("none")));
+        assert!(calls[0].get("account").is_none());
         assert!(calls[0].get("moved").is_none());
     }
 
@@ -2134,6 +2139,33 @@ Please view this email in an HTML-capable client.\r\n--b\r\nContent-Type: text/h
         let calls = model.calls.into_inner().unwrap();
         let asked = calls[0]["account"]["instructions"].as_str().unwrap();
         assert!(asked.contains("money into") && asked.contains("reports as credited"));
+    }
+
+    #[tokio::test]
+    async fn a_cited_card_number_fixes_the_source() {
+        let mut email = parse(ALERT.as_bytes()).unwrap();
+        email.body = "Your Visa ending 1234 was charged SGD 12.50 at GRAB on 23 Nov 2026.".into();
+        let ledger = vec![
+            account("Liabilities:Visa-1234", &["SGD"], &[]),
+            account("Liabilities:Visa-5678", &["SGD"], &[]),
+            account("Assets:Savings", &["SGD"], &[]),
+        ];
+        let reads =
+            Reads(json!({ "amount": "12.50", "currency": "SGD", "account_ending": "1234" }));
+        // The model would pick the other card, but is not asked.
+        let model = fixed(Answers::from([
+            ("account".into(), choice("Liabilities:Visa-5678", &[])),
+            (
+                "category".into(),
+                choice("Expenses:Transport", &[("Expenses:Transport", 0.9)]),
+            ),
+        ]));
+        let statement = extract(&email, &ledger, &[], "USD", &reads, &model)
+            .await
+            .unwrap();
+        assert_eq!(statement.source, "Liabilities:Visa-1234");
+        let calls = model.calls.into_inner().unwrap();
+        assert!(calls[0].get("account").is_none());
     }
 
     #[tokio::test]
