@@ -476,7 +476,8 @@ Available balance: SGD 1,204.33.\r\n";
                         "date": value(json!("2026-11-23")),
                         "payee": value(json!("STARBUCKS VIVOCITY")),
                         // A value that failed its grammar is no value.
-                        "account_ending": { "value": "12", "valid": false },
+                        "from_account": { "value": "12", "valid": false },
+                        "to_account": { "value": null },
                     })
                 } else {
                     // The account and category are chosen from the options offered.

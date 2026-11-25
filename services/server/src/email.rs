@@ -661,7 +661,8 @@ pub struct Extraction {
     pub settled_currency: Option<String>,
     pub date: Option<String>,
     pub payee: Option<String>,
-    pub account_ending: Option<String>,
+    pub from_account: Option<String>,
+    pub to_account: Option<String>,
 }
 
 const FIELDS: &[Field<'static>] = &[
@@ -706,9 +707,14 @@ const FIELDS: &[Field<'static>] = &[
         instructions: "The merchant, person, or organisation on the other side, exactly as written.",
     },
     Field {
-        name: "account_ending",
+        name: "from_account",
         kind: Kind::Text,
-        instructions: "The digits of the user's card or account number that the email names, such as 1234 for 'card ending 1234'.",
+        instructions: "The digits of the card or account number that money left, such as 1234 for 'charged to your card ending 1234' or 'debited from account ending 1234'. Null if the email names none.",
+    },
+    Field {
+        name: "to_account",
+        kind: Kind::Text,
+        instructions: "The digits of the card or account number that money arrived in, such as 5678 for 'credited to account ending 5678'. Null if the email names none.",
     },
 ];
 
@@ -762,7 +768,11 @@ struct Reading {
     settled: Option<(String, String)>,
     date: NaiveDate,
     payee: Option<String>,
+    /// The verified number of the user's account on this transaction's side:
+    /// the one money left, or for money in, the one it arrived in.
     ending: Option<String>,
+    /// The verified number on the other side, for a transfer.
+    other: Option<String>,
 }
 
 /// Reads the transaction from `body`, rejecting it when the model says it is
@@ -855,10 +865,19 @@ async fn read_body(email: &Email, body: &str, reader: &impl Extract) -> Result<R
         .payee
         .as_deref()
         .and_then(|value| written_phrase(&text, value));
-    let ending = found
-        .account_ending
-        .as_deref()
-        .and_then(|value| written_ending(&text, value));
+    let number = |value: &Option<String>| {
+        value
+            .as_deref()
+            .and_then(|value| written_ending(&text, value))
+    };
+    let (from, to) = (number(&found.from_account), number(&found.to_account));
+    let (ending, other) = if outgoing { (from, to) } else { (to, from) };
+    // A number on both sides says nothing about either.
+    let (ending, other) = if ending == other {
+        (None, None)
+    } else {
+        (ending, other)
+    };
     Ok(Reading {
         text,
         message,
@@ -870,6 +889,7 @@ async fn read_body(email: &Email, body: &str, reader: &impl Extract) -> Result<R
         date,
         payee,
         ending,
+        other,
     })
 }
 
@@ -903,6 +923,7 @@ pub async fn extract(
         date,
         payee,
         ending,
+        other,
     } = reading;
     let mut sources: BTreeMap<String, String> = accounts
         .iter()
@@ -925,12 +946,15 @@ pub async fn extract(
             sources.insert(name.to_owned(), text.to_owned());
         }
     }
-    // When the email's verified card or account number names accounts, only
-    // those are on offer, so the model cannot book to another card.
+    // When the verified number on this transaction's side names accounts,
+    // only those are on offer, so the model cannot book to another card. An
+    // account named only by the other side of a transfer is never the source.
     if let Some(ending) = ending.as_deref()
         && sources.keys().any(|name| names_number(name, ending))
     {
         sources.retain(|name, _| names_number(name, ending));
+    } else if let Some(other) = other.as_deref() {
+        sources.retain(|name, _| !names_number(name, other));
     }
     if sources.is_empty() {
         return Err(rejected(
@@ -1292,7 +1316,7 @@ Available balance: SGD 1,204.33.\r\n";
             let mut found = json!({
                 "is_transaction": true, "direction": "out", "amount": null, "currency": null,
                 "settled_amount": null, "settled_currency": null, "date": null, "payee": null,
-                "account_ending": null,
+                "from_account": null, "to_account": null,
             });
             for (key, value) in self.0.as_object().unwrap() {
                 found[key] = value.clone();
@@ -1724,7 +1748,7 @@ Please view this email in an HTML-capable client.\r\n--b\r\nContent-Type: text/h
         let email = parse(ALERT.as_bytes()).unwrap();
         let reads = Reads(json!({
             "amount": "12.50", "currency": "SGD", "date": "2026-11-23",
-            "payee": "STARBUCKS VIVOCITY", "account_ending": "1234",
+            "payee": "STARBUCKS VIVOCITY", "from_account": "1234",
         }));
         let model = card_answers();
         let statement = extract(&email, &card_alert_accounts(), &[], "USD", &reads, &model)
@@ -1816,7 +1840,7 @@ Please view this email in an HTML-capable client.\r\n--b\r\nContent-Type: text/h
             &accounts,
             &model,
             json!({
-                "amount": "12.50", "payee": "ACME", "date": "2026-10-01", "account_ending": "1234",
+                "amount": "12.50", "payee": "ACME", "date": "2026-10-01", "from_account": "1234",
             }),
         )
         .await
@@ -1835,7 +1859,7 @@ Please view this email in an HTML-capable client.\r\n--b\r\nContent-Type: text/h
         let model = card_answers();
         let fields = json!({
             "amount": "50.00", "currency": "EUR", "settled_amount": "75.30",
-            "settled_currency": "SGD", "account_ending": "1234", "date": "2026-11-21",
+            "settled_currency": "SGD", "from_account": "1234", "date": "2026-11-21",
         });
         let accounts = card_alert_accounts();
         let statement = extract(
@@ -1869,7 +1893,7 @@ Please view this email in an HTML-capable client.\r\n--b\r\nContent-Type: text/h
             "Purchase EUR 50.00, charged SGD 75.30 to card ending 1234 on 21 Nov 2026.".into();
         let reads = Reads(json!({
             "amount": "50.00", "currency": "EUR", "settled_amount": "75.30",
-            "settled_currency": "SGD", "account_ending": "1234",
+            "settled_currency": "SGD", "from_account": "1234",
         }));
         // This card accepts any currency, so EUR 50.00 would also fit.
         let open = vec![
@@ -2045,31 +2069,29 @@ Please view this email in an HTML-capable client.\r\n--b\r\nContent-Type: text/h
             )]))
         };
         // Read as CAD, it is posted in CAD.
-        let reads =
-            Reads(json!({ "amount": "12.50", "currency": "CAD", "account_ending": "1234" }));
+        let reads = Reads(json!({ "amount": "12.50", "currency": "CAD", "from_account": "1234" }));
         let statement = extract(&email, &card, &closed, "USD", &reads, &decide())
             .await
             .unwrap();
         assert_eq!(statement.currency, "CAD");
         // With the currency unread, it is rejected rather than posted in USD.
-        let unread = Reads(json!({ "amount": "12.50", "account_ending": "1234" }));
+        let unread = Reads(json!({ "amount": "12.50", "from_account": "1234" }));
         let usd = vec![account("Liabilities:Card-1234", &["USD"], &[])];
         let result = extract(&email, &usd, &closed, "USD", &unread, &decide()).await;
         assert!(matches!(result, Err(Failure::Rejected(_))));
         // A currency between the amount and a date belongs to the amount.
         email.body = "Card ending 1234\n45.00 CHF 23 Nov 2026 MIGROS".into();
-        let reads =
-            Reads(json!({ "amount": "45.00", "currency": "CHF", "account_ending": "1234" }));
+        let reads = Reads(json!({ "amount": "45.00", "currency": "CHF", "from_account": "1234" }));
         let chf = vec![account("Liabilities:Card-1234", &["USD", "CHF"], &[])];
         let statement = extract(&email, &chf, &closed, "USD", &reads, &decide())
             .await
             .unwrap();
         assert_eq!(statement.currency, "CHF");
-        let unread = Reads(json!({ "amount": "45.00", "account_ending": "1234" }));
+        let unread = Reads(json!({ "amount": "45.00", "from_account": "1234" }));
         let result = extract(&email, &usd, &closed, "USD", &unread, &decide()).await;
         assert!(matches!(result, Err(Failure::Rejected(_))));
         // So does a code on the line below, and one before a year-first date.
-        let unread = Reads(json!({ "amount": "45.00", "account_ending": "1234" }));
+        let unread = Reads(json!({ "amount": "45.00", "from_account": "1234" }));
         for body in [
             "Card ending 1234 at MIGROS\nTotal 45.00\nCHF\n",
             "Card ending 1234 at MIGROS\n45.00 CHF 2026.11.23",
@@ -2080,12 +2102,12 @@ Please view this email in an HTML-capable client.\r\n--b\r\nContent-Type: text/h
         }
         // So does a code that is also a word.
         email.body = "Card ending 1234. Amount: TRY 1,250.00 on 23 Nov 2026.".into();
-        let unread = Reads(json!({ "amount": "1,250.00", "account_ending": "1234" }));
+        let unread = Reads(json!({ "amount": "1,250.00", "from_account": "1234" }));
         let result = extract(&email, &usd, &closed, "USD", &unread, &decide()).await;
         assert!(matches!(result, Err(Failure::Rejected(_))));
         // So is a code that has no symbol of its own.
         email.body = "Card ending 1234 purchase: CHF 45.00 at MIGROS on 23 Nov 2026.".into();
-        let unread = Reads(json!({ "amount": "45.00", "account_ending": "1234" }));
+        let unread = Reads(json!({ "amount": "45.00", "from_account": "1234" }));
         let result = extract(&email, &usd, &closed, "USD", &unread, &decide()).await;
         assert!(matches!(result, Err(Failure::Rejected(_))));
     }
@@ -2103,7 +2125,7 @@ Please view this email in an HTML-capable client.\r\n--b\r\nContent-Type: text/h
         let closed = ["Assets:Checking".to_owned()];
         let reads = Reads(json!({
             "amount": "50.00", "currency": "EUR", "settled_amount": "75.30",
-            "settled_currency": "SGD", "account_ending": "1234",
+            "settled_currency": "SGD", "from_account": "1234",
         }));
         let model = fixed(Answers::from([(
             "category".into(),
@@ -2150,8 +2172,7 @@ Please view this email in an HTML-capable client.\r\n--b\r\nContent-Type: text/h
             account("Liabilities:Visa-5678", &["SGD"], &[]),
             account("Assets:Savings", &["SGD"], &[]),
         ];
-        let reads =
-            Reads(json!({ "amount": "12.50", "currency": "SGD", "account_ending": "1234" }));
+        let reads = Reads(json!({ "amount": "12.50", "currency": "SGD", "from_account": "1234" }));
         // The model would pick the other card, but is not asked.
         let model = fixed(Answers::from([
             ("account".into(), choice("Liabilities:Visa-5678", &[])),
@@ -2166,6 +2187,56 @@ Please view this email in an HTML-capable client.\r\n--b\r\nContent-Type: text/h
         assert_eq!(statement.source, "Liabilities:Visa-1234");
         let calls = model.calls.into_inner().unwrap();
         assert!(calls[0].get("account").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_transfer_never_books_from_the_receiving_account() {
+        let mut email = parse(ALERT.as_bytes()).unwrap();
+        email.body = "SGD 500.00 was debited from checking ••1234 and credited to savings ••5678 on 23 Nov 2026.".into();
+        let ledger = vec![
+            account("Assets:Checking-1234", &["SGD"], &[]),
+            account("Assets:Savings-5678", &["SGD"], &[]),
+            account("Liabilities:Card-9999", &["SGD"], &[]),
+        ];
+        let decide = || {
+            fixed(Answers::from([
+                ("account".into(), choice("Assets:Checking-1234", &[])),
+                (
+                    "category".into(),
+                    choice("Assets:Savings-5678", &[("Assets:Savings-5678", 0.9)]),
+                ),
+            ]))
+        };
+        // Both sides read: the debited account is the source, without asking.
+        let both = Reads(json!({
+            "amount": "500.00", "currency": "SGD", "from_account": "1234", "to_account": "5678",
+        }));
+        let model = decide();
+        let statement = extract(&email, &ledger, &[], "USD", &both, &model)
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                statement.source.as_str(),
+                statement.rows[0].account.as_str()
+            ),
+            ("Assets:Checking-1234", "Assets:Savings-5678")
+        );
+        assert!(
+            model.calls.into_inner().unwrap()[0]
+                .get("account")
+                .is_none()
+        );
+        // Only the receiving side read: it is not offered as the source.
+        let to_only = Reads(json!({ "amount": "500.00", "currency": "SGD", "to_account": "5678" }));
+        let model = decide();
+        let statement = extract(&email, &ledger, &[], "USD", &to_only, &model)
+            .await
+            .unwrap();
+        assert_eq!(statement.source, "Assets:Checking-1234");
+        let calls = model.calls.into_inner().unwrap();
+        let offered = calls[0]["account"]["enum"].as_array().unwrap();
+        assert!(!offered.contains(&json!("Assets:Savings-5678")));
     }
 
     #[tokio::test]
@@ -2203,8 +2274,7 @@ Please view this email in an HTML-capable client.\r\n--b\r\nContent-Type: text/h
     async fn an_unknown_card_can_be_refused() {
         let mut email = parse(ALERT.as_bytes()).unwrap();
         email.body = "Your card ending 5678 was charged SGD 12.50 at GRAB on 23 Nov 2026.".into();
-        let reads =
-            Reads(json!({ "amount": "12.50", "currency": "SGD", "account_ending": "5678" }));
+        let reads = Reads(json!({ "amount": "12.50", "currency": "SGD", "from_account": "5678" }));
         let model = fixed(Answers::from([("account".into(), choice("none", &[]))]));
         let result = extract(&email, &card_alert_accounts(), &[], "USD", &reads, &model).await;
         assert!(matches!(result, Err(Failure::Rejected(_))));
