@@ -265,7 +265,13 @@ const NUMBER: &str = r"[0-9]{1,3}(?:,[0-9]{3})+(?:\.[0-9]{1,3})?|[0-9]+(?:\.[0-9
 const THREE_DECIMALS: [&str; 7] = ["BHD", "IQD", "JOD", "KWD", "LYD", "OMR", "TND"];
 
 static CODE_BEFORE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(&format!(r"\b({CODES}) ?(?:[-−+] ?)?$")).unwrap());
+    // Also a code in parentheses ending a field label, as in "Amount (CAD): $25.00".
+    LazyLock::new(|| {
+        Regex::new(&format!(
+            r"(?:\b({CODES})|\(({CODES})\)[ \t]*:?) ?(?:[-−+] ?)?$"
+        ))
+        .unwrap()
+    });
 
 /// A code right after an amount, bare or alone in parentheses as in "(USD)".
 /// "(USD 18.50)" is a second amount, not an annotation.
@@ -366,6 +372,10 @@ static SPLIT_SUFFIX: LazyLock<Regex> = LazyLock::new(|| {
 
 /// Joins a currency marker and its number that layout split across lines.
 fn join_split_amounts(text: &str) -> String {
+    // Number-then-code first, so in "$25.00", "CAD", "123 Main Street" on
+    // three lines the code joins the amount above it, not the street number.
+    let text = SPLIT_SUFFIX.replace_all(text, "$1 $2").into_owned();
+    let text = &text;
     let text = SPLIT_PREFIX.replace_all(text, |caps: &regex::Captures| {
         let marker = caps.get(1).unwrap();
         // A code that already follows a number on its own line, as in
@@ -379,7 +389,7 @@ fn join_split_amounts(text: &str) -> String {
             format!("{} {}", &caps[1], &caps[2])
         }
     });
-    SPLIT_SUFFIX.replace_all(&text, "$1 $2").into_owned()
+    text.into_owned()
 }
 
 /// Whether `number` is only part of a longer or differently formatted number,
@@ -475,7 +485,7 @@ pub fn amounts(text: &str) -> Vec<(Money, String)> {
         let leading_code = caps.name("symbol").and_then(|symbol| {
             CODE_BEFORE
                 .captures(&text[..symbol.start()])
-                .map(|caps| caps.get(1).unwrap().as_str())
+                .map(|caps| caps.get(1).or(caps.get(2)).unwrap().as_str())
         });
         let trailing_code = caps
             .name("symbol")
@@ -738,15 +748,22 @@ pub fn dates(text: &str, anchor: NaiveDate) -> Vec<(NaiveDate, String)> {
         for caps in pattern.captures_iter(text) {
             let whole = caps.get(0).unwrap();
             let number = |name| caps.name(name).and_then(|m| m.as_str().parse::<u32>().ok());
-            // A "year" that runs on is an hour or an amount, as in "23 Nov
+            // A "year" that is an hour ("Nov 24 10 PM") or runs on, as in "23 Nov
             // 10:15", "23 Nov 25.00 SGD", or "23 Nov 1250.00 SGD", so the date
             // stays yearless.
             let year = number("year")
                 .filter(|_| {
                     caps.name("year").is_none_or(|year| {
                         let rest = text[year.end()..].as_bytes();
-                        !(matches!(rest.first(), Some(b':' | b'.' | b','))
-                            && rest.get(1).is_some_and(u8::is_ascii_digit))
+                        let hour = text[year.end()..]
+                            .trim_start_matches(' ')
+                            .get(..2)
+                            .is_some_and(|word| {
+                                word.eq_ignore_ascii_case("am") || word.eq_ignore_ascii_case("pm")
+                            });
+                        !hour
+                            && !(matches!(rest.first(), Some(b':' | b'.' | b','))
+                                && rest.get(1).is_some_and(u8::is_ascii_digit))
                     })
                 })
                 .map(|year| if year < 100 { year + 2000 } else { year });
@@ -825,7 +842,7 @@ static PAYEE: LazyLock<Regex> = LazyLock::new(|| {
         // After "at", "to", or "from" the name must start with a capital or a
         // digit, so "to your account" is not a payee; an explicit label such
         // as "Merchant:" accepts "amazon.com".
-        r"(?m)(?:\b(?i:at|to|from)\s+(?P<payee>[\p{Lu}0-9][\p{L}\p{M}0-9&'’*./ -]{1,60}?)|\b(?i:merchant(?: name)?:|payee:|paid to|recipient:|description:|transaction details:)\s+(?P<labelled>[\p{L}0-9][\p{L}\p{M}0-9&'’*./ -]{1,60}?))(?:\s+(?i:on|for|via|using|with|ending|at|from|is|has|was|of)\b|[,;:!()\n]|\.\s|\.?$)",
+        r"(?m)(?:\b(?i:at|to|from)\s+(?P<payee>[\p{Lu}0-9][\p{L}\p{M}0-9&'’*./ -]{1,60}?)|\b(?i:(?:merchant(?: name)?|payee|recipient|description|transaction details):\s*|paid to\s+)(?P<labelled>[\p{L}0-9][\p{L}\p{M}0-9&'’*./ -]{1,60}?))(?:\s+(?i:on|for|via|using|with|ending|at|from|is|has|was|of)\b|[,;:!()\n]|\.\s|\.?$)",
     )
     .unwrap()
 });
@@ -1482,6 +1499,10 @@ Available balance: SGD 1,204.33.\r\n";
         assert_eq!(dates("Date: 23-Nov-25", anchor)[0].0, date("2025-11-23"));
         assert_eq!(dates("Nov 3, 25", anchor)[0].0, date("2025-11-03"));
         assert_eq!(dates("on 23 Nov 10:15", anchor)[0].0, date("2026-11-23"));
+        assert_eq!(
+            dates("Transaction date: Nov 23 10 PM", anchor)[0].0,
+            date("2026-11-23")
+        );
         assert_eq!(dates("23 Nov 25.00 SGD", anchor)[0].0, date("2026-11-23"));
         assert_eq!(dates("23 Nov 1250.00 SGD", anchor)[0].0, date("2026-11-23"));
         // A two-digit "year" that is also an amount keeps both readings.
@@ -1606,6 +1627,13 @@ Available balance: SGD 1,204.33.\r\n";
             "Amount\nSGD 12.50\n7.25 USD"
         );
         assert_eq!(join_split_amounts("$\n12.50\nCAD"), "$ 12.50 CAD");
+        // A code between an amount and a street number joins the amount.
+        let three = join_split_amounts("$25.00\nCAD\n123 Main Street");
+        let found: Vec<_> = amounts(&three)
+            .into_iter()
+            .map(|(m, _)| (m.number, m.currency))
+            .collect();
+        assert_eq!(found, [("25.00".into(), Some("CAD".into()))], "{three:?}");
         // A code that already qualifies an amount is not joined to the next line.
         let kept = join_split_amounts("Total paid: $25.00 CAD\n123 Main Street");
         let found: Vec<_> = amounts(&kept)
@@ -1613,6 +1641,11 @@ Available balance: SGD 1,204.33.\r\n";
             .map(|(m, _)| (m.number, m.currency))
             .collect();
         assert_eq!(found, [("25.00".into(), Some("CAD".into()))], "{kept:?}");
+        // A code in parentheses in the field label.
+        assert_eq!(
+            amounts("Amount (CAD): $25.00")[0].0.currency.as_deref(),
+            Some("CAD")
+        );
         // A label before the currency on its line.
         let labelled = join_split_amounts("Amount: USD\n25.00\nAvailable balance: USD 500.00");
         let found: Vec<_> = amounts(&labelled)
@@ -1931,6 +1964,7 @@ Content-Transfer-Encoding: base64\r\n\r\n{}",
     fn finds_unicode_payees() {
         assert_eq!(payees("Merchant: Café de Flore\n"), ["Café de Flore"]);
         assert_eq!(payees("Merchant: amazon.com\n"), ["amazon.com"]);
+        assert_eq!(payees("Merchant:amazon.com\n"), ["amazon.com"]);
         assert!(payees("Transferred to your account").is_empty());
     }
 
