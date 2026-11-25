@@ -231,6 +231,8 @@ static WRITTEN_NUMBER: LazyLock<Regex> = LazyLock::new(|| {
         // the narrow no-break space.
         r"|[0-9]{1,3}(?:[ \u{a0}\u{202f}\u{2009}\u{2007}][0-9]{3})+,[0-9]{1,2}",
         r"|[0-9]+,[0-9]{2}",
+        // Dots before groups of three, as in rupiah "1.000.000,-".
+        r"|[0-9]{1,3}(?:\.[0-9]{3})+",
         r"|[0-9]+(?:\.[0-9]+)?|\.[0-9]+",
     ))
     .unwrap()
@@ -323,8 +325,25 @@ fn written_amounts(text: &str, value: &str) -> Vec<(String, std::ops::Range<usiz
             } else {
                 as_written
             };
-            (!fragment && canonical(&as_written).as_deref() == Some(wanted.as_str()))
-                .then(|| (as_written, found.range()))
+            // Dots before groups of three may group whole units, as in
+            // "Rp1.000.000,-" or "Rp 50.000", rather than mark a fraction.
+            let dot_grouped = !decimal_comma
+                && found_text.contains('.')
+                && found_text
+                    .split('.')
+                    .skip(1)
+                    .all(|group| group.len() == 3 && group.bytes().all(|b| b.is_ascii_digit()));
+            let readings = [
+                (found_text.matches('.').count() <= 1).then(|| as_written.clone()),
+                dot_grouped.then(|| found_text.replace('.', "")),
+            ];
+            let reading = readings
+                .into_iter()
+                .flatten()
+                .find(|reading| canonical(reading).as_deref() == Some(wanted.as_str()));
+            reading
+                .filter(|_| !fragment)
+                .map(|reading| (reading, found.range()))
         })
         .collect()
 }
@@ -1020,6 +1039,21 @@ pub async fn extract(
             .iter()
             .any(|account| account.name == name && !usable(&account))
     };
+    // A number that names only accounts closed by then must not fall through
+    // to an unnumbered or new account.
+    if let Some(ending) = ending.as_deref() {
+        let named = |account: &&OpenAccount| names_number(&account.name, ending);
+        if accounts.iter().any(|account| named(&account))
+            && !accounts
+                .iter()
+                .filter(usable)
+                .any(|account| named(&account))
+        {
+            return Err(rejected(
+                "The email names an account that was closed before the transaction.",
+            ));
+        }
+    }
     let accounts: Vec<OpenAccount> = accounts.iter().filter(usable).cloned().collect();
     let accounts = &accounts[..];
     let mut sources: BTreeMap<String, String> = accounts
@@ -1493,6 +1527,21 @@ Available balance: SGD 1,204.33.\r\n";
             Some("1250")
         );
         assert_eq!(written_amount("Betrag: 12,50 EUR", "1250"), None);
+        // Dot grouping of whole units, as rupiah alerts write.
+        let rupiah = "Transaksi Rp1.000.000,- berhasil";
+        assert_eq!(
+            written_amount(rupiah, "1000000").as_deref(),
+            Some("1000000")
+        );
+        assert_eq!(written_amount(rupiah, "1000"), None);
+        assert_eq!(
+            written_amount("Bayar Rp 50.000", "50000").as_deref(),
+            Some("50000")
+        );
+        assert_eq!(
+            written_amount("Paid 12.505 KWD", "12.505").as_deref(),
+            Some("12.505")
+        );
         // Indian grouping, read whole.
         let lakh = "Debited INR 1,25,000.00 from account";
         assert_eq!(written_amount(lakh, "125000").as_deref(), Some("125000.00"));
@@ -2552,10 +2601,14 @@ Please view this email in an HTML-capable client.\r\n--b\r\nContent-Type: text/h
             .await
             .unwrap();
         assert_eq!(statement.source, "Liabilities:Visa-1234");
-        // Closed before: it is not on offer, and the email is refused.
-        let before = ledger("2026-11-20");
-        let result = extract(&email, &before, &[], "USD", &reads, &model()).await;
+        // Closed before: it is not on offer, and the email is refused rather
+        // than booked to an unnumbered card.
+        let mut before = ledger("2026-11-20");
+        before.push(account("Liabilities:Visa", &["SGD"], &[]));
+        let model = model();
+        let result = extract(&email, &before, &[], "USD", &reads, &model).await;
         assert!(matches!(result, Err(Failure::Rejected(_))));
+        assert!(model.calls.into_inner().unwrap().is_empty());
     }
 
     #[tokio::test]

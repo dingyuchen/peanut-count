@@ -216,13 +216,16 @@ be rejected with a request to open that account first. Missing categories,
 and `Assets:Checking` or `Liabilities:CreditCard` when the ledger has no
 account of that kind, are opened automatically. A category the model is
 unsure about goes to `Expenses:Uncategorized` or `Income:Uncategorized`.
-Correct a wrong entry with a reversal.
+Correct a wrong entry with a reversal. An entry can post to an account closed
+after its date, such as a replaced card; date its reversal on or before that
+account's close.
 
 Clairic answers typed fields over System One: Extract (`state` and typed
 `fields`); the account and category are multiple-choice fields. Set
 `PEANUT_CLAIRIC` to choose where it runs: `local` for the model's own server
 on this machine, or `cloudflare` for Workers AI. Workers AI receives the text
-of every forwarded email.
+of every forwarded email, and the names of the ledger accounts and categories
+offered for it, including any card or account numbers in those names.
 
 | Variable | Purpose |
 | --- | --- |
