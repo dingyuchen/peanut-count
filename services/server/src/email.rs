@@ -335,20 +335,9 @@ fn written_amounts(text: &str, value: &str) -> Vec<(String, std::ops::Range<usiz
                 .split('.')
                 .skip(1)
                 .all(|group| group.len() == 3 && group.bytes().all(|b| b.is_ascii_digit()));
-            // Rupiah written as a word on either side, as in "Rp 50.000" or
-            // "50.000 IDR".
-            let rupiah = {
-                let before = text[..found.start()].trim_end_matches(SPACES);
-                let after = text[found.end()..].trim_start_matches(SPACES);
-                ["Rp", "IDR"].iter().any(|word| {
-                    before
-                        .strip_suffix(word)
-                        .is_some_and(|rest| !rest.ends_with(char::is_alphabetic))
-                        || after
-                            .strip_prefix(word)
-                            .is_some_and(|rest| !rest.starts_with(char::is_alphabetic))
-                })
-            };
+            // Rupiah attached to the amount by the currency rules, as in
+            // "Rp 50.000", "50.000 IDR", "IDR -50.000", or "Amount (IDR): 50.000".
+            let rupiah = attached_currency(text, &found.range(), "IDR");
             let whole_units = !decimal_comma
                 && dots > 0
                 && groups_of_three
@@ -1572,6 +1561,14 @@ Available balance: SGD 1,204.33.\r\n";
         );
         assert_eq!(written_amount("Bayar Rp 50.000", "50"), None);
         assert_eq!(written_amount("Bayar 50.000 IDR", "50"), None);
+        for written in ["Refund IDR -50.000", "Amount (IDR): 50.000"] {
+            assert_eq!(
+                written_amount(written, "50000").as_deref(),
+                Some("50000"),
+                "{written}"
+            );
+            assert_eq!(written_amount(written, "50"), None, "{written}");
+        }
         assert_eq!(
             written_amount("Paid KWD 12.5050", "12.505").as_deref(),
             Some("12.5050")
