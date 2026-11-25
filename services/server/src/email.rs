@@ -363,7 +363,7 @@ fn attached_currency(text: &str, span: &std::ops::Range<usize>, code: &str) -> b
         .trim_end();
     // A code after the amount must be on its line, so a footer or the next
     // line's figure is not read as its currency.
-    let after = text[span.end..].trim_start_matches([' ', '\t', '\u{a0}']);
+    let after = text[span.end..].trim_start_matches([' ', '\t', '\u{a0}', '\u{202f}', '\u{2009}']);
     // "CODE" ending `before`, as a word.
     let code_before = |before: &str| {
         before.ends_with(code) && !letter(before[..before.len() - 3].chars().next_back())
@@ -474,8 +474,21 @@ fn known_currencies() -> impl Iterator<Item = &'static str> {
     ISO_CURRENCIES.iter().copied()
 }
 
+/// How each month's name starts in English, French, German, Spanish,
+/// Italian, Portuguese, and Dutch, as in "Feb", "février", or "febbraio".
 const MONTHS: [&str; 12] = [
-    "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+    "jan|jän|ene|gen",
+    "feb|fév|fev",
+    "mar|mär",
+    "apr|avr|abr",
+    "may|mai|mag|mei",
+    "jun|juin|giu",
+    "jul|juil|lug",
+    "aug|aoû|aou|ago",
+    "sep|set",
+    "oct|okt|ott|out",
+    "nov",
+    "dec|déc|dez|dic",
 ];
 
 /// The model's ISO date when it is plausible and one date expression in the
@@ -497,8 +510,12 @@ fn written_date(text: &str, value: &str, latest: NaiveDate) -> Option<NaiveDate>
         format!(r"\b0?{m}[/-]0?{d}(?:[/.-]{year})?\b"),
         format!(r"\b0?{d}\.0?{m}\.{year}\b"),
         format!(r"\b0?{m}\.0?{d}\.{year}\b"),
-        format!(r"(?i)\b0?{d}(?:st|nd|rd|th)?[ -]*{mon}[a-z]*\.?(?:[ ,-]+{year})?\b"),
-        format!(r"(?i)\b{mon}[a-z]*\.?[ -]*0?{d}(?:st|nd|rd|th)?\b(?:,? +{year}\b)?"),
+        // "23 Nov 2026", "1er février 2026", "25. Februar 2026", or
+        // "25 de febrero de 2026".
+        format!(
+            r"(?i)\b0?{d}(?:st|nd|rd|th|er|\.)?[ -]*(?:de )?(?:{mon})\p{{L}}*\.?(?:[ ,-]+(?:de )?{year})?\b"
+        ),
+        format!(r"(?i)\b(?:{mon})\p{{L}}*\.?[ -]*0?{d}(?:st|nd|rd|th)?\b(?:,? +{year}\b)?"),
     ];
     // An expression that starts right after a digit and a separator is the
     // tail of a longer date, as the "11-23" of "2026-11-23".
@@ -1456,6 +1473,11 @@ Available balance: SGD 1,204.33.\r\n";
         assert!(!stated("Charged CAD $12.50", "12.50", "USD"));
         assert!(stated("Refund: CAD -$12.50", "-12.50", "CAD"));
         assert!(stated("45.00 CHF 23 Nov 2026", "45.00", "CHF"));
+        assert!(stated(
+            "Montant : 1\u{202f}234,56\u{202f}EUR",
+            "1234.56",
+            "EUR"
+        ));
         assert!(stated("45.00 CHF 23.11.2026", "45.00", "CHF"));
         assert!(stated("45.00 CHF 2026.11.23", "45.00", "CHF"));
         assert!(stated("Total\n45.00\nEUR\nThank you", "45.00", "EUR"));
@@ -1533,6 +1555,25 @@ Available balance: SGD 1,204.33.\r\n";
         assert_eq!(ok("on 22 Nov 2026", "2026-11-23"), None);
         assert_eq!(ok("on 30 Nov 2026", "2026-11-30"), None);
         assert_eq!(ok("on 23 Nov", "yesterday"), None);
+        // Month names in other languages.
+        for written in [
+            "Date de l’opération : 25 février 2026",
+            "Buchungsdatum: 25. Februar 2026",
+            "Fecha: 25 de febrero de 2026",
+            "Data: 25 febbraio 2026",
+            "Datum: 25 feb. 2026",
+        ] {
+            assert_eq!(
+                ok(written, "2026-02-25"),
+                Some(date("2026-02-25")),
+                "{written}"
+            );
+        }
+        assert_eq!(
+            ok("le 1er mars 2026", "2026-03-01"),
+            Some(date("2026-03-01"))
+        );
+        assert_eq!(ok("Date: 25 février 2026", "2026-03-25"), None);
     }
 
     #[test]
@@ -2370,6 +2411,34 @@ Please view this email in an HTML-capable client.\r\n--b\r\nContent-Type: text/h
         let result = extract(&email, &ledger, &[], "USD", &reads, &model).await;
         assert!(matches!(result, Err(Failure::Rejected(_))));
         assert!(model.calls.into_inner().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_french_alert_keeps_its_currency_and_date() {
+        let mut email = parse(ALERT.as_bytes()).unwrap();
+        email.sent = Some(date("2026-03-05"));
+        email.body = "Carte se terminant par 1234\nDate de l’opération : 25 février 2026\nMontant : 1\u{202f}234,56\u{202f}EUR\nMarchand : FNAC".into();
+        let card = vec![account("Liabilities:Card-1234", &[], &[])];
+        let closed = ["Assets:Checking".to_owned()];
+        let reads = Reads(json!({
+            "amount": 1234.56, "currency": "EUR", "date": "2026-02-25",
+            "payee": "FNAC", "from_account": "1234",
+        }));
+        let model = fixed(Answers::from([(
+            "category".into(),
+            choice("Expenses:Shopping", &[("Expenses:Shopping", 0.9)]),
+        )]));
+        let statement = extract(&email, &card, &closed, "USD", &reads, &model)
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                statement.currency.as_str(),
+                statement.rows[0].amount.as_str(),
+                statement.rows[0].date
+            ),
+            ("EUR", "-1234.56", date("2026-02-25"))
+        );
     }
 
     #[tokio::test]
