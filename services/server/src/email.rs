@@ -268,7 +268,7 @@ static CODE_BEFORE: LazyLock<Regex> =
     // Also a code in parentheses ending a field label, as in "Amount (CAD): $25.00".
     LazyLock::new(|| {
         Regex::new(&format!(
-            r"(?:\b({CODES})|\(({CODES})\)[ \t]*:?) ?(?:[-−+] ?)?$"
+            r"(?:\b({CODES})|\(({CODES})\)[ \t]*:?[ \t]*(?:\r?\n[ \t]*)?) ?(?:[-−+] ?)?$"
         ))
         .unwrap()
     });
@@ -363,6 +363,14 @@ static SPLIT_PREFIX: LazyLock<Regex> = LazyLock::new(|| {
     ))
     .unwrap()
 });
+/// A line holding only a code between a number line and a line starting
+/// with a number, as in "12345678", "CAD", "25.00". Either may be the amount.
+static SPLIT_BOTH: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(&format!(
+        r"(?m)^((?:[-−+] ?)?(?:(?:{SYMBOLS}) ?)?(?:[-−+] ?)?[0-9][0-9,.]*)\n+({CODES})\n+((?:[-−+] ?)?(?:(?:{SYMBOLS}) ?(?:[-−+] ?)?)?[0-9])"
+    ))
+    .unwrap()
+});
 static SPLIT_SUFFIX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(
         r"(?m)^((?:[-−+] ?)?(?:(?:{SYMBOLS}) ?)?(?:[-−+] ?)?[0-9][0-9,.]*)\n+((?:{CODES})$)"
@@ -374,7 +382,9 @@ static SPLIT_SUFFIX: LazyLock<Regex> = LazyLock::new(|| {
 fn join_split_amounts(text: &str) -> String {
     // Number-then-code first, so in "$25.00", "CAD", "123 Main Street" on
     // three lines the code joins the amount above it, not the street number.
-    let text = SPLIT_SUFFIX.replace_all(text, "$1 $2").into_owned();
+    // A code between two numbers is joined to both, so the model can choose.
+    let text = SPLIT_BOTH.replace_all(text, "$1 $2\n$2 $3");
+    let text = SPLIT_SUFFIX.replace_all(&text, "$1 $2").into_owned();
     let text = &text;
     let text = SPLIT_PREFIX.replace_all(text, |caps: &regex::Captures| {
         let marker = caps.get(1).unwrap();
@@ -755,12 +765,12 @@ pub fn dates(text: &str, anchor: NaiveDate) -> Vec<(NaiveDate, String)> {
                 .filter(|_| {
                     caps.name("year").is_none_or(|year| {
                         let rest = text[year.end()..].as_bytes();
-                        let hour = text[year.end()..]
-                            .trim_start_matches(' ')
-                            .get(..2)
-                            .is_some_and(|word| {
+                        let after = text[year.end()..].trim_start_matches(' ');
+                        let hour = year.len() <= 2
+                            && after.get(..2).is_some_and(|word| {
                                 word.eq_ignore_ascii_case("am") || word.eq_ignore_ascii_case("pm")
-                            });
+                            })
+                            && !after[2..].starts_with(|c: char| c.is_alphanumeric());
                         !hour
                             && !(matches!(rest.first(), Some(b':' | b'.' | b','))
                                 && rest.get(1).is_some_and(u8::is_ascii_digit))
@@ -1503,6 +1513,8 @@ Available balance: SGD 1,204.33.\r\n";
             dates("Transaction date: Nov 23 10 PM", anchor)[0].0,
             date("2026-11-23")
         );
+        // A merchant starting with "AM" does not erase an explicit year.
+        assert_eq!(dates("Nov 24, 2025 AMEX", anchor)[0].0, date("2025-11-24"));
         assert_eq!(dates("23 Nov 25.00 SGD", anchor)[0].0, date("2026-11-23"));
         assert_eq!(dates("23 Nov 1250.00 SGD", anchor)[0].0, date("2026-11-23"));
         // A two-digit "year" that is also an amount keeps both readings.
@@ -1633,7 +1645,11 @@ Available balance: SGD 1,204.33.\r\n";
             .into_iter()
             .map(|(m, _)| (m.number, m.currency))
             .collect();
-        assert_eq!(found, [("25.00".into(), Some("CAD".into()))], "{three:?}");
+        assert_eq!(found[0], ("25.00".into(), Some("CAD".into())), "{three:?}");
+        // A code between a reference and an amount offers both readings.
+        let both = join_split_amounts("Reference:\n12345678\nCAD\n25.00");
+        let found: Vec<_> = amounts(&both).into_iter().map(|(m, _)| m.number).collect();
+        assert!(found.contains(&"25.00".to_string()), "{both:?} {found:?}");
         // A code that already qualifies an amount is not joined to the next line.
         let kept = join_split_amounts("Total paid: $25.00 CAD\n123 Main Street");
         let found: Vec<_> = amounts(&kept)
@@ -1641,7 +1657,11 @@ Available balance: SGD 1,204.33.\r\n";
             .map(|(m, _)| (m.number, m.currency))
             .collect();
         assert_eq!(found, [("25.00".into(), Some("CAD".into()))], "{kept:?}");
-        // A code in parentheses in the field label.
+        // A code in parentheses in the field label, on the same or the line above.
+        assert_eq!(
+            amounts("Amount (CAD):\n$25.00")[0].0.currency.as_deref(),
+            Some("CAD")
+        );
         assert_eq!(
             amounts("Amount (CAD): $25.00")[0].0.currency.as_deref(),
             Some("CAD")
