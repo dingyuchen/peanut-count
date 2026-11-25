@@ -463,7 +463,7 @@ Available balance: SGD 1,204.33.\r\n";
                         "is_transaction": value(json!(true)), "direction": value(json!("out")),
                         "amount": value(json!(12.5)), "currency": value(json!("SGD")),
                         "settled_amount": { "value": null, "p_null": 0.99 },
-                        "settled_currency": { "type": "text" },
+                        "settled_currency": { "type": "text", "value": null },
                         "date": value(json!("2026-11-23")),
                         "payee": value(json!("STARBUCKS VIVOCITY")),
                         // A value that failed its grammar is no value.

@@ -196,14 +196,18 @@ fn values(reply: &Value, fields: &[Field<'_>]) -> Result<Answers> {
     fields
         .iter()
         .map(|field| {
+            // Every answer is an object with a value, null where the text
+            // has none, so anything else is a malformed reply.
             let answer = answers
                 .get(field.name)
-                .with_context(|| format!("Clairic did not answer `{}`", field.name))?;
+                .and_then(Value::as_object)
+                .filter(|answer| answer.contains_key("value"))
+                .with_context(|| format!("Clairic gave no answer for `{}`", field.name))?;
             // A value that failed its type's grammar is no value.
             let value = if answer.get("valid") == Some(&Value::Bool(false)) {
                 Value::Null
             } else {
-                answer.get("value").cloned().unwrap_or(Value::Null)
+                answer["value"].clone()
             };
             let confidence = answer.get("confidence").and_then(Value::as_f64);
             Ok((field.name.to_owned(), Answer { value, confidence }))
@@ -279,6 +283,11 @@ mod tests {
         let wrapped = json!({ "success": true, "errors": [], "result": answers });
         assert_eq!(values(&wrapped, FIELDS).unwrap(), expected);
         assert!(values(&json!({ "answers": {} }), FIELDS).is_err());
+        for malformed in [json!(null), json!({}), json!({ "confidence": 0.9 })] {
+            let reply =
+                json!({ "answers": { "amount": malformed, "currency": { "value": null } } });
+            assert!(values(&reply, FIELDS).is_err());
+        }
     }
 
     #[test]

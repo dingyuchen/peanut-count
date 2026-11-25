@@ -393,14 +393,20 @@ fn attached_currency(text: &str, span: &std::ops::Range<usize>, code: &str) -> b
         .any(|(symbol, named)| *named == code && after.starts_with(symbol))
         || (code == "CNY" && after.starts_with('元'))
         || (code == "JPY" && after.starts_with('円'));
-    // A wrapped line holding only the code, as in "45.00" then "EUR".
+    // A wrapped line holding only the code, as in "45.00" then "EUR", unless
+    // a figure follows on the next line, which the code then prefixes.
     let code_below = after
         .strip_prefix(['\r', '\n'])
         .map(|rest| rest.trim_start_matches(['\r', '\n']))
-        .and_then(|rest| rest.lines().next())
-        .is_some_and(|line| {
-            let line = line.trim();
-            line == code || line.strip_prefix('(').and_then(|l| l.strip_suffix(')')) == Some(code)
+        .is_some_and(|rest| {
+            let mut lines = rest.lines();
+            let line = lines.next().unwrap_or_default().trim();
+            let alone = line == code
+                || line.strip_prefix('(').and_then(|l| l.strip_suffix(')')) == Some(code);
+            let figure_next = lines
+                .find(|line| !line.trim().is_empty())
+                .is_some_and(|line| MONEY_NEXT.is_match(line.trim_start()));
+            alone && !figure_next
         });
     code_before(before)
         || code_below
@@ -415,7 +421,7 @@ fn attached_currency(text: &str, span: &std::ops::Range<usize>, code: &str) -> b
 
 /// A sum of money with a fraction, such as " 75.30" or " 1,250.00", next.
 static MONEY_NEXT: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^[ \t]*[-−+]?\d[\d,' ]*[.,]\d").unwrap());
+    LazyLock::new(|| Regex::new(r"^[ \t]*[-−+]?\d[\d,'’ ]*[.,]\d").unwrap());
 /// A numeric date with its year, such as " 23.11.2026" or " 2026.11.23",
 /// next. Without a year, "23.11" is as likely a sum.
 static DATE_NEXT: LazyLock<Regex> = LazyLock::new(|| {
@@ -1358,6 +1364,17 @@ Available balance: SGD 1,204.33.\r\n";
         assert!(stated("45.00 CHF 2026.11.23", "45.00", "CHF"));
         assert!(stated("Total\n45.00\nEUR\nThank you", "45.00", "EUR"));
         assert!(stated("Total\r\n45.00\r\n(EUR)", "45.00", "EUR"));
+        // A code that prefixes the next line's figure, or the next amount.
+        assert!(!stated(
+            "Purchase: $45.00\nEUR\n1,240.00 available",
+            "45.00",
+            "EUR"
+        ));
+        assert!(!stated(
+            "Purchase: $45.00 CHF 1’250.00 available",
+            "45.00",
+            "CHF"
+        ));
         // A code on the next line belongs to something else.
         assert!(!stated(
             "Purchase: $45.00\nJPY 5000 available",
