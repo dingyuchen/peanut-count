@@ -9,7 +9,7 @@ use std::{
     sync::Arc,
 };
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use axum::{
     Json, Router,
     body::Bytes,
@@ -47,11 +47,8 @@ pub struct InboundArgs {
     /// Where Clairic Flash, which reads each email and chooses its accounts,
     /// runs: `local` for its own server, or `cloudflare` for Workers AI. Email
     /// is deferred until it is set. An empty value counts as unset.
-    #[arg(
-        long,
-        env = "PEANUT_CLAIRIC",
-        value_parser = clap::builder::PossibleValuesParser::new(["local", "cloudflare", ""])
-    )]
+    // Checked in `config`, so a typo defers piped mail instead of bouncing it.
+    #[arg(long, env = "PEANUT_CLAIRIC")]
     clairic: Option<String>,
     /// Endpoint of a local Clairic server.
     #[arg(long, env = "PEANUT_CLAIRIC_URL", default_value = clairic::LOCAL_URL)]
@@ -93,10 +90,11 @@ impl InboundArgs {
         );
         // A Cloudflare API token, or the local server's CLAIRIC_API_KEY.
         let token = set(std::env::var("PEANUT_CLAIRIC_TOKEN").ok());
-        let host = match self.clairic.as_deref() {
+        let host = match self.clairic.as_deref().map(str::trim) {
+            None | Some("") => None,
             Some("local") => Some(Host::Local),
             Some("cloudflare") => Some(Host::Cloudflare),
-            _ => None,
+            Some(_) => bail!("PEANUT_CLAIRIC must be local or cloudflare"),
         };
         let model = match host {
             None => None,
@@ -511,6 +509,21 @@ Available balance: SGD 1,204.33.\r\n";
                 .map(|base| Clairic::local(format!("{base}/clairic/v1/systemone"), None).unwrap()),
             default_currency: "USD".into(),
         })
+    }
+
+    #[test]
+    fn the_model_host_is_checked_when_configuring() {
+        let args = |clairic: &str| InboundArgs {
+            inbound_domain: Some("in.example.com".into()),
+            clairic: Some(clairic.into()),
+            clairic_url: clairic::LOCAL_URL.into(),
+            cloudflare_account_id: None,
+            email_currency: "USD".into(),
+        };
+        // A typo fails here, so a piped delivery is deferred, not bounced.
+        assert!(args("locl").config().is_err());
+        assert!(args("").config().unwrap().unwrap().model.is_none());
+        assert!(args("local").config().unwrap().unwrap().model.is_some());
     }
 
     #[tokio::test]

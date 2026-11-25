@@ -221,7 +221,11 @@ static WRITTEN_NUMBER: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(concat!(
         r"[0-9]{1,3}(?:[,'’][0-9]{3})+(?:\.[0-9]+)?",
         // A decimal comma: "1.234,56", or two digits after it, as in "12,50".
-        r"|[0-9]{1,3}(?:\.[0-9]{3})+,[0-9]{1,2}|[0-9]+,[0-9]{2}",
+        r"|[0-9]{1,3}(?:\.[0-9]{3})+,[0-9]{1,2}",
+        // Groups of three after spaces, as in French "1 234,56", including
+        // the narrow no-break space.
+        r"|[0-9]{1,3}(?:[ \u{a0}\u{202f}][0-9]{3})+,[0-9]{1,2}",
+        r"|[0-9]+,[0-9]{2}",
         r"|[0-9]+(?:\.[0-9]+)?|\.[0-9]+",
     ))
     .unwrap()
@@ -294,7 +298,9 @@ fn written_amounts(text: &str, value: &str) -> Vec<(String, std::ops::Range<usiz
                 (1..=2).contains(&fraction.len()) && fraction.bytes().all(|b| b.is_ascii_digit())
             });
             let as_written = if decimal_comma {
-                found_text.replace('.', "").replace(',', ".")
+                found_text
+                    .replace(['.', ' ', '\u{a0}', '\u{202f}'], "")
+                    .replace(',', ".")
             } else {
                 found_text.replace([',', '\'', '’'], "")
             };
@@ -741,7 +747,7 @@ const FIELDS: &[Field<'static>] = &[
     Field {
         name: "to_account",
         kind: Kind::Text,
-        instructions: "The digits of the card or account number that money arrived in, such as 5678 for 'credited to account ending 5678'. Null if the email names none.",
+        instructions: "The digits of the user's card or account number that money arrived in, such as 9012 for 'credited to your account ending 9012'. Null if the email names none. A purchase or payment credits none of the user's accounts, so it is null for one.",
     },
 ];
 
@@ -899,12 +905,9 @@ async fn read_body(email: &Email, body: &str, reader: &impl Extract) -> Result<R
     };
     let (from, to) = (number(&found.from_account), number(&found.to_account));
     let (ending, other) = if outgoing { (from, to) } else { (to, from) };
-    // A number on both sides says nothing about either.
-    let (ending, other) = if ending == other {
-        (None, None)
-    } else {
-        (ending, other)
-    };
+    // One number read for both sides is still the user's account in the
+    // transaction, as for a purchase, so it names this side.
+    let other = other.filter(|other| ending.as_ref() != Some(other));
     Ok(Reading {
         text,
         message,
@@ -1423,6 +1426,13 @@ Available balance: SGD 1,204.33.\r\n";
             Some("1250")
         );
         assert_eq!(written_amount("Betrag: 12,50 EUR", "1250"), None);
+        for grouped in ["1 234,56 EUR", "1\u{a0}234,56 EUR", "1\u{202f}234,56 EUR"] {
+            assert_eq!(
+                written_amount(grouped, "1234.56").as_deref(),
+                Some("1234.56"),
+                "{grouped}"
+            );
+        }
     }
 
     #[test]
@@ -2337,6 +2347,29 @@ Please view this email in an HTML-capable client.\r\n--b\r\nContent-Type: text/h
         )
         .await;
         assert!(matches!(result, Err(Failure::Rejected(_))));
+    }
+
+    #[tokio::test]
+    async fn one_number_read_for_both_sides_still_names_the_card() {
+        let mut email = parse(ALERT.as_bytes()).unwrap();
+        email.body =
+            "Your credit card ending 5678 was used for SGD 23.40 at FAIRPRICE on 21 Nov 2026."
+                .into();
+        let ledger = vec![
+            account("Assets:Savings-8890", &["SGD"], &[]),
+            account("Liabilities:Citi-1234", &["SGD"], &[]),
+        ];
+        let reads = Reads(json!({
+            "amount": "23.40", "currency": "SGD", "from_account": "5678", "to_account": "5678",
+        }));
+        // The card is not in the ledger, so the email is refused unasked.
+        let model = fixed(Answers::from([(
+            "account".into(),
+            choice("Liabilities:Citi-1234", &[]),
+        )]));
+        let result = extract(&email, &ledger, &[], "USD", &reads, &model).await;
+        assert!(matches!(result, Err(Failure::Rejected(_))));
+        assert!(model.calls.into_inner().unwrap().is_empty());
     }
 
     #[tokio::test]
