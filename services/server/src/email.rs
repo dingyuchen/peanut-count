@@ -139,7 +139,7 @@ fn body_text(message: MessageRef) -> String {
             match html_part {
                 Some(html)
                     if amounts(truncate_lines(
-                        &clean(truncate_lines(&text, MAX_TEXT * 4)),
+                        &join_split_amounts(&clean(truncate_lines(&text, MAX_TEXT * 4))),
                         MAX_TEXT,
                     ))
                     .is_empty() =>
@@ -348,11 +348,12 @@ static SUFFIX_AMOUNT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(r"\b(?P<number2>{NUMBER}) ?(?P<code2>{CODES})\b")).unwrap()
 });
 
-/// A line holding only a currency marker before a line starting with a number,
+/// A line ending in a currency marker, such as "Amount: USD", before a line
+/// starting with a number,
 /// or a number before a line holding only a code, as table cells often render.
 static SPLIT_PREFIX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(
-        r"(?m)^((?:{CODES})|{SYMBOLS})\n+((?:[-−+] ?)?(?:(?:{SYMBOLS}) ?(?:[-−+] ?)?)?[0-9])"
+        r"(?m)(\b(?:{CODES})|{SYMBOLS})[ \t]*\n+((?:[-−+] ?)?(?:(?:{SYMBOLS}) ?(?:[-−+] ?)?)?[0-9])"
     ))
     .unwrap()
 });
@@ -415,8 +416,13 @@ fn partial_number(before: &str, number: &str, after: &str) -> bool {
                 // separator precedes them.
                 let head = &before[..before.len() - prev.map_or(0, char::len_utf8)];
                 let digits = head.len() - head.trim_end_matches(|c: char| c.is_ascii_digit()).len();
-                let lead = head[..head.len() - digits].chars().next_back();
-                (1..=3).contains(&digits) && !matches!(lead, Some('-' | '/' | '.' | ':' | ','))
+                // A separator counts as a date or time only after a digit, as in
+                // "2026-11-23"; after a currency marker, as in "CHF-1’234.50",
+                // it is a sign.
+                let mut lead = head[..head.len() - digits].chars().rev();
+                let in_date = matches!(lead.next(), Some('-' | '/' | '.' | ':' | ','))
+                    && lead.next().is_some_and(|c| c.is_ascii_digit());
+                (1..=3).contains(&digits) && !in_date
             })
 }
 
@@ -1539,8 +1545,15 @@ Available balance: SGD 1,204.33.\r\n";
         }
         // A marked amount before a month name stays a candidate.
         assert_eq!(amounts("Paid SGD 5 May 12 at Cafe")[0].0.number, "5");
-        // A glued currency marker does not hide a thousands group.
-        assert!(amounts("Total CHF1’234.50 CHF").is_empty());
+        // A glued currency marker does not hide a thousands group, with or
+        // without a sign.
+        for grouped in [
+            "Total CHF1’234.50 CHF",
+            "Refund: CHF-1’234.50 CHF",
+            "Refund: CHF−1’234.50 CHF",
+        ] {
+            assert!(amounts(grouped).is_empty(), "{grouped}");
+        }
         // The end of an ISO date is not a thousands group.
         let found = amounts("Paid on 2026-11-23 250.00 SGD");
         assert_eq!(found.len(), 1);
@@ -1572,6 +1585,13 @@ Available balance: SGD 1,204.33.\r\n";
             "Amount\nSGD 12.50\n7.25 USD"
         );
         assert_eq!(join_split_amounts("$\n12.50\nCAD"), "$ 12.50 CAD");
+        // A label before the currency on its line.
+        let labelled = join_split_amounts("Amount: USD\n25.00\nAvailable balance: USD 500.00");
+        let found: Vec<_> = amounts(&labelled)
+            .into_iter()
+            .map(|(m, _)| m.number)
+            .collect();
+        assert_eq!(found, ["25.00", "500.00"], "{labelled:?}");
         let found = amounts(&join_split_amounts("$\n12.50\nCAD"));
         assert_eq!(found[0].0.currency.as_deref(), Some("CAD"));
         // An itemised receipt keeps its labelled total past the candidate cap.
