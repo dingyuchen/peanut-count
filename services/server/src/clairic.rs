@@ -98,8 +98,12 @@ impl Clairic {
             matches!(parsed.scheme(), "http" | "https"),
             "Clairic URL must use http or https"
         );
-        // A local model may take a minute on a busy machine.
-        Self::new(url, token, Duration::from_secs(300))
+        // A local model may take a minute on a busy machine. The email and
+        // ledger account names must not reach a proxy from the environment.
+        let builder = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(300));
+        Self::new(builder, url, token)
     }
 
     /// Workers AI in the Cloudflare account `account_id`, with an API token
@@ -115,13 +119,13 @@ impl Clairic {
         let url = format!(
             "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/@cf/cloudflare/{MODEL}"
         );
-        Self::new(url, Some(token), Duration::from_secs(120))
+        let builder = reqwest::Client::builder().timeout(Duration::from_secs(120));
+        Self::new(builder, url, Some(token))
     }
 
-    fn new(url: String, token: Option<String>, timeout: Duration) -> Result<Self> {
-        let http = reqwest::Client::builder()
+    fn new(builder: reqwest::ClientBuilder, url: String, token: Option<String>) -> Result<Self> {
+        let http = builder
             .connect_timeout(Duration::from_secs(10))
-            .timeout(timeout)
             .redirect(reqwest::redirect::Policy::none())
             .build()?;
         Ok(Self { http, url, token })

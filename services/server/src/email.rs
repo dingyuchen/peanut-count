@@ -363,13 +363,13 @@ fn attached_currency(text: &str, span: &std::ops::Range<usize>, code: &str) -> b
     let symbol_before = SYMBOLS
         .iter()
         .any(|(symbol, named)| *named == code && before.ends_with(symbol));
-    // A code, then a symbol, as in "CAD $12.50" or "EUR €12.50".
+    // A code, then a symbol, as in "CAD $12.50", "CAD -$12.50", or "EUR €12.50".
     let code_then_symbol = SYMBOLS
         .iter()
         .map(|(symbol, _)| *symbol)
         .chain(["$", "¥"])
         .filter_map(|symbol| before.strip_suffix(symbol))
-        .any(|rest| code_before(rest.trim_end()));
+        .any(|rest| code_before(rest.trim_end().trim_end_matches(['-', '−', '+']).trim_end()));
     let yen = (before.ends_with('¥') || after.starts_with('¥'))
         && match code {
             "CNY" => text.contains('元') || text.contains("RMB"),
@@ -400,17 +400,26 @@ fn attached_currency(text: &str, span: &std::ops::Range<usize>, code: &str) -> b
         || symbol_after
 }
 
-/// The currencies [`attached_currency`] can recognize by code or symbol.
+/// Active ISO 4217 codes, leaving out those that are also common English
+/// words written in capitals before a number, such as "ALL", "TOP", or "TRY".
+const ISO_CURRENCIES: &[&str] = &[
+    "AED", "AFN", "AMD", "ANG", "AOA", "ARS", "AUD", "AWG", "AZN", "BAM", "BBD", "BDT", "BGN",
+    "BHD", "BIF", "BMD", "BND", "BRL", "BSD", "BTN", "BWP", "BYN", "BZD", "CAD", "CDF", "CHF",
+    "CLP", "CNY", "COP", "CRC", "CVE", "CZK", "DJF", "DKK", "DOP", "DZD", "EGP", "ERN", "ETB",
+    "EUR", "FJD", "FKP", "GBP", "GEL", "GHS", "GIP", "GMD", "GNF", "GTQ", "GYD", "HKD", "HNL",
+    "HTG", "HUF", "IDR", "ILS", "INR", "IQD", "IRR", "ISK", "JMD", "JOD", "JPY", "KES", "KGS",
+    "KHR", "KMF", "KPW", "KRW", "KWD", "KYD", "KZT", "LAK", "LBP", "LKR", "LRD", "LSL", "LYD",
+    "MAD", "MDL", "MGA", "MKD", "MMK", "MNT", "MRU", "MUR", "MVR", "MWK", "MXN", "MYR", "MZN",
+    "NAD", "NGN", "NIO", "NOK", "NPR", "NZD", "OMR", "PAB", "PGK", "PHP", "PKR", "PLN", "PYG",
+    "QAR", "RON", "RSD", "RUB", "RWF", "SAR", "SBD", "SCR", "SDG", "SEK", "SGD", "SHP", "SLE",
+    "SRD", "SSP", "STN", "SVC", "SYP", "SZL", "THB", "TJS", "TMT", "TND", "TTD", "TWD", "TZS",
+    "UAH", "UGX", "USD", "UYU", "UZS", "VES", "VND", "VUV", "WST", "XAF", "XCD", "XOF", "XPF",
+    "YER", "ZAR", "ZMW", "ZWL",
+];
+
+/// The currencies [`attached_currency`] can find written with an amount.
 fn known_currencies() -> impl Iterator<Item = &'static str> {
-    let mut codes: Vec<&str> = SYMBOLS
-        .iter()
-        .chain(DOLLARS.iter())
-        .map(|(_, code)| *code)
-        .chain(["CNY", "JPY"])
-        .collect();
-    codes.sort_unstable();
-    codes.dedup();
-    codes.into_iter()
+    ISO_CURRENCIES.iter().copied()
 }
 
 const MONTHS: [&str; 12] = [
@@ -1319,6 +1328,8 @@ Available balance: SGD 1,204.33.\r\n";
         assert!(stated("Charged CAD $12.50", "12.50", "CAD"));
         assert!(stated("Charged USD $12.50", "12.50", "USD"));
         assert!(!stated("Charged CAD $12.50", "12.50", "USD"));
+        assert!(stated("Refund: CAD -$12.50", "-12.50", "CAD"));
+        assert!(stated("Refund: CAD $-12.50", "-12.50", "CAD"));
         assert!(stated("Amount\nUSD\n12.50", "12.50", "USD"));
         assert!(stated("消费USD12.50", "12.50", "USD"));
         assert!(stated("消费 ¥128.50 元", "128.50", "CNY"));
@@ -1985,6 +1996,11 @@ Please view this email in an HTML-capable client.\r\n--b\r\nContent-Type: text/h
         // With the currency unread, it is rejected rather than posted in USD.
         let unread = Reads(json!({ "amount": "12.50", "account_ending": "1234" }));
         let usd = vec![account("Liabilities:Card-1234", &["USD"], &[])];
+        let result = extract(&email, &usd, &closed, "USD", &unread, &decide()).await;
+        assert!(matches!(result, Err(Failure::Rejected(_))));
+        // So is a code that has no symbol of its own.
+        email.body = "Card ending 1234 purchase: CHF 45.00 at MIGROS on 23 Nov 2026.".into();
+        let unread = Reads(json!({ "amount": "45.00", "account_ending": "1234" }));
         let result = extract(&email, &usd, &closed, "USD", &unread, &decide()).await;
         assert!(matches!(result, Err(Failure::Rejected(_))));
     }
