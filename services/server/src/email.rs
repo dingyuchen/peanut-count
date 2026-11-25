@@ -220,6 +220,11 @@ fn truncate(text: &str, chars: usize) -> &str {
 /// A number as written in the text: optionally grouped with commas or
 /// apostrophes, with an optional decimal fraction, or a bare fraction such as
 /// ".50".
+/// Whole units grouped by spaces, as in "12 500".
+static SPACE_GROUPED: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"[0-9]{1,3}(?:[ \u{a0}\u{202f}\u{2009}\u{2007}][0-9]{3})+").unwrap()
+});
+
 /// Spaces that may group an amount's digits or sit between it and its code.
 const SPACES: [char; 6] = [' ', '\t', '\u{a0}', '\u{202f}', '\u{2009}', '\u{2007}'];
 
@@ -290,78 +295,112 @@ fn written_amounts(text: &str, value: &str) -> Vec<(String, std::ops::Range<usiz
     }
     let digit = |c: Option<char>| c.is_some_and(|c| c.is_ascii_digit());
     let separator = |c: Option<char>| matches!(c, Some('.' | ',' | '\'' | '’'));
-    WRITTEN_NUMBER
+    // Spaces between groups of three group whole units, as in "12 500 XOF",
+    // only for a currency without minor units: otherwise "Nov 23 500.00" is a
+    // day and an amount.
+    let spaced: Vec<std::ops::Range<usize>> = SPACE_GROUPED
         .find_iter(text)
-        .filter_map(|found| {
-            // Skip part of a longer number, such as the "12" of "12.505" or the
-            // "50" of "1.50".
-            let mut after = text[found.end()..].chars();
-            let mut before = text[..found.start()].chars().rev();
-            let (next, prev) = (after.next(), before.next());
-            let fragment = digit(next)
-                || digit(prev)
-                || (separator(next) && digit(after.next()))
-                || (separator(prev) && digit(before.next()));
-            // Nor the last group of a space-grouped amount, as the "234,56" of
-            // "1 234,56" with a separator not read as grouping.
-            let spaced = prev.is_some_and(|c| SPACES.contains(&c));
-            let last_group = found
-                .as_str()
-                .split_once(',')
-                .is_some_and(|(whole, fraction)| whole.len() == 3 && fraction.len() <= 2);
-            let fragment = fragment || (spaced && last_group && digit(before.next()));
-            let found_text = found.as_str();
-            // One or two digits after the last comma make it a decimal comma.
-            let decimal_comma = found_text.rfind(',').is_some_and(|at| {
-                let fraction = &found_text[at + 1..];
-                (1..=2).contains(&fraction.len()) && fraction.bytes().all(|b| b.is_ascii_digit())
-            });
-            let as_written = if decimal_comma {
-                found_text
-                    .replace('.', "")
-                    .replace(SPACES, "")
-                    .replace(',', ".")
-            } else {
-                found_text.replace([',', '\'', '’'], "")
-            };
-            let as_written = if as_written.starts_with('.') {
-                format!("0{as_written}")
-            } else {
-                as_written
-            };
-            // Dots before groups of three may group whole units, as in
-            // "Rp1.000.000,-" or "Rp 50.000", rather than mark a fraction. One
-            // dot is ambiguous, as "12.505 KWD" shows, so that reading needs
-            // two groups, a ",-" after, or rupiah written before.
-            let dots = found_text.matches('.').count();
-            let groups_of_three = found_text
-                .split('.')
-                .skip(1)
-                .all(|group| group.len() == 3 && group.bytes().all(|b| b.is_ascii_digit()));
-            // A currency without minor units attached to the amount, as in
-            // "Rp 50.000", "50.000 VND", or "Amount (IDR): 50.000", where a
-            // dot before three digits cannot mark a fraction.
-            let whole_currency = WHOLE_CURRENCIES
-                .iter()
-                .any(|code| attached_currency(text, &found.range(), code));
-            let whole_units = !decimal_comma
-                && dots > 0
-                && groups_of_three
-                && (dots >= 2 || text[found.end()..].starts_with(",-") || whole_currency);
-            // With whole units established, the dot is no fraction.
-            let readings = [
-                (decimal_comma || (dots <= 1 && !whole_units)).then(|| as_written.clone()),
-                whole_units.then(|| found_text.replace('.', "")),
-            ];
-            let reading = readings
-                .into_iter()
-                .flatten()
-                .find(|reading| canonical(reading).as_deref() == Some(wanted.as_str()));
-            reading
-                .filter(|_| !fragment)
-                .map(|reading| (reading, found.range()))
+        .map(|found| found.range())
+        .filter(|range| {
+            let before = text[..range.start].chars().next_back();
+            let after = text[range.end..].chars().next();
+            !digit(before)
+                && !digit(after)
+                && !separator(after)
+                && WHOLE_CURRENCIES
+                    .iter()
+                    .any(|code| attached_currency(text, range, code))
         })
-        .collect()
+        .collect();
+    let grouped = spaced.iter().filter_map(|range| {
+        let reading: String = text[range.clone()]
+            .chars()
+            .filter(char::is_ascii_digit)
+            .collect();
+        (canonical(&reading).as_deref() == Some(wanted.as_str())).then(|| (reading, range.clone()))
+    });
+    let inside_grouped = |range: &std::ops::Range<usize>| {
+        spaced
+            .iter()
+            .any(|outer| outer.start <= range.start && range.end <= outer.end && outer != range)
+    };
+    let mut found: Vec<_> = grouped.collect();
+    found.extend(
+        WRITTEN_NUMBER
+            .find_iter(text)
+            .filter(|found| !inside_grouped(&found.range()))
+            .filter_map(|found| {
+                // Skip part of a longer number, such as the "12" of "12.505" or the
+                // "50" of "1.50".
+                let mut after = text[found.end()..].chars();
+                let mut before = text[..found.start()].chars().rev();
+                let (next, prev) = (after.next(), before.next());
+                let fragment = digit(next)
+                    || digit(prev)
+                    || (separator(next) && digit(after.next()))
+                    || (separator(prev) && digit(before.next()));
+                // Nor the last group of a space-grouped amount, as the "234,56" of
+                // "1 234,56" with a separator not read as grouping.
+                let spaced = prev.is_some_and(|c| SPACES.contains(&c));
+                let last_group = found
+                    .as_str()
+                    .split_once(',')
+                    .is_some_and(|(whole, fraction)| whole.len() == 3 && fraction.len() <= 2);
+                let fragment = fragment || (spaced && last_group && digit(before.next()));
+                let found_text = found.as_str();
+                // One or two digits after the last comma make it a decimal comma.
+                let decimal_comma = found_text.rfind(',').is_some_and(|at| {
+                    let fraction = &found_text[at + 1..];
+                    (1..=2).contains(&fraction.len())
+                        && fraction.bytes().all(|b| b.is_ascii_digit())
+                });
+                let as_written = if decimal_comma {
+                    found_text
+                        .replace('.', "")
+                        .replace(SPACES, "")
+                        .replace(',', ".")
+                } else {
+                    found_text.replace([',', '\'', '’'], "")
+                };
+                let as_written = if as_written.starts_with('.') {
+                    format!("0{as_written}")
+                } else {
+                    as_written
+                };
+                // Dots before groups of three may group whole units, as in
+                // "Rp1.000.000,-" or "Rp 50.000", rather than mark a fraction. One
+                // dot is ambiguous, as "12.505 KWD" shows, so that reading needs
+                // two groups, a ",-" after, or rupiah written before.
+                let dots = found_text.matches('.').count();
+                let groups_of_three = found_text
+                    .split('.')
+                    .skip(1)
+                    .all(|group| group.len() == 3 && group.bytes().all(|b| b.is_ascii_digit()));
+                // A currency without minor units attached to the amount, as in
+                // "Rp 50.000", "50.000 VND", or "Amount (IDR): 50.000", where a
+                // dot before three digits cannot mark a fraction.
+                let whole_currency = WHOLE_CURRENCIES
+                    .iter()
+                    .any(|code| attached_currency(text, &found.range(), code));
+                let whole_units = !decimal_comma
+                    && dots > 0
+                    && groups_of_three
+                    && (dots >= 2 || text[found.end()..].starts_with(",-") || whole_currency);
+                // With whole units established, the dot is no fraction.
+                let readings = [
+                    (decimal_comma || (dots <= 1 && !whole_units)).then(|| as_written.clone()),
+                    whole_units.then(|| found_text.replace('.', "")),
+                ];
+                let reading = readings
+                    .into_iter()
+                    .flatten()
+                    .find(|reading| canonical(reading).as_deref() == Some(wanted.as_str()));
+                reading
+                    .filter(|_| !fragment)
+                    .map(|reading| (reading, found.range()))
+            }),
+    );
+    found
 }
 
 /// Symbols other than "$" that name exactly one currency.
@@ -610,6 +649,8 @@ fn written_date(text: &str, value: &str, latest: NaiveDate) -> Option<NaiveDate>
         format!(r"\b0?{d}[/-]0?{m}(?:[/.-]{year})?\b"),
         format!(r"\b0?{m}[/-]0?{d}(?:[/.-]{year})?\b"),
         format!(r"\b0?{d}\.0?{m}\.{year}\b"),
+        // Japanese, as in "2026年11月23日" or "11月23日".
+        format!(r"(?:(?P<year>[0-9]{{4}})年)?0?{m}月0?{d}日"),
         format!(r"\b0?{m}\.0?{d}\.{year}\b"),
         // "23 Nov 2026", "1er février 2026", "25. Februar 2026", or
         // "25 de febrero de 2026".
@@ -1307,9 +1348,21 @@ pub async fn extract(
             (account.name.starts_with("Assets:") || account.name.starts_with("Liabilities:"))
                 && names_number(&account.name, other)
         });
+        // Only lines naming either account count, so a balance in another
+        // currency on its own line does not.
+        let transfer_lines: String = text
+            .lines()
+            .filter(|line| {
+                [Some(other), ending.as_deref()]
+                    .into_iter()
+                    .flatten()
+                    .any(|number| written_ending(line, number).is_some())
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
         if let (Some(account), None) = (named.next(), named.next())
             && (!account.accepts(&currency)
-                || written_currencies(&text)
+                || written_currencies(&transfer_lines)
                     .iter()
                     .any(|code| *code != currency))
         {
@@ -1611,6 +1664,15 @@ Available balance: SGD 1,204.33.\r\n";
         );
         assert_eq!(written_amount("Bayar Rp 50.000", "50"), None);
         assert_eq!(written_amount("Bayar 50.000 IDR", "50"), None);
+        // Space-grouped whole units, for a currency without minor units.
+        let franc = "Montant : 12 500 XOF";
+        assert_eq!(written_amount(franc, "12500").as_deref(), Some("12500"));
+        assert_eq!(written_amount(franc, "500"), None);
+        assert_eq!(
+            written_amount("Nov 23 500.00 SGD", "500.00").as_deref(),
+            Some("500.00")
+        );
+        assert_eq!(written_amount("Nov 23 500.00 SGD", "23500"), None);
         for written in [
             "Refund IDR -50.000",
             "Amount (IDR): 50.000",
@@ -1785,6 +1847,16 @@ Available balance: SGD 1,204.33.\r\n";
             Some(date("2026-03-01"))
         );
         assert_eq!(ok("Date: 25 février 2026", "2026-03-25"), None);
+        // Japanese dates.
+        assert_eq!(
+            ok("ご利用日：2026年11月23日", "2026-11-23"),
+            Some(date("2026-11-23"))
+        );
+        assert_eq!(
+            ok("ご利用日：11月23日", "2026-11-23"),
+            Some(date("2026-11-23"))
+        );
+        assert_eq!(ok("ご利用日：2026年11月23日", "2025-11-23"), None);
         // Whole month names only.
         assert_eq!(ok("Paid at 25 Main Street", "2026-05-25"), None);
         assert_eq!(ok("rated 5 out of 5", "2026-10-05"), None);
@@ -2718,6 +2790,24 @@ Please view this email in an HTML-capable client.\r\n--b\r\nContent-Type: text/h
         )]));
         let result = extract(&email, &ledger, &[], "USD", &reads, &model).await;
         assert!(matches!(result, Err(Failure::Rejected(_))));
+        // A balance in another currency on its own line is no conversion.
+        let mut same = parse(ALERT.as_bytes()).unwrap();
+        same.body = "EUR 100.00 debited from checking ending 1234 and credited to savings ending 5678 on 23 Nov 2026.\nTotal available balance: USD 2,450.00".into();
+        let same_currency = vec![
+            account("Assets:Checking-1234", &["EUR"], &[]),
+            account("Assets:Savings-5678", &["EUR", "USD"], &[]),
+        ];
+        let euros = Reads(json!({
+            "amount": "100.00", "currency": "EUR", "from_account": "1234", "to_account": "5678",
+        }));
+        let transfer = fixed(Answers::from([(
+            "category".into(),
+            choice("Assets:Savings-5678", &[("Assets:Savings-5678", 0.9)]),
+        )]));
+        let statement = extract(&same, &same_currency, &[], "USD", &euros, &transfer)
+            .await
+            .unwrap();
+        assert_eq!(statement.rows[0].account, "Assets:Savings-5678");
         // Even when the receiving account takes both currencies.
         let multi = vec![
             account("Assets:Checking-1234", &["SGD"], &[]),
