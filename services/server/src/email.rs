@@ -631,6 +631,13 @@ const ISO_CURRENCIES: &[&str] = &[
     "ZWG", "ZWL",
 ];
 
+/// What names a settled amount's currency.
+#[derive(Clone, Debug)]
+enum Settled {
+    Code(String),
+    Symbol(char),
+}
+
 /// A "$" or "¥" written directly before or after the amount at `span` with
 /// no letters naming its currency, as in "$12.00" or "¥12,500" but not
 /// "US$12.00" or "JP¥12,500".
@@ -640,10 +647,23 @@ fn bare_symbol(text: &str, span: &std::ops::Range<usize>) -> Option<char> {
         .trim_end_matches(['-', '−', '+'])
         .trim_end_matches(SPACES);
     let after = text[span.end..].trim_start_matches(SPACES);
+    // Only a recognized prefix, as in "US$" or "JP¥", names the currency;
+    // other letters, as in "ご利用金額￥12,500", leave the symbol bare.
+    let named = |rest: &str, symbol: char| {
+        let letters = &rest[rest
+            .trim_end_matches(|c: char| c.is_ascii_alphabetic())
+            .len()..];
+        match symbol {
+            '$' => DOLLARS
+                .iter()
+                .any(|(prefix, _)| letters.eq_ignore_ascii_case(prefix)),
+            _ => matches!(letters, "JP" | "CN" | "RMB"),
+        }
+    };
     ['$', '¥', '￥'].into_iter().find(|symbol| {
         before
             .strip_suffix(*symbol)
-            .is_some_and(|rest| !rest.ends_with(|c: char| c.is_alphabetic()))
+            .is_some_and(|rest| !named(rest, *symbol))
             || after.starts_with(*symbol)
     })
 }
@@ -1056,7 +1076,9 @@ struct Reading {
     /// A bare "$" or "¥" written with the amount, which limits its currency
     /// to those the symbol can mean.
     symbol: Option<char>,
-    settled: Option<(String, String)>,
+    /// A verified settled amount, with its attached code, or failing that a
+    /// bare "$" or "¥" written with it.
+    settled: Option<(String, Settled)>,
     date: NaiveDate,
     payee: Option<String>,
     /// The verified number of the user's account on this transaction's side:
@@ -1137,11 +1159,20 @@ async fn read_body(email: &Email, body: &str, reader: &impl Extract) -> Result<R
         })
         .collect();
     // A settled amount without its own written currency could be anything,
-    // so it is used only with one.
+    // so it is used only with one: a code, or a bare "$" or "¥" that the
+    // account's own currency can then settle.
     let settled = found.settled_amount.as_deref().and_then(|value| {
         let places = written_amounts(&text, value);
         let (amount, _) = places.first().cloned()?;
-        Some((amount, attached(&places, &found.settled_currency)?))
+        let named = attached(&places, &found.settled_currency)
+            .map(Settled::Code)
+            .or_else(|| {
+                places
+                    .iter()
+                    .find_map(|(_, span)| bare_symbol(&text, span))
+                    .map(Settled::Symbol)
+            })?;
+        Some((amount, named))
     });
     let latest = email
         .sent
@@ -1323,8 +1354,26 @@ pub async fn extract(
         // the account accepts it; otherwise use the amount itself, unless the
         // email writes a different currency with it. Rejection reasons reach
         // the relay or a bounce, so they name no account and no currency.
+        // The account's one currency, declared or else posted.
+        let only =
+            find(source).and_then(
+                |account| match (&account.declared[..], &account.posted[..]) {
+                    ([only], _) | ([], [only]) => Some(only.clone()),
+                    _ => None,
+                },
+            );
         match &settled {
-            Some((settled, code)) if accepts(source, code) => Ok((settled.clone(), code.clone())),
+            Some((settled, Settled::Code(code))) if accepts(source, code) => {
+                Ok((settled.clone(), code.clone()))
+            }
+            // "Billed amount: $55.25" on a card that holds only USD.
+            Some((settled, Settled::Symbol(symbol)))
+                if only
+                    .as_deref()
+                    .is_some_and(|only| symbol_means(*symbol, only)) =>
+            {
+                Ok((settled.clone(), only.clone().unwrap()))
+            }
             _ if !written.is_empty() && !written.contains(&resolved.as_str()) => Err(rejected(
                 "The currency written with the amount could not be confirmed.",
             )),
@@ -3054,6 +3103,44 @@ Content-Type: text/html; charset=utf-8\r\n\
         let dollars = Reads(json!({ "amount": "12.00", "from_account": "1234" }));
         let result = extract(&email, &eur_card, &closed, "USD", &dollars, &decide()).await;
         assert!(matches!(result, Err(Failure::Rejected(_))));
+    }
+
+    #[tokio::test]
+    async fn symbols_after_japanese_labels_stay_bare() {
+        for written in ["ご利用金額￥12,500", "ご利用金額¥12,500", "消费金额¥12,500"]
+        {
+            let span = written_amounts(written, "12500")[0].1.clone();
+            assert!(bare_symbol(written, &span).is_some(), "{written}");
+        }
+        let named = "Charged JP¥12,500";
+        let span = written_amounts(named, "12500")[0].1.clone();
+        assert_eq!(bare_symbol(named, &span), None);
+    }
+
+    #[tokio::test]
+    async fn a_settled_dollar_amount_takes_the_card_currency() {
+        let mut email = parse(ALERT.as_bytes()).unwrap();
+        email.body = "Card ending 1234\nTransaction amount: EUR 50.00\nBilled amount: $55.25\nDate: 21 Nov 2026".into();
+        let usd_card = vec![account("Liabilities:Card-1234", &["USD"], &[])];
+        let closed = ["Assets:Checking".to_owned()];
+        let reads = Reads(json!({
+            "amount": "50.00", "currency": "EUR", "settled_amount": "55.25",
+            "from_account": "1234",
+        }));
+        let model = fixed(Answers::from([(
+            "category".into(),
+            choice("Expenses:Dining", &[("Expenses:Dining", 0.9)]),
+        )]));
+        let statement = extract(&email, &usd_card, &closed, "USD", &reads, &model)
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                statement.currency.as_str(),
+                statement.rows[0].amount.as_str()
+            ),
+            ("USD", "-55.25")
+        );
     }
 
     #[tokio::test]
